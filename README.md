@@ -1,6 +1,6 @@
 <div align="center">
 
-# Y2A-Auto（感谢原版作者。本版是在原版的基础上进行优化，遵守原作者提出的协议）
+# Y2A-Auto（感谢原版作者。本版是在原版的基础上进行优化，遵守原作者许可证）
 
 <img src="static/img/favicon.png" width="96" alt="Y2A-Auto Logo" />
 

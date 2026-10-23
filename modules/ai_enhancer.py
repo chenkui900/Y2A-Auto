@@ -755,6 +755,16 @@ def _should_retry_metadata_translation_attempt(failed_fields: Mapping[str, Seque
     return False
 
 
+def _has_rate_limit_failure(failed_fields: Mapping[str, Sequence[str]]) -> bool:
+    """判断失败字段中是否存在 API 限流类异常（需要比常规重试更长的退避）。"""
+    for reasons in (failed_fields or {}).values():
+        for reason in reasons or ():
+            normalized = safe_str(reason).strip().lower()
+            if normalized.startswith("exception:") and "ratelimit" in normalized:
+                return True
+    return False
+
+
 def _humanize_metadata_failure_reason(reason: str) -> str:
     normalized = safe_str(reason).strip()
     lowered = normalized.lower()
@@ -1146,7 +1156,13 @@ def translate_video_metadata(
                 attempt < METADATA_TRANSLATION_MAX_ATTEMPTS
                 and _should_retry_metadata_translation_attempt(failed_fields)
             ):
-                time.sleep(METADATA_TRANSLATION_RETRY_DELAY_SECONDS)
+                # 限流（429）按分钟窗口计费，固定 2 秒退避无效，改为逐次拉长的退避
+                if _has_rate_limit_failure(failed_fields):
+                    delay = max(METADATA_TRANSLATION_RETRY_DELAY_SECONDS, 20 * attempt)
+                    logger.warning(f"检测到 API 限流，第 {attempt} 次重试前等待 {delay} 秒")
+                else:
+                    delay = METADATA_TRANSLATION_RETRY_DELAY_SECONDS
+                time.sleep(delay)
             else:
                 break
 
