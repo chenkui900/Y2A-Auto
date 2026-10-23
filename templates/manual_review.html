@@ -6,6 +6,15 @@
 <div class="review-container">
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h2><i class="bi bi-check-square"></i> 人工审核列表</h2>
+        {% if tasks %}
+        {% set retryable_tasks = tasks | selectattr('can_retry_translation') | list %}
+        {% if retryable_tasks %}
+        <button type="button" class="btn btn-warning" onclick="confirmBatchRetryTranslation({{ retryable_tasks|length }})">
+            <i class="bi bi-arrow-clockwise"></i> 批量重新翻译
+            <span class="badge bg-danger ms-1">{{ retryable_tasks|length }}</span>
+        </button>
+        {% endif %}
+        {% endif %}
     </div>
     
     {% if tasks %}
@@ -250,6 +259,35 @@
     </div>
 </div>
 
+<!-- 批量重新翻译确认对话框 -->
+<div class="modal fade" id="batchRetryTranslationModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-arrow-clockwise"></i> 批量重新翻译</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p>确定要重新翻译全部 <strong id="batchRetryTranslationCount">0</strong> 个翻译失败的任务吗？</p>
+                <div class="alert alert-warning">
+                    <i class="bi bi-exclamation-triangle-fill"></i>
+                    这些任务已手动修改的标题、简介、标签和分区选择将被清空并重新生成；任务会按系统并发设置自动排队处理。
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="bi bi-x-circle"></i> 取消
+                </button>
+                <form method="post" action="{{ url_for('batch_retry_translation_route') }}">
+                    <button type="submit" class="btn btn-warning">
+                        <i class="bi bi-arrow-clockwise"></i> 确认批量重试
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- 强制上传确认对话框 -->
 <div class="modal fade" id="forceUploadModal" tabindex="-1">
     <div class="modal-dialog">
@@ -367,6 +405,12 @@
         document.getElementById('retryTranslationForm').action = "{{ url_for('retry_metadata_translation_route', task_id='TASK_ID') }}".replace('TASK_ID', taskId);
 
         new bootstrap.Modal(document.getElementById('retryTranslationModal')).show();
+    }
+
+    // 批量重新翻译确认
+    function confirmBatchRetryTranslation(count) {
+        document.getElementById('batchRetryTranslationCount').textContent = count;
+        new bootstrap.Modal(document.getElementById('batchRetryTranslationModal')).show();
     }
 
     // 强制上传确认

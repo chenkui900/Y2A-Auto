@@ -3276,6 +3276,44 @@ def retry_metadata_translation_route(task_id):
 
     return redirect(url_for('manual_review'))
 
+@app.route('/tasks/batch_retry_translation', methods=['POST'])
+@login_required
+def batch_retry_translation_route():
+    """批量重新调度所有因自动翻译失败而转入人工审核的任务。"""
+    config = load_config()
+    candidates = [t for t in get_tasks_by_status(TASK_STATES['AWAITING_REVIEW'])
+                  if is_metadata_translation_retryable(t)]
+    if not candidates:
+        flash('没有可批量重试的翻译失败任务', 'info')
+        return redirect(url_for('manual_review'))
+
+    block_reason = get_metadata_translation_retry_block_reason(candidates[0], config)
+    if block_reason:
+        flash(block_reason, 'warning')
+        return redirect(url_for('manual_review'))
+
+    success, failed = 0, 0
+    for task in candidates:
+        try:
+            from modules.task_manager import clear_task_cancel
+            clear_task_cancel(task['id'])
+        except Exception:
+            pass
+        try:
+            if retry_metadata_translation_task(task['id'], config):
+                success += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            logger.error(f"批量重试任务 {task['id']} 的自动翻译失败: {exc}")
+            failed += 1
+
+    parts = [f'已重新调度 {success} 个任务的自动翻译']
+    if failed:
+        parts.append(f'{failed} 个调度失败')
+    flash('，'.join(parts), 'success' if success else 'danger')
+    return redirect(url_for('manual_review'))
+
 @app.route('/tasks/<task_id>/force_upload', methods=['POST'])
 @login_required
 def force_upload_task_route(task_id):
