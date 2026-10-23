@@ -104,6 +104,7 @@
 14. 状态增加排队顺序；
 15. 增加搜索；
 16. 筛选任务后，继续任务，不跳转到全部任务列表；
+17. 增加excel导入功能
 
 
 ## 项目结构
@@ -133,58 +134,10 @@ Y2A-Auto/
 
 ## 快速开始
 
-推荐使用 Docker（无需手动安装 Python、FFmpeg、yt-dlp）。
-
-1. 准备 Cookie（必须）
-- `cookies/yt_cookies.txt`：YouTube 登录 Cookie
-- `cookies/ac_cookies.json`：AcFun 登录 Cookie
-- `cookies/bili_cookies.json`：bilibili 登录 Cookie
-- 可使用浏览器扩展导出 `cookies.txt`，请勿提交到仓库
-
-2. 启动服务
-
-```bash
-# 默认从 Docker Hub 拉取镜像 fqscfqj/y2a-auto:latest
-# 如需使用 GitHub 容器注册表，可切换为 ghcr.io/fqscfqj/y2a-auto:latest
-docker compose up -d
-```
-
-3. 打开 Web
-- 访问 `http://localhost:5000`
-- 首次进入建议先配置登录保护、平台账号和 YouTube Cookie
-
-默认会持久化目录：`config/`、`db/`、`downloads/`、`logs/`、`temp/`、`cookies/`。
-
-说明：`fonts/` 中的字体属于项目内置依赖，用于字幕烧录；许可证见 `fonts/LICENSE.txt`。
 
 ## 部署与运行
 
-### 方案 A：Docker（推荐）
-
-- 启动：`docker compose up -d`
-- 停止：`docker compose down`
-- 重启：`docker compose restart`
-- 日志：`docker compose logs -f`
-
-如需本地构建镜像，可使用：
-
-```bash
-docker compose -f docker-compose-build.yml up -d --build
-```
-
-如果启动日志出现写入 `config/`、`db/` 或 `logs/` 等挂载目录的
-`PermissionError`，请在项目目录中创建这些目录，并将其属主改为容器内应用使用的
-UID/GID（默认 `1000:1000`）：
-
-```bash
-mkdir -p config db downloads logs cookies temp
-sudo chown -R 1000:1000 config db downloads logs cookies temp
-```
-
-启用了 rootless Docker 或 `userns-remap` 时，请使用容器 UID 1000 实际映射到宿主机的
-UID/GID；映射方式参见 [Docker 官方文档](https://docs.docker.com/engine/security/rootless/uid-gid-mapping/)。
-
-### 方案 B：本地运行
+### 本地运行
 
 前置要求：
 - Python 3.11+
@@ -200,11 +153,6 @@ python app.py
 
 访问 `http://127.0.0.1:5500`。
 
-### 方案 C：Windows 便携包
-
-- `build-tools/` 提供 Windows 可执行文件构建工具
-- 官方 Windows Release 包通常已内置 FFmpeg / FFprobe
-- 如果手工打包，保持 `ffmpeg/` 目录完整即可
 
 ## 配置说明
 

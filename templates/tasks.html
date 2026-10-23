@@ -41,6 +41,9 @@
             <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addTaskModal">
                 <i class="bi bi-plus-circle"></i> 新建任务
             </button>
+            <button type="button" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#importExcelModal">
+                <i class="bi bi-file-earmark-arrow-up"></i> 导入Excel
+            </button>
             {% if failed_tasks %}
             <button type="button" class="btn btn-outline-danger" id="retryFailedTasksBtn" onclick="confirmRetryFailed()">
                 <i class="bi bi-arrow-repeat"></i> 重试失败任务
@@ -217,6 +220,40 @@
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-circle"></i> 取消</button>
                     <button type="submit" class="btn btn-primary"><i class="bi bi-plus-circle"></i> 添加任务</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- 导入 Excel 对话框 -->
+<div class="modal fade" id="importExcelModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-file-earmark-arrow-up"></i> 导入Excel任务</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <form method="post" action="{{ url_for('import_tasks_from_excel') }}" enctype="multipart/form-data">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="excel_file" class="form-label">Excel 文件</label>
+                        <input type="file" class="form-control" id="excel_file" name="excel_file" accept=".xlsx,.csv" required>
+                        <div class="form-text">支持 .xlsx / .csv，文件中包含视频网址即可（自动识别所有链接，播放列表链接会被忽略）；已存在的任务会自动跳过。</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="excel_upload_target" class="form-label">目标平台</label>
+                        {% set default_target2 = (config.get('UPLOAD_TARGET_DEFAULT', 'acfun'))|lower %}
+                        <select class="form-select" id="excel_upload_target" name="upload_target">
+                            <option value="acfun" {% if default_target2 == 'acfun' %}selected{% endif %}>AcFun</option>
+                            <option value="bilibili" {% if default_target2 == 'bilibili' %}selected{% endif %}>bilibili</option>
+                            <option value="both" {% if default_target2 == 'both' %}selected{% endif %}>双平台（AcFun + bilibili）</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-circle"></i> 取消</button>
+                    <button type="submit" class="btn btn-primary" id="importExcelBtn"><i class="bi bi-file-earmark-arrow-up"></i> 导入</button>
                 </div>
             </form>
         </div>
@@ -1437,6 +1474,18 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
 
     // --- 初始化 ---
     document.addEventListener('DOMContentLoaded', function() {
+        // 导入Excel：提交时显示导入中状态，防止重复提交
+        var importForm = document.querySelector('#importExcelModal form');
+        if (importForm) {
+            importForm.addEventListener('submit', function() {
+                var btn = document.getElementById('importExcelBtn');
+                if (btn) {
+                    btn.disabled = true;
+                    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> 导入中…';
+                }
+            });
+        }
+    });
         adjustTableColumns();
         let resizeTimer;
         window.addEventListener('resize', () => {

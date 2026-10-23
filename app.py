@@ -2721,6 +2721,105 @@ def add_task_route():
             flash(f'添加任务失败: {youtube_url}', 'danger')
         return redirect(url_for('tasks'))
 
+@app.route('/tasks/import-excel', methods=['POST'])
+@login_required
+def import_tasks_from_excel():
+    """从 Excel/CSV 导入任务：文件中只有网址一列，自动提取所有 http(s) 链接"""
+    file = request.files.get('excel_file')
+    upload_target = request.form.get('upload_target')
+    if not file or not file.filename:
+        flash('请选择要导入的 Excel 文件', 'danger')
+        return redirect(url_for('tasks'))
+
+    filename = (file.filename or '').lower()
+    if not filename.endswith(('.xlsx', '.csv')):
+        flash('仅支持 .xlsx 或 .csv 文件（旧版 .xls 请先另存为 .xlsx）', 'danger')
+        return redirect(url_for('tasks'))
+
+    config = load_config()
+    if not upload_target:
+        upload_target = config.get('UPLOAD_TARGET_DEFAULT', 'acfun')
+
+    # 1. 解析文件，提取所有网址
+    raw_urls = []
+    try:
+        if filename.endswith('.csv'):
+            import csv as _csv
+            import io as _io
+            text = file.read().decode('utf-8-sig', errors='replace')
+            for row in _csv.reader(_io.StringIO(text)):
+                for cell in row:
+                    cell = (cell or '').strip()
+                    if cell.startswith('http://') or cell.startswith('https://'):
+                        raw_urls.append(cell)
+        else:
+            from openpyxl import load_workbook
+            wb = load_workbook(file, read_only=True, data_only=True)
+            ws = wb.active
+            for row in ws.iter_rows(values_only=True):
+                for cell in row:
+                    if isinstance(cell, str):
+                        cell = cell.strip()
+                        if cell.startswith('http://') or cell.startswith('https://'):
+                            raw_urls.append(cell)
+            wb.close()
+    except Exception as e:
+        logger.error(f"解析导入文件失败: {e}")
+        flash(f'解析文件失败: {e}', 'danger')
+        return redirect(url_for('tasks'))
+
+    # 只保留 YouTube 视频链接，排除播放列表链接
+    urls, skipped_invalid, skipped_playlist = [], 0, 0
+    for u in raw_urls:
+        low = u.lower()
+        if 'youtube.com/watch' not in low and 'youtu.be/' not in low:
+            skipped_invalid += 1
+        elif 'list=' in low:
+            skipped_playlist += 1
+        elif u not in urls:
+            urls.append(u)
+
+    if not urls:
+        flash('文件中没有找到有效的 YouTube 视频链接', 'danger')
+        return redirect(url_for('tasks'))
+
+    # 2. 与任务库中已有任务去重
+    existing_urls = set()
+    try:
+        from modules.task_manager import get_db_connection
+        conn = get_db_connection()
+        try:
+            for (u,) in conn.execute('SELECT youtube_url FROM tasks'):
+                if u:
+                    existing_urls.add(u.strip())
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"查询已有任务网址失败（跳过去重）: {e}")
+
+    added, duplicates = 0, 0
+    for u in urls:
+        if u in existing_urls:
+            duplicates += 1
+            continue
+        task_id = add_task(u, upload_target=upload_target)
+        if task_id:
+            added += 1
+            existing_urls.add(u)
+        else:
+            logger.warning(f"Excel 导入添加任务失败: {u}")
+
+    # 3. 汇总提示
+    parts = [f'成功导入 {added} 个任务']
+    if duplicates:
+        parts.append(f'跳过 {duplicates} 个已存在任务')
+    if skipped_invalid:
+        parts.append(f'忽略 {skipped_invalid} 个非视频链接')
+    if skipped_playlist:
+        parts.append(f'忽略 {skipped_playlist} 个播放列表链接')
+    flash('，'.join(parts), 'success' if added else 'warning')
+    return redirect(url_for('tasks'))
+
 def _back_to_tasks():
     """操作后回到来源页：保留任务列表当前的筛选/搜索/页码（status、q、page）。"""
     ref = request.referrer

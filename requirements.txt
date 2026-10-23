@@ -18,6 +18,9 @@ silero-vad~=6.2.1
 Pillow~=12.3.0
 lxml>=6.1.0,<7.0
 
+# Excel 导入任务（/tasks/import-excel）。
+openpyxl>=3.1,<4.0
+
 # Platform SDKs: stay on the verified release line unless tested otherwise.
 # tzdata：在缺少系统 IANA 时区库的环境（如部分精简镜像 / Windows）提供
 # America/Los_Angeles 等时区数据，确保 YouTube 配额日对齐太平洋时间（DST-aware）。
