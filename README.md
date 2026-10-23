@@ -1,0 +1,592 @@
+<div align="center">
+
+# Y2A-Auto（感谢原版作者。本版是在原版的基础上进行优化，遵守原作者提出的协议）
+
+<img src="static/img/favicon.png" width="96" alt="Y2A-Auto Logo" />
+
+将 YouTube 视频自动搬运到 AcFun / bilibili 的一体化工具。
+
+[![License](https://img.shields.io/badge/license-GPL%20v3-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11+-green.svg)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/docker-supported-blue.svg)](https://www.docker.com/)
+
+从下载、ASR、字幕翻译、字幕质检、内容审核到上传，全流程自动化；内置 Web 管理后台、YouTube 监控和维护能力。
+
+[快速开始](#快速开始) · [功能概览](#功能概览) · [修改说明](#修改说明) · [部署与运行](#部署与运行) · [配置说明](#配置说明) · [使用指南](#使用指南) · [通知推送](#通知推送) · [CookieCloud](#cookiecloud-集成) · [安全特性](#安全特性) · [常见问题](#常见问题)
+
+---
+
+</div>
+
+
+## 项目展示
+
+<p align="center">
+  <img src="static/img/readme/dashboard-real.png" alt="Dashboard Screenshot" width="92%" />
+</p>
+
+<p align="center">
+  <img src="static/img/readme/monitor-real.png" alt="Monitor Screenshot" width="45%" />
+  <img src="static/img/readme/settings-real.png" alt="Settings Screenshot" width="45%" />
+</p>
+
+<div align="center">
+  <sub>以上为当前页面截图。</sub>
+</div>
+
+## 核心亮点
+
+| 能力模块 | 说明 |
+| --- | --- |
+| 全流程自动化 | 从下载、ASR、字幕、元信息到上传一条龙处理 |
+| 审核可控 | 支持人工审核、强制上传、内容安全检测和登录保护 |
+| 灵活部署 | Docker / 本地双模式，支持 CPU 与多种 GPU 编码 |
+| 监控拉取 | 支持 YouTube 频道 / 关键词定时抓取与历史记录 |
+| 消息推送 | 企业微信、Server酱、message-pusher 多渠道异步通知 |
+| CookieCloud | 从 CookieCloud 服务自动同步 YouTube Cookies |
+| 安全防护 | 密码保护、暴力破解锁定、会话超时、路径遍历防护 |
+| 维护完善 | 支持日志清理、下载清理、并发控制和 FFmpeg 自动补齐 |
+
+## 功能概览
+
+- 自动化流水线
+  - `yt-dlp` 下载视频与封面
+  - 自动或按需进行语音识别生成字幕，支持 Whisper、Voxtral
+  - 字幕翻译、字幕后处理、字幕质检（QC）与字幕烧录
+  - AI 生成标题、简介、标签与分区推荐
+  - 内容安全审核（阿里云 Green）
+  - 自动上传到 AcFun / bilibili / 双平台
+- Web 管理后台
+  - 任务列表、人工审核、强制上传
+  - 设置中心分组管理：运行概览、账号与网络、内容审核、AI 模型、字幕处理、语音识别、视频转码、监控与维护、安全
+  - 登录保护、错误次数锁定和密码管理
+- YouTube 监控
+  - 频道监控与关键词搜索监控
+  - 支持 latest / historical 模式、视频类型筛选和自动加入任务队列
+  - 内置历史记录与配置文件恢复
+- 通知推送
+  - 企业微信、Server酱、message-pusher 三种渠道
+  - 任务添加 / 完成 / 失败、登录成功 / 锁定、QR 登录成功 / 失败等事件推送
+  - 异步重试队列，递增间隔保证投递
+- CookieCloud 集成
+  - 从 CookieCloud 服务自动拉取 YouTube / Google Cookies
+  - 支持 auto / legacy / aes-128-cbc-fixed 加密模式
+  - Web UI 一键测试与同步
+- 字幕变换引擎
+  - 长行自动拆分、标点标准化、填充词 / 重复词过滤
+  - 幻觉文本与噪声标签检测、文本密度过高检测
+  - 时间偏移、最短时长、相邻间隙合并等后处理
+- 视频转码
+  - 支持 CPU / NVIDIA / Intel / AMD 硬件编码
+  - 默认优先 HEVC / H.265，失败后自动回退到 H.264
+- 平台认证
+  - AcFun / bilibili 支持 QR 码扫码登录
+  - bilibili 支持 Cookie 导入（Netscape / JSON 格式）
+- 维护与环境
+  - Windows 可自动补齐 FFmpeg
+  - 支持日志清理、下载清理和自定义 FFmpeg 路径
+
+## 修改说明
+-在原版的基础上增加和优化如下功能：
+1.在首页点击卡片进入对应的任务状态；
+2.任务列表增加批量分区，批量审核，批量上传，删除选中按钮；
+3.任务列表增加多选框；
+4.在首页进入“进行中”详细任务，任务增加停止按钮。可暂停上传下载任务，并可续传；
+5.设置 - 运维与安全 - 资源控制 - 任务并发，修改并发可立即生效。原版需重启服务；
+6.修改端口为5050；
+7.每个任务完成页面刷新一次；
+8.增加批量停止准备上传任务；
+9.可以单独对每个任务操作；
+10.增加下拉状态筛选;
+11.优化了上传下载逻辑；
+12.优化了首页显示；
+13.任务列表增加失败原因列；
+14.状态增加排队顺序；
+15.增加搜索；
+16.筛选任务后，继续任务，不跳转到全部任务列表；
+
+
+## 项目结构
+
+```text
+Y2A-Auto/
+├── app.py
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── docker-compose-build.yml
+├── acfunid/
+├── build-tools/
+├── config/
+├── cookies/
+├── db/
+├── downloads/
+├── ffmpeg/
+├── fonts/
+├── logs/
+├── modules/
+├── static/
+├── temp/
+├── templates/
+└── tests/
+```
+
+## 快速开始
+
+推荐使用 Docker（无需手动安装 Python、FFmpeg、yt-dlp）。
+
+1. 准备 Cookie（必须）
+- `cookies/yt_cookies.txt`：YouTube 登录 Cookie
+- `cookies/ac_cookies.json`：AcFun 登录 Cookie
+- `cookies/bili_cookies.json`：bilibili 登录 Cookie
+- 可使用浏览器扩展导出 `cookies.txt`，请勿提交到仓库
+
+2. 启动服务
+
+```bash
+# 默认从 Docker Hub 拉取镜像 fqscfqj/y2a-auto:latest
+# 如需使用 GitHub 容器注册表，可切换为 ghcr.io/fqscfqj/y2a-auto:latest
+docker compose up -d
+```
+
+3. 打开 Web
+- 访问 `http://localhost:5000`
+- 首次进入建议先配置登录保护、平台账号和 YouTube Cookie
+
+默认会持久化目录：`config/`、`db/`、`downloads/`、`logs/`、`temp/`、`cookies/`。
+
+说明：`fonts/` 中的字体属于项目内置依赖，用于字幕烧录；许可证见 `fonts/LICENSE.txt`。
+
+## 部署与运行
+
+### 方案 A：Docker（推荐）
+
+- 启动：`docker compose up -d`
+- 停止：`docker compose down`
+- 重启：`docker compose restart`
+- 日志：`docker compose logs -f`
+
+如需本地构建镜像，可使用：
+
+```bash
+docker compose -f docker-compose-build.yml up -d --build
+```
+
+如果启动日志出现写入 `config/`、`db/` 或 `logs/` 等挂载目录的
+`PermissionError`，请在项目目录中创建这些目录，并将其属主改为容器内应用使用的
+UID/GID（默认 `1000:1000`）：
+
+```bash
+mkdir -p config db downloads logs cookies temp
+sudo chown -R 1000:1000 config db downloads logs cookies temp
+```
+
+启用了 rootless Docker 或 `userns-remap` 时，请使用容器 UID 1000 实际映射到宿主机的
+UID/GID；映射方式参见 [Docker 官方文档](https://docs.docker.com/engine/security/rootless/uid-gid-mapping/)。
+
+### 方案 B：本地运行
+
+前置要求：
+- Python 3.11+
+- FFmpeg
+- yt-dlp
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python app.py
+```
+
+访问 `http://127.0.0.1:5000`。
+
+### 方案 C：Windows 便携包
+
+- `build-tools/` 提供 Windows 可执行文件构建工具
+- 官方 Windows Release 包通常已内置 FFmpeg / FFprobe
+- 如果手工打包，保持 `ffmpeg/` 目录完整即可
+
+## 配置说明
+
+首次运行会自动生成 `config/config.json`。推荐先配置以下几类参数：
+
+### 基础与安全
+
+- `AUTO_MODE_ENABLED`：无人值守自动投稿总开关，默认 `false`
+- `password_protection_enabled`：Web 密码保护，默认 `false`
+- `LOGIN_MAX_FAILED_ATTEMPTS`：连续错误次数上限，默认 `5`
+- `LOGIN_LOCKOUT_MINUTES`：锁定时长，默认 `15`
+- `LOGIN_SESSION_TIMEOUT_MINUTES`：登录空闲超时时长，默认 `30` 分钟，最小 `1`，访问受保护页面会自动续期
+- `UPLOAD_TARGET_DEFAULT`：默认投稿平台，支持 `acfun`、`bilibili`、`both`
+- `UPLOAD_APPEND_REPOST_NOTICE`：是否自动追加转载声明，默认 `true`
+
+### 账号与网络
+
+- `YOUTUBE_COOKIES_PATH`：YouTube Cookie 路径
+- `ACFUN_COOKIES_PATH`：AcFun Cookie 路径
+- `BILIBILI_COOKIES_PATH`：bilibili Cookie 路径
+- `YOUTUBE_PROXY_ENABLED` / `YOUTUBE_PROXY_URL`：YouTube 下载代理
+- `YOUTUBE_API_PROXY_ENABLED` / `YOUTUBE_API_PROXY_URL`：YouTube 监控 API 独立代理，不继承下载代理
+- `YOUTUBE_DOWNLOAD_THREADS`：下载线程数
+- `YOUTUBE_THROTTLED_RATE`：下载速度限制
+- `YOUTUBE_API_KEY`：YouTube Data API v3 密钥，监控功能需要
+- `FFMPEG_LOCATION`：自定义 FFmpeg 路径
+- `FFMPEG_AUTO_DOWNLOAD`：Windows 缺失时自动下载 FFmpeg，默认 `true`
+
+> **FFmpeg 版本要求：≥ 5.1。** 字幕烧录使用 `-fps_mode cfr` 控制帧率模式，
+> 该选项在 FFmpeg 5.1 才引入（5.0 及更早只认已弃用的 `-vsync`）。仓库自带的
+> 与自动下载的 FFmpeg（BtbN latest）都远高于该版本；但若通过 `FFMPEG_LOCATION`
+> 指向 5.0 或更早的旧版本，软件编码路径会因 `Unrecognized option 'fps_mode'`
+> 直接失败（非硬件编码器没有降级重试，任务会直接报错）。
+>
+> `VIDEO_CPU_CODEC=x265` 还额外要求该 FFmpeg 构建带 `libx265`（需 `--enable-gpl
+> --enable-libx265`，BtbN 与仓库自带版本均满足）。缺失时会自动降级为 `libx264`
+> 并继续烧录，不会因缺库而丢掉整条字幕。
+
+### AI 与投稿
+
+- `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL_NAME`：全局 AI 配置
+- `OPENAI_THINKING_ENABLED`：是否允许模型使用思考模式；关闭时按可识别的 DeepSeek、Qwen、MiMo 接口发送各自的私有禁用参数
+- `SUBTITLE_OPENAI_*`：字幕翻译专用覆盖配置，留空则回退全局
+- `SUBTITLE_QC_*`：字幕质检专用覆盖配置，留空则回退字幕翻译 / 全局配置
+- `TRANSLATE_TITLE` / `TRANSLATE_DESCRIPTION` / `GENERATE_TAGS`：自动生成标题、简介、标签
+- `RECOMMEND_PARTITION`：自动推荐分区
+- `FIXED_PARTITION_ID` / `FIXED_PARTITION_ID_BILIBILI`：固定分区
+- `YOUTUBE_UPLOADER_AS_FIRST_TAG`：将上传者作为首标签
+- `PRESET_TAGS_ENABLED` / `PRESET_TAGS`：预设标签，每行一个（也接受逗号、顿号、分号分隔）。启用后预设标签排在任务标签之前，`GENERATE_TAGS` 开启时 AI 只补齐剩余名额；一份预设同时服务 AcFun（前 6 个、每个约 10 字）与 bilibili（最多 12 个、每个 20 字）
+
+AI 文本功能同时兼容 OpenAI Chat Completions 与 Responses API。`OPENAI_BASE_URL` 可填写 API 根地址（例如 `https://api.openai.com/v1`，默认使用 Chat Completions）或完整的 `/chat/completions`、`/responses` 地址；填写完整端点时会自动选择协议并规范化。Responses 请求会自动转换消息、JSON 输出格式和 token 上限参数，返回值也会归一化供翻译、质检、智能分段等现有功能使用。当兼容服务不支持 `response_format`、token 上限参数、自定义 `temperature` 或特定指令角色时，系统会根据端点实际错误逐级协商；若网关只返回笼统的请求 schema 错误，则降级为仅含 `model + user messages` 的最小标准请求。能力只在降级请求成功后按端点、协议和模型缓存。
+
+### 字幕处理
+
+- `SUBTITLE_TRANSLATION_ENABLED`：启用字幕翻译，默认 `false`
+- `YOUTUBE_AUTO_GENERATED_SUBTITLES_ENABLED`：下载 YouTube 自动生成字幕，默认 `false`
+- `SUBTITLE_SOURCE_LANGUAGE`：源语言，默认 `auto`
+- `SUBTITLE_TARGET_LANGUAGE`：目标语言，默认 `zh`
+- `SUBTITLE_FONT_NAME`：烧录字幕字体名，默认 `NotoSansCJKsc-Regular.otf`
+- `SUBTITLE_BATCH_SIZE`：翻译批次大小
+- `SUBTITLE_MAX_RETRIES` / `SUBTITLE_RETRY_DELAY`：翻译重试策略
+- `SUBTITLE_EMBED_IN_VIDEO`：是否将字幕嵌入视频
+- `SUBTITLE_KEEP_ORIGINAL`：是否保留原始字幕文件
+- `SUBTITLE_MAX_WORKERS`：字幕翻译并发线程数
+
+烧录字幕外观（默认值即历史观感；对 `.ass`/`.ssa` 源的行为变更见下方说明）：
+
+- `SUBTITLE_FONT_SIZE_SCALE` / `SUBTITLE_MARGIN_V_SCALE`：字号与底部边距倍率，范围 `0.5-2.0`，默认 `1.0`
+- `SUBTITLE_FONT_COLOR` / `SUBTITLE_OUTLINE_COLOR`：字体色与描边色，`#RRGGBB`，默认 `#FFFFFF` / `#000000`
+- `SUBTITLE_OUTLINE_ENABLED` / `SUBTITLE_OUTLINE_SCALE`：描边开关与粗细倍率（`0-3`）
+- `SUBTITLE_SHADOW_ENABLED` / `SUBTITLE_SHADOW_SCALE`：阴影开关与倍率（`0-3`）
+- `SUBTITLE_TEXT_BOLD`：是否粗体，默认 `true`
+- `SUBTITLE_BACKGROUND_ENABLED` / `SUBTITLE_BACKGROUND_COLOR` / `SUBTITLE_BACKGROUND_OPACITY`：半透明底板（`BorderStyle=4`）及其颜色与不透明度（`0-1`）。开启后 libass 会把阴影当作底框外扩，建议同时关闭阴影
+
+> **行为变更（`.ass` / `.ssa` 源素材）**：上述外观配置现在对**所有字幕源统一生效**。
+> 此前上游只把字体与边距写进 `force_style`，字色 / 描边色 / 粗体 / 底板这些键对
+> `.ass` / `.ssa` 源**不生效**（同一份配置喂 `.srt` 是红字、喂 `.ass` 仍是创作者的白字），
+> 现在这些键改为逐键覆盖源样式 —— 也就是说，**素材自带的字色 / 粗体 / 底板样式会被
+> 应用配置覆盖**，未配置时即默认的白字 + 粗体 + 描边（与 SRT 源行为一致）。
+> 升级后若想保留素材自带外观，请把对应配置项显式设置成与素材一致的取值，或改用
+> 自带样式的外部字幕文件而不依赖本功能。
+
+### 语音识别（ASR）
+
+- `SPEECH_RECOGNITION_ENABLED`：是否启用语音识别生成字幕，默认 `false`
+- `SPEECH_RECOGNITION_PROVIDER`：支持 `whisper`、`voxtral`
+- `VAD_ENABLED`：VAD 语音扫描窗，默认 `true`
+- `WHISPER` 路径默认使用 `segment` 级时间戳，并自动兼容不支持 `timestamp_granularities` 的接口
+- `WHISPER_LANGUAGE` / `WHISPER_PROMPT` / `WHISPER_TRANSLATE`：Whisper 专用参数
+- `VOXTRAL_TIMESTAMP_GRANULARITIES`：默认 `segment,word`
+- `VOXTRAL_DIARIZE` / `VOXTRAL_CONTEXT_BIAS` / `VOXTRAL_LANGUAGE`
+- `VOXTRAL_MAX_AUDIO_DURATION_S` / `VOXTRAL_LONG_AUDIO_MARGIN_S` / `VOXTRAL_ENFORCE_MAX_DURATION`
+
+### 视频转码与维护
+
+- `VIDEO_ENCODER`：`auto` / `cpu` / `nvidia` / `intel` / `amd`
+- `VIDEO_CPU_CODEC`：`x264`（H.264，默认）或 `x265`（H.265/HEVC）。仅在最终使用 CPU 编码时生效：`VIDEO_ENCODER=cpu`，或硬编不可用而回退到 CPU 时。编码耗时约为 `libx264` 的 5 倍，超时预算会按同一倍数放大；体积收益**不保证**，取决于素材与 preset，建议开启后自行对比
+- `VIDEO_CPU_PRESET`：常规 CPU 软编码 preset，默认 `medium`
+- `VIDEO_CPU_PRESET_HD`：1440p+ 且超过 10 分钟时使用的 preset，默认 `veryfast`
+- `VIDEO_QUALITY_MODE`：`auto`（按分辨率推荐）或 `manual`（使用 `VIDEO_QUALITY_VALUE`），默认 `auto`
+- `VIDEO_QUALITY_VALUE`：固定质量值 CRF/CQ/QP，范围 `0-51`，越小质量越高。自动模式的推荐值为 4K `22.5` / 1440p `23` / 1080p `23.5` / 720p `24.5`
+- `VIDEO_HW_QUALITY_BOOST`：编码质量增强总开关（自适应量化、前瞻、多遍分析等），默认 `true`。它同时作用于硬件编码器与软件编码器：x264 写 `-aq-mode 3 -aq-strength 0.8 -psy-rd 1.0:0.0`，非 HD preset 路径再加 `-rc-lookahead 40`；x265 只写 `aq-mode=3`，非 HD preset 路径再加 `rc-lookahead=40`（`psy-rd` / `aq-strength` / `psy-rdoq` **不写**，即保持 x265 自身的默认值 2.00 / 1.0 / 1.00 —— 照抄 x264 的数值在 x265 上等于把这些心理视觉优化砍半，与「质量增强」相反）。1440p+ 长视频走 `VERYFAST` 档时前瞻跟随 preset 自身默认值，不被放大。老 GPU 驱动不认识这些参数时可关闭，命令会回到基础参数并自动重试
+- `VIDEO_HW_QUALITY_LEVEL`：`fast` / `balanced` / `quality`，映射到各硬件编码器的速度档，默认 `quality`
+- `VIDEO_COLOR_METADATA_MODE`：`auto`（透传源流色彩信息）/ `bt709`（强制）/ `off`（不写入），默认 `auto`。不写入时播放器会按默认色域解释，可能偏色
+- `VIDEO_X264_TUNE`：软编码 `-tune` 取值（如 `film` / `animation`），留空则不传。取值按 `VIDEO_CPU_CODEC` 各自的白名单校验：`film` 与 `stillimage` 只对 x264 合法，切到 x265 时会被忽略并写入任务日志
+- `VIDEO_CUSTOM_PARAMS_ENABLED` / `VIDEO_CUSTOM_PARAMS`：自定义 FFmpeg 参数（启用后完全覆盖内置编码参数与色彩参数）。若自定义参数里没有写 `-c:v`，系统会按 `VIDEO_CPU_CODEC` 补上 `-c:v libx264` / `-c:v libx265` —— 否则 ffmpeg 会取容器默认编码器（mp4 为 libx264），`VIDEO_CPU_CODEC` 被静默忽略、色彩 VUI 补写也一并失效；若你自己写了 `-c:v`，则以你指定的编码器为准（识别为 libx264 / libx265 时才补写色彩 VUI，并在任务日志中说明）
+- `MAX_CONCURRENT_TASKS`：最大并发任务数，默认 `2`
+- `MAX_CONCURRENT_UPLOADS`：最大并发上传数，默认 `1`。指**同时进行的上传任务数**（含前置准备到投稿完成的全过程），由设置 → 运维与安全 → 资源控制 → 最大并发上传数控制；修改后立即生效，超出的任务排队等待，不再按任务各开一个线程
+- `LOG_CLEANUP_ENABLED` / `LOG_CLEANUP_HOURS` / `LOG_CLEANUP_INTERVAL`
+- `DOWNLOAD_CLEANUP_ENABLED` / `DOWNLOAD_CLEANUP_HOURS` / `DOWNLOAD_CLEANUP_INTERVAL`
+- `DELETE_DOWNLOAD_FILES_AFTER_UPLOAD`：所有目标平台上传成功后立即删除该任务的下载文件（默认关闭）
+
+### 通知推送
+
+- `NOTIFY_ENABLED`：启用消息推送，默认 `false`
+- `NOTIFY_CHANNELS`：启用的渠道列表，支持 `wecom`、`serverchan`、`message_pusher`
+- `NOTIFY_EVENTS`：订阅的事件列表，可选 `task_added`、`task_completed`、`task_failed`、`login_success`、`login_locked`、`qr_login_success`、`qr_login_failed`
+- 企业微信：`NOTIFY_WECOM_WEBHOOK_URL`
+- Server酱：`NOTIFY_SERVERCHAN_SENDKEY`
+- message-pusher：`NOTIFY_MESSAGE_PUSHER_SERVER` / `NOTIFY_MESSAGE_PUSHER_USERNAME` / `NOTIFY_MESSAGE_PUSHER_TOKEN`
+
+### CookieCloud
+
+- `COOKIECLOUD_ENABLED`：启用 CookieCloud 同步，默认 `false`
+- `COOKIECLOUD_SERVER_URL`：CookieCloud 服务地址
+- `COOKIECLOUD_UUID`：CookieCloud UUID
+- `COOKIECLOUD_PASSWORD`：CookieCloud 加密密码
+- `COOKIECLOUD_ENCRYPT_MODE`：加密模式，支持 `auto` / `legacy` / `aes-128-cbc-fixed`
+
+### 内容审核
+
+- `CONTENT_MODERATION_ENABLED`：启用阿里云内容审核，默认 `false`
+- `ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET`：阿里云 AK/SK
+- `ALIYUN_CONTENT_MODERATION_REGION`：审核服务区域
+- `ALIYUN_TEXT_MODERATION_SERVICE`：文本审核服务名，默认 `comment_detection_pro`
+
+### 下载质量
+
+- `YOUTUBE_DOWNLOAD_QUALITY_MODE`：下载质量模式
+- `YOUTUBE_DOWNLOAD_MAX_HEIGHT`：最大分辨率高度限制
+
+### 字幕后处理
+
+- `SUBTITLE_MAX_LINE_LENGTH`：单行最大字符数，默认 `42`
+- `SUBTITLE_MAX_LINES`：单条字幕最大行数，默认 `2`
+- `SUBTITLE_NORMALIZE_PUNCTUATION`：标点标准化，默认 `true`
+- `SUBTITLE_FILTER_FILLER_WORDS`：过滤填充词（um、uh 等），默认 `true`
+- `SUBTITLE_TIME_OFFSET_S`：字幕时间偏移（秒）
+- `SUBTITLE_MIN_CUE_DURATION_S`：最短字幕时长，默认 `0.6`
+- `SUBTITLE_MERGE_GAP_S`：相邻间隙合并阈值，默认 `0.3`
+
+### 配置示例
+
+```json
+{
+  "AUTO_MODE_ENABLED": false,
+  "password_protection_enabled": false,
+  "password": "",
+  "UPLOAD_TARGET_DEFAULT": "acfun",
+  "OPENAI_API_KEY": "",
+  "OPENAI_BASE_URL": "https://api.openai.com/v1",
+  "OPENAI_MODEL_NAME": "gpt-3.5-turbo",
+  "OPENAI_THINKING_ENABLED": false,
+  "SUBTITLE_TRANSLATION_ENABLED": false,
+  "SUBTITLE_QC_ENABLED": true,
+  "SPEECH_RECOGNITION_ENABLED": false,
+  "SPEECH_RECOGNITION_PROVIDER": "whisper",
+  "VAD_ENABLED": true,
+  "VIDEO_ENCODER": "auto",
+  "VIDEO_CPU_CODEC": "x264",
+  "VIDEO_CPU_PRESET": "medium",
+  "VIDEO_CPU_PRESET_HD": "veryfast",
+  "FFMPEG_AUTO_DOWNLOAD": true,
+  "MAX_CONCURRENT_TASKS": 2,
+  "MAX_CONCURRENT_UPLOADS": 1
+}
+```
+
+## 字幕质检说明
+
+`SUBTITLE_QC_ENABLED` 默认为 `true`：系统会对 ASR 生成的源字幕做预检。
+
+- `SUBTITLE_QC_THRESHOLD`：AI 复核分数下限（0 ~ 1，默认 0.60）
+- `SUBTITLE_QC_SAMPLE_MAX_ITEMS`：AI 抽样条目上限，默认 80
+- `SUBTITLE_QC_MAX_CHARS`：AI 单次送检最大字符数上限，默认 9000
+- `SUBTITLE_QC_MODEL_NAME`：单独指定 QC 模型，留空则复用字幕翻译 / 全局模型
+- `SUBTITLE_QC_TIMELINE_ENABLED`：是否启用时间轴维度判定，默认 `true`
+- `SUBTITLE_QC_MIN_COVERAGE_RATIO`：字幕总时长 / 视频时长的覆盖率下限，默认 `0.15`
+- `SUBTITLE_QC_MAX_GAP_S`：允许的最大连续无字幕间隙（秒），默认 `90`
+- `SUBTITLE_QC_MAX_CPS`：单条字幕最大字符速率（字符/秒），默认 `25`
+
+QC 会先用规则做硬拦截，只有边界样本才会调用 AI 严格复核。
+
+命中署名行、噪声提示、界面操作词、模板化重复句等明显低质量字幕时，会在规则层直接失败，不再进入宽松放行。
+
+时间轴维度（覆盖率 / 间隙 / 语速）会在 ASR 来源退化（`subtitle_quality_state == degraded`）时随严格模式一并参与判定。
+
+时间轴维度的三条边界语义：片尾留白容忍带取「30 秒」与「片长 25%」的**较小值**（60 秒素材不会因为末尾 23 秒无字幕而被当作良性留白）；零时长 cue 达到「≥3 条且 ≥20%」即视为实质缺陷，AI 不可用时不予放行（≥25% 无条件硬失败）；畸形时间戳（时间行无法解析）的 cue 会被跳过并记 warning，不再静默退化为 `0.0` —— 退化到 0.0 会虚高覆盖率并反过来帮助质检通过。
+
+可疑样本在 AI 不可用、返回异常或输出不合规时，默认按失败处理。QC 失败时会跳过烧录字幕，但仍保留字幕文件并继续上传原视频，任务最终标记为完成，并显示字幕异常标记。
+
+被判定不合格的 ASR 字幕会被改名为 `*.rejected.txt`（内容保留供人工检查），移出复用范围，避免任务重跑时复用旧字幕而永远拿不到新字幕。平台自带或人工提供的字幕不受此影响。
+
+### 烧录门控开关
+
+- `ASR_FAILURE_BLOCKS_EMBED`（默认 `true`）：ASR/VAD 质量结局为 `failed`（来源不可信）时拒绝烧录该字幕。设为 `false` 恢复旧行为，只放宽「ASR 来源结局」与「质检没跑成」两种拦截，**不会**放过质检给出的明确失败结论 —— 质检结论针对字幕内容本身，与 ASR 来源可靠度是两件事。
+- `SUBTITLE_QC_ENABLED=false`：用户主动放弃质检这道防线。此时不再看历史质检标记，也不再要求 `degraded` 素材通过严格质检（质检关闭时该条件无法满足，若仍拦截就变成「关掉质检反而更严格」）。
+
+「质检不可用」（字幕文件缺失 / 执行异常）与「用户主动关闭质检」是两种不同结局：前者按拒绝处理，后者放行。任务列表中会通过 `qc_unavailable` / `subtitle_qc_rejected` / `asr_failed_block_embed` / `asr_degraded_block_embed` 标注具体原因。
+
+## 语音识别说明
+
+当前支持两类 ASR 提供商：
+
+- Whisper：兼容 OpenAI 风格接口，可使用独立的 API Key、Base URL 和模型名
+- Voxtral：Mistral /v1/audio/transcriptions，默认模型为 `voxtral-mini-latest`
+
+建议优先保持 `VAD_ENABLED=true`。当前默认采用质量优先的扫描窗参数，分片更短、重叠更小，便于提升字幕边界精度。
+
+如果 VAD 结果不理想，系统会自动进入分片或整段兜底流程。
+
+## 内置字幕字体
+
+- 项目默认内置 `SourceHanSansHWSC-VF.otf`，作为字幕烧录依赖随仓库一起分发
+- 可通过 `SUBTITLE_FONT_NAME` 指定 `fonts/` 目录中的字体文件名；程序会读取该文件的真实字体名供 libass 使用
+- 字体许可证位于 `fonts/LICENSE.txt`
+
+## 使用指南
+
+1. 在首页或任务页提交 YouTube 链接创建任务。
+2. 自动模式下流程为：下载 -> ASR / 字幕处理（可选） -> AI 元信息 -> 审核 -> 上传目标平台。
+3. 在人工审核页可调整标题、简介、标签、分区并强制上传。
+4. 启用 YouTube 监控后，可按频道或关键词定时拉取任务，并自动加入任务队列。
+5. 在设置页可分组维护账号、AI、字幕、ASR、转码、维护与安全项。
+6. AcFun / bilibili 支持 QR 码扫码登录：在设置页点击「扫码登录」，用手机 App 扫码即可完成认证。
+7. 如已部署 CookieCloud 服务，可在设置页配置后一键同步 YouTube Cookies，无需手动导出。
+8. 启用通知推送后，任务状态变化和登录事件会自动推送到企业微信等渠道。
+
+## FFmpeg 与硬件加速
+
+- 默认优先使用项目内 `ffmpeg/` 目录中的二进制
+- Windows 环境下如果 `ffmpeg/` 缺失，系统可自动下载并补齐
+- `FFMPEG_LOCATION` 可覆盖默认路径，支持直接指向 `ffmpeg.exe` 或其所在目录
+- `VIDEO_ENCODER=cpu` 时使用 CPU 软编码，编码器由 `VIDEO_CPU_CODEC` 决定：
+  - `x264`（默认）：`libx264`（H.264）
+  - `x265`：`libx265`（H.265/HEVC）。实测（1080p30，带字幕烧录）耗时约为 `libx264` 的 5 倍（veryfast 1.70s → 8.44s），超时预算已按同一倍数放大
+  - 体积收益并不稳定：实测在合成图文素材上（SSIM 匹配），`veryfast` 下同 CRF 的体积反而是 `libx264` 的 1.6~1.8 倍，`medium` 下约持平。是否更省取决于素材与 preset，建议开启后自行对比再决定；x265 的 CRF 标度与 x264 不可直接比较，本项不做任何自动偏移
+- `VIDEO_ENCODER=auto|nvidia|intel|amd` 时优先使用 HEVC / H.265 硬件编码：
+  - NVIDIA：`hevc_nvenc`
+  - Intel：`hevc_qsv`
+  - AMD（Windows）：`hevc_amf`
+  - AMD（Linux）：`hevc_vaapi`
+- 如果 HEVC 硬编不可用或转码失败，会自动回退到 CPU 软编码（按 `VIDEO_CPU_CODEC` 选择编码器）
+- 如果 CPU 编码器选了 `x265` 但当前 FFmpeg 不含 `libx265`，或 `libx265` 不接受某个参数，会自动降级为 `libx264` 重试。硬件编码失败回退到 CPU 时同样保留这一级：硬编回退的 CPU 阶段仍用你配置的 `x265`，因此仍需要 `x265 -> x264` 这条兜底；该阶段的超时预算也按其真实编码器（`x265` 为 5 倍）计算，而不是沿用 `x264` 的预算
+
+### Docker GPU 示例
+
+NVIDIA（推荐）：
+
+```yaml
+# 在 docker-compose.yml 内取消以下注释即可启用：
+# gpus: all
+# environment:
+#   - NVIDIA_VISIBLE_DEVICES=all
+#   - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+```
+
+Intel / AMD（Linux）：
+
+```yaml
+devices:
+  - /dev/dri:/dev/dri
+group_add:
+  - video
+  - render
+```
+
+> NVIDIA 专用覆盖文件已移除，相关配置已直接集成到主 `docker-compose.yml`。
+
+## YouTube 监控
+
+- 需要先配置 `YOUTUBE_API_KEY`
+- 支持关键词搜索、指定频道、历史搬运和持续跟进最新模式
+- 支持视频类型筛选：video / short / live
+- 可设置自动添加到任务队列，并保留监控历史记录
+- 配置文件会保存到 `config/youtube_monitor/`，历史数据库位于 `db/youtube_monitor.db`
+
+## 通知推送
+
+支持三种推送渠道，可在设置页自由组合启用：
+
+| 渠道 | 标识 | 必需配置 |
+| --- | --- | --- |
+| 企业微信 | `wecom` | `NOTIFY_WECOM_WEBHOOK_URL` |
+| Server酱 | `serverchan` | `NOTIFY_SERVERCHAN_SENDKEY` |
+| message-pusher | `message_pusher` | `NOTIFY_MESSAGE_PUSHER_SERVER` + `USERNAME` + `TOKEN` |
+
+支持的事件类型：
+
+- `task_added`：任务添加
+- `task_completed`：任务完成
+- `task_failed`：任务失败
+- `login_success`：登录成功
+- `login_locked`：登录锁定
+- `qr_login_success`：QR 码登录成功
+- `qr_login_failed`：QR 码登录失败
+
+通知采用异步重试队列（SQLite outbox），递增间隔（30s → 120s → 600s → 1800s → 3600s）保证最终投递。企业微信优先使用 Markdown 格式，失败后自动回退纯文本。
+
+## CookieCloud 集成
+
+支持从 [CookieCloud](https://github.com/easychen/CookieCloud) 服务自动拉取 YouTube / Google Cookies，免去手动导出的麻烦。
+
+- 配置 `COOKIECLOUD_SERVER_URL`、`COOKIECLOUD_UUID`、`COOKIECLOUD_PASSWORD` 后即可启用
+- 支持三种加密模式：`auto`（自动探测）、`legacy`、`aes-128-cbc-fixed`
+- 自动过滤仅保留 `youtube.com`、`youtu.be`、`google.com` 域名的 Cookie
+- 输出为 Netscape 格式 `cookies/yt_cookies.txt`
+- Web 设置页提供「测试连接」和「立即同步」按钮
+- 同步状态会记录时间戳、成功/失败和消息，便于排查
+
+## 安全特性
+
+- **密码保护**：可选 Web UI 密码保护，首次进入设置页即可配置
+- **暴力破解防护**：连续错误 5 次自动锁定 15 分钟，锁定时发送通知
+- **会话超时**：登录空闲 30 分钟自动过期，访问受保护页面会自动续期
+- **SECRET_KEY 持久化**：首次运行自动生成 256-bit 随机密钥并保存，重启不丢失
+- **路径遍历防护**：所有文件操作使用 `werkzeug.security.safe_join`，Cookie 路径限制在项目目录内
+- **内容审核**：可对接阿里云 Green 审核服务，对 AI 生成的文本做合规检测
+- **登录事件通知**：QR 登录成功/失败、密码锁定等事件可推送到企业微信等渠道
+
+## 常见问题
+
+### 云服务器无法访问 Web 界面
+
+云平台的安全组 / 网络防火墙或服务器自身的防火墙可能没有放行 TCP 5000。不要直接将该端口向整个公网开放：Web 密码保护默认关闭，直接访问使用的也是明文 HTTP。
+
+推荐通过 SSH 本地端口转发访问，无需开放公网 5000 端口：
+
+```bash
+ssh -N -L 5000:127.0.0.1:5000 -o ServerAliveInterval=30 user@<服务器公网IP>
+```
+
+连接建立后，在本地浏览器打开 `http://localhost:5000`。如果确实需要长期公网访问，请先启用 Web 密码保护，通过反向代理配置 HTTPS，并将云防火墙和主机防火墙的入站来源限制为可信 IP 或网段。
+
+- 403 / 需要登录 / not a bot
+  - 通常是 YouTube 反爬或权限问题，更新 `cookies/yt_cookies.txt`
+  - 也可通过 CookieCloud 自动同步，免去手动导出
+- 找不到 FFmpeg / yt-dlp
+  - Docker 环境通常无需处理；本地运行请确保 PATH 正确
+  - 如果使用 Windows Release 包，通常不应出现缺失 FFmpeg；若出现，请确认 `ffmpeg/` 未被安全软件隔离
+- 上传 AcFun 失败
+  - 更新 `cookies/ac_cookies.json`，或在设置页使用 QR 码重新扫码登录
+  - 检查人工审核页元信息是否合规
+- 上传 bilibili 失败
+  - 更新 `cookies/bili_cookies.json`，或在设置页使用 QR 码重新扫码登录
+- 字幕翻译慢
+  - 调整并发与批量大小，同时注意 API 限速
+- Docker 未启用 NVENC
+  - 检查 `docker-compose.yml` 中 GPU 部分是否已取消注释
+  - 确认主机已安装 `nvidia-container-toolkit`
+- CookieCloud 同步失败
+  - 检查服务地址、UUID 和密码是否正确
+  - 确认 CookieCloud 服务可访问，可使用设置页「测试连接」按钮排查
+- 通知推送未收到消息
+  - 确认 `NOTIFY_ENABLED` 已开启，且目标渠道已正确配置
+  - 检查 webhook URL / SendKey 是否有效
+
+## 贡献与反馈
+
+- 欢迎提交 Issue / PR：`../../issues`
+- 请勿提交包含 Cookie、密钥等敏感信息的文件
+
+## 致谢
+
+- [acfun_upload](https://github.com/Aruelius/acfun_upload)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+- [FFmpeg](https://ffmpeg.org/)
+- [Flask](https://flask.palletsprojects.com/)
+- Bilibili 平台上传的技术参考资料
+  - 项目内的 `modules/bili_sdk` 部分参考了社区开源项目，针对上传流程做了适配。
+- [OpenAI](https://openai.com/)
+
+## 许可证
+
+本项目基于 [GNU GPL v3](LICENSE) 开源。请遵守相关平台条款，仅在合法合规前提下用于学习与研究。

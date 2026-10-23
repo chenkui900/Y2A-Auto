@@ -1,0 +1,147 @@
+name: 错误报告
+description: 报告可复现的功能异常、任务失败或运行问题。
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请先搜索现有 Issue，并仅提供复现所需的最小信息。
+
+        **请勿公开上传或粘贴** Cookie、密码、API Key、Token、Webhook、代理认证信息、完整 `config/config.json`、`db/`、完整日志压缩包、私人视频链接或包含上述内容的截图。
+
+        安全漏洞请不要在此提交，请按 [SECURITY.md](../../SECURITY.md) 私下报告。
+  - type: dropdown
+    id: component
+    attributes:
+      label: 发生问题的功能
+      options:
+        - YouTube 下载或解析
+        - AcFun 登录或上传
+        - bilibili 登录、Cookie 或上传
+        - ASR、Whisper、Voxtral 或 VAD
+        - 字幕下载、翻译、质检或烧录
+        - AI 标题、简介、标签或分区
+        - YouTube 监控
+        - CookieCloud
+        - 通知推送
+        - FFmpeg、转码或 GPU 编码
+        - Web 界面、登录保护或任务管理
+        - Docker、启动或数据持久化
+        - 其他
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 涉及的平台
+      options:
+        - YouTube（源站下载或监控）
+        - AcFun
+        - bilibili
+        - AcFun 与 bilibili
+        - 不适用
+    validations:
+      required: true
+  - type: dropdown
+    id: task-stage
+    attributes:
+      label: 问题发生阶段
+      options:
+        - 服务启动或设置保存
+        - 任务创建或下载
+        - ASR 或字幕处理
+        - 视频转码或烧录
+        - 内容审核或人工审核
+        - 上传投稿
+        - YouTube 监控
+        - 非任务相关
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题概述
+      description: 简洁描述问题；如有任务 ID，仅提供前 8 位即可。
+      placeholder: 例如：任务在转码阶段失败，任务 ID：12345678
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 从启动服务或创建任务开始，列出可稳定复现该问题的最小步骤。
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为与完整错误文本
+      description: 粘贴经过脱敏的错误文本，不要贴完整日志文件。
+    validations:
+      required: true
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: 复现频率
+      options:
+        - 每次都能复现
+        - 偶发
+        - 仅首次出现
+        - 升级后出现
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 按适用项填写版本信息，不适用可填“无”。
+      value: |
+        部署方式：Docker 官方镜像 / Docker 本地构建 / Python 本地运行 / Windows 便携包
+        应用版本：Release 标签、Docker 镜像 tag/digest，或 Git commit
+        操作系统与架构：
+        Python 版本（本地运行时）：
+        Docker Engine / Docker Compose 版本（Docker 时）：
+        FFmpeg 版本：
+        yt-dlp 版本：
+        编码器：auto / cpu / nvidia / intel / amd
+        GPU 与驱动版本（硬件编码、ASR 或 VAD 相关时）：
+    validations:
+      required: true
+  - type: textarea
+    id: relevant-settings
+    attributes:
+      label: 相关配置与第三方服务（脱敏）
+      description: 仅提供相关开关、Provider、模型名、编码器类型及是否使用代理；不要提供密钥、地址、账号或认证信息。
+      placeholder: |
+        是否使用代理：否
+        AI / ASR Provider 与模型名：
+        字幕、监控或 CookieCloud 相关开关：
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志（已脱敏）
+      description: 粘贴故障时间附近的最小片段。通用问题看 `logs/app.log`；单任务问题看 `logs/task_<任务ID>.log`；监控问题看 `logs/youtube_monitor.log`；Docker 启动问题可贴相关的 `docker compose logs` 输出。删除 Cookie、令牌、密钥、账号、私人 URL 和本地用户名后再提交。
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 Issue。
+          required: true
+        - label: 我没有提交 Cookie、密钥、密码、Token、Webhook、完整配置、完整日志或私人内容。
+          required: true
+        - label: 这不是安全漏洞；安全漏洞将按 SECURITY.md 私下报告。
+          required: true

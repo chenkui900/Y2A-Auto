@@ -1,0 +1,54 @@
+services:
+  y2a-auto:
+    container_name: y2a-auto
+    image: fqscfqj/y2a-auto:latest
+    # image: ghcr.io/fqscfqj/y2a-auto:latest
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    
+    # 挂载目录
+    volumes:
+      - ./config:/app/config
+      - ./db:/app/db
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+      - ./cookies:/app/cookies
+      - ./temp:/app/temp
+
+    # 环境变量配置
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONIOENCODING=utf-8
+
+    # ========================================
+    # GPU 硬件编码加速配置（可选）
+    # 根据您的显卡类型，取消注释对应的配置部分
+    # ========================================
+
+    # --- GPU 编码加速配置示例 ---
+    # 根据显卡类型，取消对应部分的注释
+    #
+    # NVIDIA 图形卡示例：
+    #   gpus: all
+    #   environment:
+    #     - NVIDIA_VISIBLE_DEVICES=all
+    #     - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    #
+    # 以下为 Intel/AMD 样板（保留）。若不需要 GPU，整个区块可忽略。
+
+    # --- Intel GPU 配置 (QSV) ---
+    # 需要挂载 /dev/dri 设备
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
+    #   - render
+
+    # --- AMD GPU 配置 (VAAPI) ---
+    # 需要挂载 /dev/dri 设备
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
+    #   - render

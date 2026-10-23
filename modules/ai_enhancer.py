@@ -1,0 +1,2254 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import logging
+import re
+import time
+import json
+import base64
+import traceback
+from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
+from difflib import SequenceMatcher
+from logging.handlers import RotatingFileHandler
+from .utils import (
+    get_app_subdir,
+    safe_str,
+    openai_chat_create_with_thinking_control,
+    extract_chat_message_json,
+    get_chat_message_text,
+)
+
+import openai
+
+# Pre-compiled regex patterns for _pre_clean (performance optimization)
+_URL_PATTERNS = [
+    re.compile(r'https?://[^\s\u4e00-\u9fff]+', re.IGNORECASE),
+    re.compile(r'www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', re.IGNORECASE),
+    re.compile(r'ftp://[^\s\u4e00-\u9fff]+', re.IGNORECASE),
+    re.compile(r'[a-zA-Z0-9.-]+\.(com|org|net|io|me|tv|cn|co|uk)(?:[/\s]|$)', re.IGNORECASE),
+    re.compile(r'\b[a-zA-Z0-9]+\.[a-zA-Z0-9]+/[a-zA-Z0-9_-]+\b', re.IGNORECASE),
+]
+_EMAIL_RE = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
+_SOCIAL_HANDLE_RE = re.compile(r'@[A-Za-z0-9_]+')
+_HASHTAG_RE = re.compile(r'#[A-Za-z0-9_]+')
+_SPONSOR_URL_PATTERNS = [
+    re.compile(r'patreon\.com/[^\s]*', re.IGNORECASE),
+    re.compile(r'ko-fi\.com/[^\s]*', re.IGNORECASE),
+    re.compile(r'buymeacoffee\.com/[^\s]*', re.IGNORECASE),
+]
+_CTA_PATTERNS = [
+    re.compile(r'link\s+in\s+[the\s]*description', re.IGNORECASE),
+    re.compile(r'links?\s+[in\s]*[the\s]*bio', re.IGNORECASE),
+    re.compile(r'check\s+[the\s]*description\s+for', re.IGNORECASE),
+    re.compile(r'visit\s+[our\s]*website\s+at', re.IGNORECASE),
+    re.compile(r'more\s+info\s+at\s+[^\s]+', re.IGNORECASE),
+    re.compile(r'download\s+link[:\s]+[^\s]+', re.IGNORECASE),
+]
+_WHITESPACE_RE = re.compile(r'[ \t\f\v]+')
+_TRAILING_SPACE_RE = re.compile(r'[ \t]+\n')
+_MULTIPLE_NEWLINES_RE = re.compile(r'\n{3,}')
+_LIST_LINE_RE = re.compile(r'^\s*(?:[-*•►]|\d+[.)])\s+', re.IGNORECASE | re.MULTILINE)
+_NON_TEXT_RE = re.compile(r'[^\w\u4e00-\u9fff]+', re.IGNORECASE)
+_MEANINGFUL_TEXT_RE = re.compile(r'[A-Za-z0-9\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+')
+
+_PROMO_LINE_PATTERNS = [
+    re.compile(r'^\s*video playlists?\s*:?', re.IGNORECASE),
+    re.compile(r'^\s*all playlists?\s*:?', re.IGNORECASE),
+    re.compile(r'^\s*website\s*:?', re.IGNORECASE),
+    re.compile(r'^\s*official\s+site\s*:?', re.IGNORECASE),
+    re.compile(r'^\s*(listen|watch)\s+to\s+', re.IGNORECASE),
+    re.compile(r'^\s*(patreon|spotify|itunes|apple music|cdbaby)\b', re.IGNORECASE),
+    re.compile(r'^\s*(follow|subscribe|like|share|download|buy)\b', re.IGNORECASE),
+    re.compile(r'^\s*(播放列表|更多内容|关注|订阅|点赞|分享|评论区|下载链接|购买链接|联系方式)\s*[:：]?', re.IGNORECASE),
+]
+_PROMO_BLOCK_PATTERNS = [
+    re.compile(r'\bvideo\s*playlists?\b', re.IGNORECASE),
+    re.compile(r'\ball\s*playlists?\b', re.IGNORECASE),
+    re.compile(r'\blisten\s+to\b.*\boutside\b', re.IGNORECASE),
+    re.compile(r'\b(link\s+in|links?\s+in|follow|subscribe|visit|website|patreon|download|buy)\b', re.IGNORECASE),
+    re.compile(r'(播放列表|站外|关注|订阅|点赞|分享|联系方式|社交媒体|外部平台)', re.IGNORECASE),
+]
+_EXTERNAL_PLATFORM_PATTERNS = [
+    re.compile(
+        r'\b('
+        r'youtube|spotify|itunes|apple\s*music|patreon|cdbaby|soundcloud|bandcamp|'
+        r'twitter|instagram|facebook|tiktok|discord|telegram|ko-?fi|buymeacoffee'
+        r')\b',
+        re.IGNORECASE
+    ),
+    re.compile(r'(油管|推特|脸书|外部平台|社交平台|官网|官方网站|个人网站|独立站)', re.IGNORECASE),
+]
+_PROMO_SIGNAL_PATTERNS = [
+    re.compile(r'►'),
+    re.compile(r'\b(playlists?|follow|subscribe|link\s+in|website|patreon|download|buy)\b', re.IGNORECASE),
+    re.compile(r'(播放列表|关注|订阅|点赞|分享|链接在|站外|外部平台|联系方式)', re.IGNORECASE),
+]
+
+# Pre-compiled patterns for post-translation cleanup in translate_text
+_TRANSLATION_COMMENT_PATTERNS = [
+    re.compile(r'（注：.*?）', re.IGNORECASE),
+    re.compile(r'\(注：.*?\)', re.IGNORECASE),
+    re.compile(r'【注：.*?】', re.IGNORECASE),
+    re.compile(r'（.*?已移除）', re.IGNORECASE),
+    re.compile(r'\(.*?已移除\)', re.IGNORECASE),
+    re.compile(r'（.*?联系方式.*?）', re.IGNORECASE),
+    re.compile(r'\(.*?联系方式.*?\)', re.IGNORECASE),
+    re.compile(r'（.*?社交媒体.*?）', re.IGNORECASE),
+    re.compile(r'\(.*?社交媒体.*?\)', re.IGNORECASE),
+    re.compile(r'（.*?标签.*?）', re.IGNORECASE),
+    re.compile(r'\(.*?标签.*?\)', re.IGNORECASE),
+    re.compile(r'（.*?链接.*?）', re.IGNORECASE),
+    re.compile(r'\(.*?链接.*?\)', re.IGNORECASE),
+    re.compile(r'（.*?推广.*?）', re.IGNORECASE),
+    re.compile(r'\(.*?推广.*?\)', re.IGNORECASE),
+    re.compile(r'（.*?广告.*?）', re.IGNORECASE),
+    re.compile(r'\(.*?广告.*?\)', re.IGNORECASE),
+    re.compile(r'（.*?removed.*?）', re.IGNORECASE),
+    re.compile(r'\(.*?removed.*?\)', re.IGNORECASE),
+    re.compile(r'（.*?filtered.*?）', re.IGNORECASE),
+    re.compile(r'\(.*?filtered.*?\)', re.IGNORECASE),
+]
+_INTERACTION_PATTERNS = [
+    re.compile(r'订阅[我们的]*[频道]*'),
+    re.compile(r'关注[我们]*'),
+    re.compile(r'点赞[这个]*[视频]*'),
+    re.compile(r'分享[给]*[朋友们]*'),
+    re.compile(r'评论[区]*[见]*'),
+    re.compile(r'更多[内容]*请访问'),
+    re.compile(r'详情见[链接]*'),
+    re.compile(r'链接在[描述]*[中]*'),
+    re.compile(r'访问[我们的]*[网站]*'),
+    re.compile(r'查看[完整]*[版本]*'),
+    re.compile(r'下载[链接]*'),
+    re.compile(r'购买[链接]*'),
+    re.compile(r'subscribe\s+to\s+[our\s]*channel', re.IGNORECASE),
+    re.compile(r'follow\s+[us\s]*', re.IGNORECASE),
+    re.compile(r'like\s+[this\s]*video', re.IGNORECASE),
+    re.compile(r'share\s+[with\s]*[friends\s]*', re.IGNORECASE),
+    re.compile(r'check\s+out\s+[our\s]*[websit\s]*', re.IGNORECASE),
+    re.compile(r'visit\s+[our\s]*[site\s]*', re.IGNORECASE),
+    re.compile(r'download\s+[link\s]*', re.IGNORECASE),
+    re.compile(r'buy\s+[link\s]*', re.IGNORECASE),
+    re.compile(r'more\s+info\s+at', re.IGNORECASE),
+    re.compile(r'see\s+[full\s]*[version\s]*', re.IGNORECASE),
+]
+
+# --- Helpers: logger/client/cleaner (restored) ---
+def setup_task_logger(task_id):
+    """
+    为特定任务设置日志记录器。
+    """
+    log_dir = get_app_subdir('logs')
+    os.makedirs(log_dir, exist_ok=True)
+
+    log_file = os.path.join(log_dir, f'task_{task_id}.log')
+    logger = logging.getLogger(f'ai_enhancer_{task_id}')
+
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        file_handler = RotatingFileHandler(log_file, maxBytes=10485760, backupCount=5, encoding='utf-8')
+        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        file_handler.setLevel(logging.INFO)
+        logger.addHandler(file_handler)
+        logger.propagate = False
+
+    return logger
+
+def get_openai_client(openai_config):
+    """
+    创建OpenAI客户端。
+
+    统一走 modules.ai_fallback_client.get_ai_client，主端点（OPENAI_*）不可用时
+    自动切换到 FALLBACK_OPENAI_* 兜底端点；未配置兜底则退化为单端点，行为不变。
+    """
+    from modules.ai_fallback_client import get_ai_client
+    return get_ai_client(openai_config)
+
+
+def _is_timeout_like_error(exc: Exception) -> bool:
+    exc_type = exc.__class__.__name__.lower()
+    text = safe_str(exc).lower()
+    timeout_signals = (
+        'timeout',
+        'timed out',
+        'readtimeout',
+        'connecttimeout',
+        'apitimeouterror',
+        'deadline exceeded',
+    )
+    return any(signal in exc_type or signal in text for signal in timeout_signals)
+
+
+def _is_response_format_unsupported_error(exc: Exception) -> bool:
+    text = safe_str(exc).lower()
+    signals = (
+        'response_format',
+        'json_object',
+        'json schema',
+        'unsupported format',
+        'invalid parameter',
+        'unrecognized request argument',
+        'extra inputs are not permitted',
+    )
+    return any(signal in text for signal in signals)
+
+def _normalize_whitespace(text: str) -> str:
+    if not text:
+        return ''
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = _WHITESPACE_RE.sub(' ', text)
+    text = _TRAILING_SPACE_RE.sub('\n', text)
+    text = _MULTIPLE_NEWLINES_RE.sub('\n\n', text)
+    return text.strip()
+
+def _strip_external_platforms(text: str) -> str:
+    if not text:
+        return ''
+    cleaned = text
+    for pat in _EXTERNAL_PLATFORM_PATTERNS:
+        cleaned = pat.sub('', cleaned)
+    return cleaned
+
+def _split_blocks(text: str) -> list:
+    if not text:
+        return []
+    return [b.strip() for b in re.split(r'\n\s*\n+', text) if b and b.strip()]
+
+def _cleanup_list_prefix(line: str) -> str:
+    return _LIST_LINE_RE.sub('', line or '').strip()
+
+def _looks_like_promo_line(line: str) -> bool:
+    if not line:
+        return False
+    compact = line.strip()
+    if not compact:
+        return False
+    if '►' in compact:
+        return True
+    if _URL_PATTERNS[0].search(compact) or _URL_PATTERNS[1].search(compact):
+        return True
+    for pat in _PROMO_LINE_PATTERNS:
+        if pat.search(compact):
+            return True
+    for pat in _CTA_PATTERNS:
+        if pat.search(compact):
+            return True
+    return False
+
+def _looks_like_promo_block(block: str) -> bool:
+    if not block:
+        return False
+    for pat in _PROMO_BLOCK_PATTERNS:
+        if pat.search(block):
+            return True
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        promo_like = sum(1 for ln in lines if _looks_like_promo_line(ln))
+        if promo_like >= max(2, len(lines) // 2):
+            return True
+    return False
+
+def _compress_description_blocks(text: str, max_blocks: Optional[int] = 2) -> str:
+    blocks = []
+    for block in _split_blocks(text):
+        if _looks_like_promo_block(block):
+            continue
+        clean_lines = []
+        for line in block.splitlines():
+            normalized = _cleanup_list_prefix(_normalize_whitespace(line))
+            if not normalized:
+                continue
+            if _looks_like_promo_line(normalized):
+                continue
+            clean_lines.append(normalized)
+        if clean_lines:
+            # 将块内列表折叠成自然段
+            blocks.append(' '.join(clean_lines))
+    if not blocks:
+        lines = []
+        for line in _normalize_whitespace(text).split('\n'):
+            normalized = _cleanup_list_prefix(line)
+            if normalized and not _looks_like_promo_line(normalized):
+                lines.append(normalized)
+        if lines:
+            blocks = [' '.join(lines)]
+    if max_blocks is not None:
+        blocks = blocks[:max(0, int(max_blocks))]
+    return '\n\n'.join(blocks).strip()
+
+def _pre_clean(text: str, content_type: str = "description", max_blocks: Optional[int] = 2) -> str:
+    """在发送给模型前做确定性去噪：移除导流信息，并将描述压缩成自然段。"""
+    if not text:
+        return text
+
+    ct_lower = str(content_type).lower().strip()
+    cleaned = text
+
+    for pat in _URL_PATTERNS:
+        cleaned = pat.sub('', cleaned)
+    cleaned = _EMAIL_RE.sub('', cleaned)
+    cleaned = _SOCIAL_HANDLE_RE.sub('', cleaned)
+    cleaned = _HASHTAG_RE.sub('', cleaned)
+    for pat in _SPONSOR_URL_PATTERNS:
+        cleaned = pat.sub('', cleaned)
+    for pat in _CTA_PATTERNS:
+        cleaned = pat.sub('', cleaned)
+    cleaned = _strip_external_platforms(cleaned)
+    cleaned = _normalize_whitespace(cleaned)
+
+    if ct_lower == 'title':
+        # 标题不需要多段结构，压缩为单行
+        title = _cleanup_list_prefix(cleaned.replace('\n', ' '))
+        title = _normalize_whitespace(title).replace('\n', ' ')
+        return title.strip()
+
+    return _compress_description_blocks(cleaned, max_blocks=max_blocks)
+
+
+def _has_meaningful_content(text: str, content_type: str = "description") -> bool:
+    cleaned = safe_str(text).strip()
+    if not cleaned:
+        return False
+    tokens = _MEANINGFUL_TEXT_RE.findall(cleaned)
+    if not tokens:
+        return False
+    if str(content_type).lower().strip() == "title":
+        return True
+    total_chars = sum(len(token) for token in tokens)
+    return total_chars > 3 or len(tokens) > 1
+
+_LANGUAGE_NAME_MAP = {
+    "zh": "简体中文",
+    "en": "English",
+    "ja": "日本語",
+    "ko": "한국어",
+}
+_DESCRIPTION_ONLY_RETRY_REASONS = frozenset({"empty_output", "description_not_natural"})
+METADATA_TRANSLATION_MAX_ATTEMPTS = 3
+METADATA_TRANSLATION_RETRY_DELAY_SECONDS = 2
+
+
+def _normalize_target_language(target_language: str) -> str:
+    value = safe_str(target_language).strip().lower()
+    for prefix in ("zh", "en", "ja", "ko"):
+        if value.startswith(prefix):
+            return prefix
+    return value or "zh"
+
+
+def _target_language_name(target_language: str) -> str:
+    normalized = _normalize_target_language(target_language)
+    return _LANGUAGE_NAME_MAP.get(normalized, safe_str(target_language).strip() or "简体中文")
+
+def _post_clean(text: str, content_type: str = "description", max_blocks: Optional[int] = 2) -> str:
+    if not text:
+        return ''
+
+    ct_lower = str(content_type).lower().strip()
+    cleaned = text
+
+    for prefix in ["翻译：", "译文：", "这是翻译：", "以下是译文：", "以下是我的翻译："]:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+
+    for pattern in _TRANSLATION_COMMENT_PATTERNS:
+        cleaned = pattern.sub('', cleaned)
+    for pattern in _URL_PATTERNS:
+        cleaned = pattern.sub('', cleaned)
+    cleaned = _EMAIL_RE.sub('', cleaned)
+    cleaned = _SOCIAL_HANDLE_RE.sub('', cleaned)
+    cleaned = _HASHTAG_RE.sub('', cleaned)
+    for pattern in _INTERACTION_PATTERNS:
+        cleaned = pattern.sub('', cleaned)
+    cleaned = _strip_external_platforms(cleaned)
+    cleaned = _normalize_whitespace(cleaned)
+
+    if ct_lower == 'title':
+        cleaned = _cleanup_list_prefix(cleaned.replace('\n', ' '))
+        cleaned = _normalize_whitespace(cleaned).replace('\n', ' ')
+        return cleaned.strip()
+
+    cleaned = _compress_description_blocks(cleaned, max_blocks=max_blocks)
+    return _normalize_whitespace(cleaned)
+
+def _normalize_for_similarity(text: str) -> str:
+    if not text:
+        return ''
+    normalized = _NON_TEXT_RE.sub('', text.lower())
+    return normalized.strip()
+
+def _contains_promo_signal(text: str) -> bool:
+    if not text:
+        return False
+    if _EMAIL_RE.search(text) or _SOCIAL_HANDLE_RE.search(text) or _HASHTAG_RE.search(text):
+        return True
+    for pat in _URL_PATTERNS[:3]:
+        if pat.search(text):
+            return True
+    for pat in _PROMO_SIGNAL_PATTERNS:
+        if pat.search(text):
+            return True
+    for pat in _EXTERNAL_PLATFORM_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+def _is_natural_description(text: str, max_blocks: Optional[int] = 2) -> bool:
+    blocks = _split_blocks(text)
+    if not blocks:
+        return False
+    if max_blocks is not None and len(blocks) > max_blocks:
+        return False
+    if _LIST_LINE_RE.search(text):
+        return False
+    if '►' in text:
+        return False
+    if any(len(block.strip()) < 6 for block in blocks):
+        return False
+    return True
+
+def _validate_output(
+    source_clean: str,
+    output_text: str,
+    content_type: str = "description",
+    *,
+    description_max_blocks: Optional[int] = 2,
+):
+    reasons = []
+    ct_lower = str(content_type).lower().strip()
+    out = (output_text or '').strip()
+    src = (source_clean or '').strip()
+
+    if not out:
+        reasons.append('empty_output')
+    if _contains_promo_signal(out):
+        reasons.append('contains_promo_signal')
+
+    src_norm = _normalize_for_similarity(src)
+    out_norm = _normalize_for_similarity(out)
+    if src_norm and out_norm:
+        if len(src_norm) >= 12 and len(out_norm) >= 8:
+            ratio = SequenceMatcher(None, src_norm, out_norm).ratio()
+            if ratio >= 0.90:
+                reasons.append(f'too_similar:{ratio:.2f}')
+        elif src_norm == out_norm and len(src_norm) >= 6:
+            reasons.append('identical_to_source')
+
+    if ct_lower != 'title' and out and not _is_natural_description(out, max_blocks=description_max_blocks):
+        reasons.append('description_not_natural')
+
+    return len(reasons) == 0, reasons
+
+def _apply_output_limits(
+    text: str,
+    content_type: str = "description",
+    logger=None,
+    *,
+    title_limit: int = 50,
+    description_limit: int = 1000,
+) -> str:
+    limited = text or ''
+    ct_lower = str(content_type).lower().strip()
+    if ct_lower == 'title' and len(limited) > title_limit:
+        if logger:
+            logger.info(f"标题超过限制({title_limit}字符)，将被截断: {len(limited)} -> {title_limit}")
+        limited = limited[:title_limit]
+    if ct_lower != 'title' and len(limited) > description_limit:
+        if logger:
+            logger.info(
+                f"描述超过限制({description_limit}字符)，将被截断: {len(limited)} -> {description_limit}"
+            )
+        limited = limited[: max(0, description_limit - 3)] + "..." if description_limit > 3 else limited[:description_limit]
+    return limited
+
+def _build_fallback_text(
+    source_clean: str,
+    content_type: str,
+    logger=None,
+    max_blocks: Optional[int] = 2,
+    *,
+    title_limit: int = 50,
+    description_limit: int = 1000,
+) -> str:
+    if not source_clean:
+        return ''
+    fallback = _post_clean(source_clean, content_type=content_type, max_blocks=max_blocks)
+    return _apply_output_limits(
+        fallback,
+        content_type=content_type,
+        logger=logger,
+        title_limit=title_limit,
+        description_limit=description_limit,
+    )
+
+
+def _build_metadata_translation_system_prompt(target_language: str, retry: bool = False, openai_config=None) -> str:
+    """构建元数据翻译 system prompt（委托给统一 Prompt 中心）。"""
+    from .prompt_manager import get_metadata_translate_prompt, read_prompt_config_from_app_config
+    mode = 'builtin'
+    user_text = ''
+    if openai_config:
+        try:
+            mode, user_text = read_prompt_config_from_app_config(openai_config, 'METADATA_TRANSLATE')
+        except Exception as exc:
+            logging.getLogger(__name__).debug("读取 Prompt 配置失败（METADATA_TRANSLATE），将回退 builtin: %s", exc)
+    return get_metadata_translate_prompt(
+        mode=mode,
+        user_text=user_text,
+        target_language=target_language,
+        retry=retry,
+    )
+
+
+def _build_description_retry_system_prompt(target_language: str, openai_config=None) -> str:
+    """构建简介重试 system prompt（委托给统一 Prompt 中心）。"""
+    from .prompt_manager import get_metadata_desc_retry_prompt, read_prompt_config_from_app_config
+    mode = 'builtin'
+    user_text = ''
+    if openai_config:
+        try:
+            mode, user_text = read_prompt_config_from_app_config(openai_config, 'METADATA_DESC_RETRY')
+        except Exception as exc:
+            logging.getLogger(__name__).debug("读取 Prompt 配置失败（METADATA_DESC_RETRY），将回退 builtin: %s", exc)
+    return get_metadata_desc_retry_prompt(
+        mode=mode,
+        user_text=user_text,
+        target_language=target_language,
+    )
+
+
+def _build_metadata_translation_payload(
+    title: str,
+    description: str,
+    target_language: str,
+    translate_title: bool = True,
+    translate_description: bool = True,
+) -> Dict[str, str]:
+    payload: Dict[str, str] = {"target_language": safe_str(target_language).strip() or "zh-CN"}
+    if translate_title and title:
+        payload["title"] = title
+    if translate_description and description:
+        payload["description"] = description
+    return payload
+
+
+def _request_chat_completion(
+    client,
+    model_name: str,
+    system_prompt: str,
+    payload: Dict[str, Any],
+    *,
+    temperature: float,
+    thinking_enabled: bool,
+    logger_obj,
+    scene_name: str,
+    user_content=None,
+    response_format=None,
+):
+    """公共 LLM 调用逻辑：构建消息、计时、执行请求，返回原始 response。"""
+    user_message_content = user_content
+    if user_message_content is None:
+        user_message_content = json.dumps(payload, ensure_ascii=False)
+    create_kwargs = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message_content},
+        ],
+        "temperature": temperature,
+    }
+    if response_format is not None:
+        create_kwargs["response_format"] = response_format
+    request_start = time.time()
+    mode_label = "JSON模式" if response_format else "纯文本模式"
+    if logger_obj:
+        logger_obj.info(f"发起模型请求（{mode_label}）")
+    try:
+        response = openai_chat_create_with_thinking_control(
+            client=client,
+            create_kwargs=create_kwargs,
+            thinking_enabled=thinking_enabled,
+            logger=logger_obj,
+            scene_name=scene_name,
+        )
+    finally:
+        if logger_obj:
+            logger_obj.info(f"模型请求结束，耗时: {time.time() - request_start:.2f}秒")
+    return response
+
+
+def _request_json_object(
+    client,
+    model_name: str,
+    system_prompt: str,
+    payload: Dict[str, Any],
+    *,
+    temperature: float,
+    thinking_enabled: bool,
+    logger_obj,
+    scene_name: str,
+    user_content=None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        response = _request_chat_completion(
+            client, model_name, system_prompt, payload,
+            temperature=temperature,
+            thinking_enabled=thinking_enabled, logger_obj=logger_obj,
+            scene_name=scene_name, user_content=user_content,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:
+        if _is_timeout_like_error(exc) or _is_response_format_unsupported_error(exc):
+            if logger_obj:
+                logger_obj.warning(
+                    f"{scene_name} JSON模式请求失败，回退到纯文本JSON解析: {exc.__class__.__name__}: {exc}"
+                )
+            response = _request_chat_completion(
+                client, model_name, system_prompt, payload,
+                temperature=temperature,
+                thinking_enabled=thinking_enabled, logger_obj=logger_obj,
+                scene_name=f"{scene_name}_fallback_plain_json",
+                user_content=user_content,
+            )
+        else:
+            raise
+    if not getattr(response, "choices", None):
+        if logger_obj:
+            logger_obj.warning(f"{scene_name} 模型返回空 choices")
+        return None
+    parsed = extract_chat_message_json(response.choices[0].message, expected_type=dict)
+    if isinstance(parsed, dict):
+        return parsed
+
+    # JSON 解析失败，重试一次（纯文本模式，强化提示）
+    raw_text = get_chat_message_text(response.choices[0].message)
+    if logger_obj:
+        logger_obj.warning(
+            "%s 模型返回内容无法解析为 JSON（正文长度=%d），重试中…",
+            scene_name,
+            len(raw_text),
+        )
+    retry_system = system_prompt + "\n重要：你必须且只能返回一个合法的JSON对象，不要包含任何解释、代码标记或额外文字。"
+    try:
+        response = _request_chat_completion(
+            client, model_name, retry_system, payload,
+            temperature=temperature,
+            thinking_enabled=thinking_enabled, logger_obj=logger_obj,
+            scene_name=f"{scene_name}_retry_json",
+            user_content=user_content,
+        )
+    except Exception:
+        pass
+    else:
+        if getattr(response, "choices", None):
+            parsed = extract_chat_message_json(response.choices[0].message, expected_type=dict)
+            if isinstance(parsed, dict):
+                if logger_obj:
+                    logger_obj.info("%s 重试成功，已获取有效 JSON", scene_name)
+                return parsed
+
+    if logger_obj:
+        logger_obj.warning(
+            "%s 模型返回内容最终无法解析为 JSON（正文长度=%d）",
+            scene_name,
+            len(raw_text),
+        )
+    return None
+
+
+def _request_raw_text(
+    client,
+    model_name: str,
+    system_prompt: str,
+    payload: Dict[str, Any],
+    *,
+    temperature: float,
+    thinking_enabled: bool,
+    logger_obj,
+    scene_name: str,
+    user_content=None,
+) -> str:
+    """请求 LLM 返回原始文本（不做 JSON 解析），用于索引制分段等场景。"""
+    response = _request_chat_completion(
+        client, model_name, system_prompt, payload,
+        temperature=temperature,
+        thinking_enabled=thinking_enabled, logger_obj=logger_obj,
+        scene_name=scene_name, user_content=user_content,
+    )
+    if not getattr(response, "choices", None):
+        return ''
+    return get_chat_message_text(response.choices[0].message)
+
+
+def _sanitize_metadata_field(
+    value: Any,
+    content_type: str,
+    logger=None,
+    max_blocks: Optional[int] = 2,
+    *,
+    title_limit: int = 50,
+    description_limit: int = 1000,
+) -> str:
+    cleaned = _post_clean(safe_str(value), content_type=content_type, max_blocks=max_blocks)
+    return _apply_output_limits(
+        cleaned,
+        content_type=content_type,
+        logger=logger,
+        title_limit=title_limit,
+        description_limit=description_limit,
+    )
+
+
+def _collect_invalid_metadata_fields(
+    cleaned_sources: Dict[str, str],
+    outputs: Dict[str, str],
+    *,
+    description_max_blocks: Optional[int] = 2,
+) -> Dict[str, List[str]]:
+    invalid_fields: Dict[str, List[str]] = {}
+    for field_name in ("title", "description"):
+        source_clean = cleaned_sources.get(field_name, '')
+        output_text = outputs.get(field_name, '')
+        if not source_clean:
+            if output_text:
+                invalid_fields[field_name] = ["unexpected_output"]
+            continue
+        is_valid, reasons = _validate_output(
+            source_clean,
+            output_text,
+            content_type=field_name,
+            description_max_blocks=description_max_blocks,
+        )
+        if not is_valid:
+            invalid_fields[field_name] = reasons
+    return invalid_fields
+
+
+def _count_description_blocks(text: str) -> int:
+    return len(_split_blocks(text))
+
+
+def _should_use_description_only_retry(reasons: Sequence[str]) -> bool:
+    return bool(_DESCRIPTION_ONLY_RETRY_REASONS.intersection(reasons or ()))
+
+
+def _is_retryable_metadata_failure(reason: str) -> bool:
+    normalized = safe_str(reason).strip().lower()
+    if not normalized:
+        return False
+    non_retryable_reasons = {
+        "missing_openai_config",
+        "no_meaningful_content_after_preclean",
+    }
+    if normalized in non_retryable_reasons:
+        return False
+    return True
+
+
+def _should_retry_metadata_translation_attempt(failed_fields: Mapping[str, Sequence[str]]) -> bool:
+    for reasons in (failed_fields or {}).values():
+        for reason in reasons or ():
+            if _is_retryable_metadata_failure(reason):
+                return True
+    return False
+
+
+def _humanize_metadata_failure_reason(reason: str) -> str:
+    normalized = safe_str(reason).strip()
+    lowered = normalized.lower()
+
+    if lowered == "empty_output":
+        return "输出为空"
+    if lowered == "description_not_natural":
+        return "简介格式不自然"
+    if lowered == "contains_promo_signal":
+        return "含有导流或外链残留"
+    if lowered == "identical_to_source":
+        return "与原文相同"
+    if lowered == "unexpected_output":
+        return "返回了非预期内容"
+    if lowered == "no_meaningful_content_after_preclean":
+        return "预清洗后无可用内容"
+    if lowered == "missing_openai_config":
+        return "缺少 OpenAI 配置"
+    if lowered.startswith("too_similar:"):
+        score = normalized.split(":", 1)[1] if ":" in normalized else ""
+        return f"与原文过于相似{f'（相似度 {score}）' if score else ''}"
+    if lowered.startswith("exception:"):
+        exc_name = normalized.split(":", 1)[1] if ":" in normalized else "unknown"
+        return f"请求异常（{exc_name}）"
+    return normalized or "未知原因"
+
+
+def _build_metadata_failure_message(failed_fields: Mapping[str, Sequence[str]]) -> str:
+    if not failed_fields:
+        return ""
+
+    field_names = {
+        "title": "标题",
+        "description": "简介",
+    }
+    parts = []
+    for field_name in ("title", "description"):
+        reasons = list(failed_fields.get(field_name) or [])
+        if not reasons:
+            continue
+        reason_text = "、".join(_humanize_metadata_failure_reason(reason) for reason in reasons)
+        parts.append(f"{field_names.get(field_name, field_name)}：{reason_text}")
+
+    if not parts:
+        return "自动翻译失败，任务已转入人工审核。"
+    return "自动翻译失败，" + "；".join(parts) + "。任务已转入人工审核。"
+
+
+def _log_description_field_state(logger, phase: str, raw_value: Any, sanitized_value: str) -> None:
+    raw_text = safe_str(raw_value).strip()
+    sanitized_text = safe_str(sanitized_value).strip()
+    if not raw_text:
+        logger.warning(f"{phase} description 模型输出为空")
+    elif not sanitized_text:
+        logger.warning(f"{phase} description 模型有输出，但后处理后为空")
+
+
+def _request_translated_metadata_fields(
+    client,
+    model_name: str,
+    system_prompt: str,
+    payload: Dict[str, Any],
+    *,
+    thinking_enabled: bool,
+    logger,
+    scene_name: str,
+    description_max_blocks: Optional[int] = 2,
+    description_log_phase: Optional[str] = None,
+    title_limit: int = 50,
+    description_limit: int = 1000,
+) -> Dict[str, str]:
+    parsed = _request_json_object(
+        client=client,
+        model_name=model_name,
+        system_prompt=system_prompt,
+        payload=payload,
+        temperature=0.2,
+        thinking_enabled=thinking_enabled,
+        logger_obj=logger,
+        scene_name=scene_name,
+    )
+    raw_title = (parsed or {}).get("title", '')
+    raw_description = (parsed or {}).get("description", '')
+    translated_fields = {
+        "title": _sanitize_metadata_field(
+            raw_title,
+            "title",
+            logger=logger,
+            title_limit=title_limit,
+            description_limit=description_limit,
+        ),
+        "description": _sanitize_metadata_field(
+            raw_description,
+            "description",
+            logger=logger,
+            max_blocks=description_max_blocks,
+            title_limit=title_limit,
+            description_limit=description_limit,
+        ),
+    }
+    if description_log_phase and "description" in payload:
+        _log_description_field_state(
+            logger,
+            description_log_phase,
+            raw_description,
+            translated_fields["description"],
+    )
+    return translated_fields
+
+
+def _translate_video_metadata_once(
+    *,
+    client,
+    model_name: str,
+    target_language: str,
+    thinking_enabled: bool,
+    cleaned_title: str,
+    cleaned_description: str,
+    requested_fields: Sequence[str],
+    logger,
+    title_limit: int = 50,
+    description_limit: int = 1000,
+    openai_config=None,
+) -> Dict[str, Any]:
+    translated_fields = {
+        "title": "",
+        "description": "",
+    }
+    failed_fields: Dict[str, List[str]] = {}
+
+    requestable_fields: List[str] = []
+    for field_name, source_text in (
+        ("title", cleaned_title),
+        ("description", cleaned_description),
+    ):
+        if field_name not in requested_fields:
+            continue
+        if not source_text:
+            failed_fields[field_name] = ["no_meaningful_content_after_preclean"]
+            continue
+        requestable_fields.append(field_name)
+
+    if not requestable_fields:
+        return {
+            "translated_fields": translated_fields,
+            "failed_fields": failed_fields,
+        }
+
+    payload = _build_metadata_translation_payload(
+        cleaned_title,
+        cleaned_description,
+        target_language=target_language,
+        translate_title="title" in requestable_fields,
+        translate_description="description" in requestable_fields,
+    )
+    cleaned_sources = {
+        "title": cleaned_title if "title" in requestable_fields else "",
+        "description": cleaned_description if "description" in requestable_fields else "",
+    }
+
+    translated_fields = _request_translated_metadata_fields(
+        client=client,
+        model_name=model_name,
+        system_prompt=_build_metadata_translation_system_prompt(target_language, retry=False, openai_config=openai_config),
+        payload=payload,
+        thinking_enabled=thinking_enabled,
+        scene_name="ai_enhancer_metadata_translate",
+        logger=logger,
+        description_max_blocks=None,
+        description_log_phase="首轮",
+        title_limit=title_limit,
+        description_limit=description_limit,
+    )
+    invalid_fields = _collect_invalid_metadata_fields(
+        cleaned_sources,
+        translated_fields,
+        description_max_blocks=None,
+    )
+
+    if invalid_fields:
+        logger.info(f"元数据首轮输出未通过校验，失败字段: {invalid_fields}")
+
+        if "title" in invalid_fields:
+            retry_payload = _build_metadata_translation_payload(
+                cleaned_title,
+                "",
+                target_language=target_language,
+                translate_title=True,
+                translate_description=False,
+            )
+            retry_fields = _request_translated_metadata_fields(
+                client=client,
+                model_name=model_name,
+                system_prompt=_build_metadata_translation_system_prompt(target_language, retry=True, openai_config=openai_config),
+                payload=retry_payload,
+                thinking_enabled=thinking_enabled,
+                scene_name="ai_enhancer_metadata_translate_title_retry",
+                logger=logger,
+                description_max_blocks=None,
+                title_limit=title_limit,
+                description_limit=description_limit,
+            )
+            translated_fields["title"] = retry_fields["title"]
+
+        if "description" in invalid_fields:
+            description_retry_prompt = _build_metadata_translation_system_prompt(target_language, retry=True, openai_config=openai_config)
+            description_retry_scene = "ai_enhancer_metadata_translate_retry"
+            if _should_use_description_only_retry(invalid_fields["description"]):
+                logger.info(
+                    f"description 字段触发定向重试，失败原因: {invalid_fields['description']}"
+                )
+                description_retry_prompt = _build_description_retry_system_prompt(target_language, openai_config=openai_config)
+                description_retry_scene = "ai_enhancer_metadata_translate_description_retry"
+
+            description_retry_payload = _build_metadata_translation_payload(
+                "",
+                cleaned_description,
+                target_language=target_language,
+                translate_title=False,
+                translate_description=True,
+            )
+            retry_fields = _request_translated_metadata_fields(
+                client=client,
+                model_name=model_name,
+                system_prompt=description_retry_prompt,
+                payload=description_retry_payload,
+                thinking_enabled=thinking_enabled,
+                scene_name=description_retry_scene,
+                logger=logger,
+                description_max_blocks=None,
+                description_log_phase="重试",
+                title_limit=title_limit,
+                description_limit=description_limit,
+            )
+            translated_fields["description"] = retry_fields["description"]
+
+        invalid_fields = _collect_invalid_metadata_fields(
+            cleaned_sources,
+            translated_fields,
+            description_max_blocks=None,
+        )
+        if invalid_fields:
+            logger.warning(f"元数据重试后仍有失败字段: {invalid_fields}")
+
+    for field_name in requestable_fields:
+        if field_name in invalid_fields or not translated_fields.get(field_name):
+            failed_fields[field_name] = list(invalid_fields.get(field_name) or ["empty_output"])
+            translated_fields[field_name] = ""
+
+    return {
+        "translated_fields": translated_fields,
+        "failed_fields": failed_fields,
+    }
+
+
+def translate_video_metadata(
+    title,
+    description,
+    target_language="zh-CN",
+    openai_config=None,
+    task_id=None,
+    translate_title: bool = True,
+    translate_description: bool = True,
+    title_limit: int = 50,
+    description_limit: int = 1000,
+):
+    """翻译视频标题和简介，返回带状态与诊断信息的结构化结果。"""
+    logger = setup_task_logger(task_id or "unknown")
+    raw_title = safe_str(title)
+    raw_description = safe_str(description)
+
+    logger.info(f"开始翻译视频元数据，目标语言: {target_language}")
+    logger.info(f"原标题 (截取前100字符): {raw_title[:100]}...")
+    logger.info(f"原简介长度: {len(raw_description)} 字符")
+
+    cleaned_title = _pre_clean(raw_title, content_type="title") if translate_title and raw_title else ''
+    cleaned_description = (
+        _pre_clean(raw_description, content_type="description", max_blocks=None)
+        if translate_description and raw_description
+        else ''
+    )
+    if cleaned_title and not _has_meaningful_content(cleaned_title, content_type="title"):
+        cleaned_title = ''
+    if cleaned_description and not _has_meaningful_content(cleaned_description, content_type="description"):
+        cleaned_description = ''
+
+    if translate_description and raw_description and not cleaned_description:
+        logger.info("简介预清洗后无有效内容，直接留空")
+    elif cleaned_description:
+        logger.info(
+            f"简介预清洗后长度: {len(cleaned_description)} 字符，段落数: {_count_description_blocks(cleaned_description)}"
+        )
+    if (translate_title and raw_title and cleaned_title != raw_title) or (
+        translate_description and raw_description and cleaned_description != raw_description
+    ):
+        logger.info("已在提示阶段前执行结构化预清洗（去导流/站外信息/列表化噪声）")
+
+    requested_fields = []
+    if translate_title and raw_title:
+        requested_fields.append("title")
+    if translate_description and raw_description:
+        requested_fields.append("description")
+
+    final_result = {
+        "success": False,
+        "attempts": 0,
+        "requested_fields": requested_fields,
+        "failed_fields": {},
+        "error_message": "",
+        "translated_fields": {
+            "title": "",
+            "description": "",
+        },
+        "title": "",
+        "description": "",
+    }
+    if not requested_fields:
+        logger.info("没有可发送给模型的有效元数据字段，直接返回清洗结果")
+        final_result["success"] = True
+        return final_result
+
+    if not openai_config or not openai_config.get('OPENAI_API_KEY'):
+        logger.warning("缺少OpenAI配置或API密钥，无法执行元数据翻译")
+        final_result["failed_fields"] = {
+            field_name: ["missing_openai_config"] for field_name in requested_fields
+        }
+        final_result["error_message"] = _build_metadata_failure_message(final_result["failed_fields"])
+        return final_result
+
+    try:
+        client = get_openai_client(openai_config)
+        model_name = openai_config.get('OPENAI_MODEL_NAME', 'gpt-3.5-turbo')
+        thinking_enabled = openai_config.get('OPENAI_THINKING_ENABLED', False)
+
+        start_time = time.time()
+        last_attempt_result = None
+
+        for attempt in range(1, METADATA_TRANSLATION_MAX_ATTEMPTS + 1):
+            final_result["attempts"] = attempt
+            try:
+                attempt_result = _translate_video_metadata_once(
+                    client=client,
+                    model_name=model_name,
+                    target_language=target_language,
+                    thinking_enabled=thinking_enabled,
+                    cleaned_title=cleaned_title,
+                    cleaned_description=cleaned_description,
+                    requested_fields=requested_fields,
+                    logger=logger,
+                    title_limit=title_limit,
+                    description_limit=description_limit,
+                    openai_config=openai_config,
+                )
+            except Exception as exc:
+                logger.error(f"第 {attempt} 次元数据翻译尝试发生异常: {exc}")
+                logger.error(traceback.format_exc())
+                attempt_result = {
+                    "translated_fields": {
+                        "title": "",
+                        "description": "",
+                    },
+                    "failed_fields": {
+                        field_name: [f"exception:{exc.__class__.__name__}"]
+                        for field_name in requested_fields
+                    },
+                }
+
+            last_attempt_result = attempt_result
+            translated_fields = dict(attempt_result.get("translated_fields") or {})
+            failed_fields = dict(attempt_result.get("failed_fields") or {})
+
+            final_result["translated_fields"] = {
+                "title": translated_fields.get("title", ""),
+                "description": translated_fields.get("description", ""),
+            }
+            final_result["title"] = final_result["translated_fields"]["title"]
+            final_result["description"] = final_result["translated_fields"]["description"]
+            final_result["failed_fields"] = failed_fields
+            final_result["error_message"] = _build_metadata_failure_message(failed_fields)
+
+            if not failed_fields:
+                final_result["success"] = True
+                break
+
+            logger.warning(
+                f"第 {attempt} 次元数据翻译仍有失败字段: {failed_fields}"
+            )
+            if (
+                attempt < METADATA_TRANSLATION_MAX_ATTEMPTS
+                and _should_retry_metadata_translation_attempt(failed_fields)
+            ):
+                time.sleep(METADATA_TRANSLATION_RETRY_DELAY_SECONDS)
+            else:
+                break
+
+        elapsed = time.time() - start_time
+        logger.info(f"元数据翻译完成，耗时: {elapsed:.2f}秒")
+        logger.info(f"翻译标题: {final_result['title'][:100]}...")
+        logger.info(f"翻译简介长度: {len(final_result['description'])} 字符")
+        if final_result["failed_fields"]:
+            logger.warning(f"元数据翻译最终失败字段: {final_result['failed_fields']}")
+        return final_result
+
+    except Exception as e:
+        logger.error(f"翻译视频元数据时发生错误: {str(e)}")
+        logger.error(traceback.format_exc())
+        final_result["failed_fields"] = {
+            field_name: [f"exception:{e.__class__.__name__}"] for field_name in requested_fields
+        }
+        final_result["error_message"] = _build_metadata_failure_message(final_result["failed_fields"])
+        return final_result
+
+def generate_acfun_tags(title, description, openai_config=None, task_id=None, avoid_tags=None):
+    """
+    使用OpenAI生成AcFun风格的标签
+    
+    Args:
+        title (str): 视频标题
+        description (str): 视频描述
+        openai_config (dict): OpenAI配置信息，包含api_key, base_url, model_name等
+        task_id (str, optional): 任务ID，用于日志记录
+        avoid_tags (list, optional): 已由人工预设占用的标签，提示模型不要重复并在解析后过滤
+        
+    Returns:
+        list: 标签列表，出错时返回空列表
+    """
+    logger = setup_task_logger(task_id or "unknown")
+    logger.info("开始生成AcFun标签")
+    title = _pre_clean(safe_str(title), content_type="title")
+    description = _pre_clean(safe_str(description), content_type="description")
+    if not _has_meaningful_content(title, content_type="title"):
+        title = ''
+    if not _has_meaningful_content(description, content_type="description"):
+        description = ''
+    logger.info(f"标签标题输入: {title[:100]}...")
+    logger.info(f"标签简介输入长度: {len(description)} 字符")
+
+    if not (title or description):
+        logger.warning("缺少有效标题和简介，跳过标签生成")
+        return []
+
+    if not openai_config or not openai_config.get('OPENAI_API_KEY'):
+        logger.warning("缺少OpenAI配置或API密钥，跳过标签生成")
+        return []
+
+    try:
+        client = get_openai_client(openai_config)
+        model_name = openai_config.get('OPENAI_MODEL_NAME', 'gpt-3.5-turbo')
+        start_time = time.time()
+
+        # 预设标签（Issue #139）：预设已占用这些标签，禁止模型重复或近似复用。
+        # 同时把截断到 10 字的形式一并纳入比对集合：上传给 AcFun 前每个标签都会被
+        # 截断到 10 字，若只比对原文，12 字的预设标签与模型返回的 10 字版本仍会撞车。
+        # 拼进提示词时按 bilibili 的单标签上限（20 字）收口：预设本身允许保留超长原文
+        # （设置页只告警不裁剪），但超长文本拼进 system prompt 没有意义，只会白白占额度。
+        _avoid_prompt_max_len = 20
+        avoid_list = []
+        for raw_avoid in (avoid_tags or []):
+            avoid_tag = _normalize_whitespace(safe_str(raw_avoid)).strip()
+            if avoid_tag and avoid_tag not in avoid_list:
+                avoid_list.append(avoid_tag)
+        avoid_set = set()
+        for avoid_tag in avoid_list:
+            avoid_set.add(avoid_tag.lower())
+            avoid_set.add(avoid_tag[:10].lower())
+        prompt_avoid_list = [tag[:_avoid_prompt_max_len] for tag in avoid_list]
+
+        system_prompt = (
+            "你是视频标签生成器。基于标题和简介输出 6 个简体中文标签。"
+            "标签必须短、去重、无序号、无解释。"
+            '只返回 JSON：{"tags":["","","","","",""]}。'
+        )
+        if prompt_avoid_list:
+            system_prompt += (
+                "以下标签已被人工预设占用，禁止重复或近似复用："
+                + "、".join(prompt_avoid_list) + "。"
+            )
+            logger.info(f"标签生成已排除预设标签: {prompt_avoid_list}")
+
+        parsed = _request_json_object(
+            client=client,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            payload={
+                "title": title,
+                "description": description[:200],
+            },
+            temperature=0.2,
+            thinking_enabled=openai_config.get('OPENAI_THINKING_ENABLED', False),
+            logger_obj=logger,
+            scene_name='ai_enhancer_tags',
+        )
+        response_time = time.time() - start_time
+        logger.info(f"标签生成完成，耗时: {response_time:.2f}秒")
+
+        raw_tags = parsed.get("tags") if isinstance(parsed, dict) else None
+        if not isinstance(raw_tags, list):
+            logger.error(f"标签响应不是对象JSON或缺少 tags 字段: {safe_str(parsed)[:200]}")
+            return []
+
+        normalized_tags: List[str] = []
+        seen = set()
+        for raw_tag in raw_tags:
+            tag = _normalize_whitespace(safe_str(raw_tag)).strip()
+            if not tag:
+                continue
+            tag = tag[:10]
+            lowered = tag.lower()
+            if lowered in seen or lowered in avoid_set:
+                continue
+            seen.add(lowered)
+            normalized_tags.append(tag)
+            if len(normalized_tags) >= 6:
+                break
+
+        while len(normalized_tags) < 6:
+            normalized_tags.append('')
+
+        logger.info(f"生成标签: {normalized_tags}")
+        return normalized_tags
+
+    except Exception as e:
+        logger.error(f"生成标签过程中发生错误: {str(e)}")
+        logger.error(traceback.format_exc())
+        return []
+
+def flatten_partitions(id_mapping_data):
+    """
+    将id_mapping_data扁平化为分区列表
+    
+    Args:
+        id_mapping_data (list): id_mapping.json解析后的数据
+        
+    Returns:
+        list: 分区列表，每个元素包含id, name等信息
+    """
+    if not id_mapping_data:
+        return []
+        
+    partitions = []
+    
+    for category_item in id_mapping_data:
+        # 兼容两种格式："name"或"category"作为分类名称
+        category_name = category_item.get('name', '') or category_item.get('category', '')
+        for partition in category_item.get('partitions', []):
+            # 记录一级分区信息
+            partition_id = partition.get('id')
+            partition_name = partition.get('name', '')
+            partition_desc = partition.get('description', '')
+            
+            if partition_id:
+                partitions.append({
+                    'id': partition_id,
+                    'name': partition_name,
+                    'description': partition_desc,
+                    'parent_name': category_name
+                })
+            
+            # 处理二级分区
+            for sub_partition in partition.get('sub_partitions', []):
+                sub_id = sub_partition.get('id')
+                sub_name = sub_partition.get('name', '')
+                sub_desc = sub_partition.get('description', '')
+                
+                if sub_id:
+                    partitions.append({
+                        'id': sub_id,
+                        'name': sub_name,
+                        'description': sub_desc,
+                        'parent_name': partition_name
+                    })
+    
+    return partitions
+
+def flatten_bilibili_partitions(zone_data):
+    """
+    将 Bilibili video_zone.get_zone_list_sub() 扁平化为分区列表。
+
+    Args:
+        zone_data (list): bilibili分区原始数据
+
+    Returns:
+        list: 统一结构分区列表
+    """
+    if not zone_data:
+        return []
+
+    partitions = []
+    for item in zone_data:
+        if not isinstance(item, dict):
+            continue
+
+        parent_tid = item.get("tid")
+        parent_name = safe_str(item.get("name"))
+        parent_desc = safe_str(item.get("desc"))
+
+        # 跳过“全部分区”等无效顶层
+        if parent_tid not in (None, "", 0, "0") and parent_name:
+            partitions.append(
+                {
+                    "id": str(parent_tid),
+                    "name": parent_name,
+                    "description": parent_desc,
+                    "parent_name": "",
+                }
+            )
+
+        for sub in item.get("sub", []) or []:
+            if not isinstance(sub, dict):
+                continue
+            sub_tid = sub.get("tid")
+            sub_name = safe_str(sub.get("name"))
+            if sub_tid in (None, "", 0, "0") or not sub_name:
+                continue
+            partitions.append(
+                {
+                    "id": str(sub_tid),
+                    "name": sub_name,
+                    "description": safe_str(sub.get("desc")),
+                    "parent_name": parent_name,
+                }
+            )
+
+    return partitions
+
+def _find_partition_id_by_name(partitions, name_sub: str):
+    keyword = safe_str(name_sub).strip()
+    if not keyword:
+        return None
+    for partition in partitions:
+        if keyword in safe_str(partition.get("name")):
+            return str(partition.get("id"))
+    return None
+
+
+def _rule_based_partition_fallback(title: str, description: str, partitions) -> Optional[str]:
+    text = f"{title or ''}\n{description or ''}".lower()
+    rules = (
+        (["music", "歌曲", "演唱", "mv", "翻唱", "乐器", "单曲", "专辑"], ("综合音乐", "原创·翻唱", "演奏·乐器", "音乐综合", "音乐")),
+        (["舞蹈", "dance", "编舞", "翻跳", "宅舞"], ("综合舞蹈", "宅舞", "舞蹈")),
+        (["预告", "花絮", "trailer", "behind the scenes", "影视", "电影"], ("预告·花絮", "影视")),
+        (["电竞", "esports", "赛事", "比赛", "联赛", "战队", "职业选手", "职业哥", "bp"], ("电子竞技", "网络游戏", "游戏")),
+        (["game", "游戏", "实况", "攻略", "mod", "mods", "rpg"], ("主机单机", "单机游戏", "主机游戏", "电子竞技", "网络游戏", "游戏")),
+        (["科技", "数码", "评测", "开箱", "测评"], ("数码家电", "科技制造", "科技", "数码")),
+        (["vlog", "生活", "美食", "旅行", "宠物"], ("生活日常", "美食", "旅行", "生活")),
+        (["教程", "科普", "知识", "教学"], ("知识", "科普")),
+    )
+    for keywords, candidate_names in rules:
+        if not any(keyword in text for keyword in keywords):
+            continue
+        for candidate_name in candidate_names:
+            matched = _find_partition_id_by_name(partitions, candidate_name)
+            if matched:
+                return matched
+    return None
+
+
+_PARTITION_CANDIDATE_DESCRIPTION_LIMIT = 144
+_PARTITION_SELECTION_ALT_LIMIT = 3
+_PARTITION_LOW_CONFIDENCE_THRESHOLD = 0.55
+_PARTITION_DOMAIN_CHOICES = {
+    "game",
+    "music",
+    "dance",
+    "film",
+    "technology",
+    "lifestyle",
+    "knowledge",
+    "other",
+}
+_PARTITION_CONTENT_FORMAT_CHOICES = {
+    "interview",
+    "review",
+    "gameplay",
+    "news",
+    "tutorial",
+    "vlog",
+    "highlights",
+    "commentary",
+    "analysis",
+    "clip",
+    "other",
+}
+_PARTITION_GAME_MODE_CHOICES = {
+    "single_player",
+    "online",
+    "esports",
+    "mobile",
+    "unknown",
+}
+
+
+def _clean_partition_input(value: Any, *, content_type: str) -> str:
+    cleaned = _pre_clean(safe_str(value), content_type=content_type)
+    if not _has_meaningful_content(cleaned, content_type=content_type):
+        return ''
+    return cleaned
+
+
+def _normalize_partition_tags(tags: Any) -> List[str]:
+    parsed = tags
+    if isinstance(tags, str):
+        raw_text = tags.strip()
+        if not raw_text:
+            return []
+        try:
+            parsed = json.loads(raw_text)
+        except Exception:
+            parsed = re.split(r'[,，\s]+', raw_text)
+
+    if not isinstance(parsed, list):
+        return []
+
+    normalized: List[str] = []
+    seen = set()
+    for raw_tag in parsed:
+        tag = _normalize_whitespace(safe_str(raw_tag)).strip()
+        if not tag:
+            continue
+        tag = tag[:20]
+        lowered = tag.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(tag)
+        if len(normalized) >= 8:
+            break
+    return normalized
+
+
+def _dedupe_non_empty_text(parts: Sequence[str]) -> List[str]:
+    deduped: List[str] = []
+    seen = set()
+    for part in parts:
+        text = _normalize_whitespace(safe_str(part)).strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(text)
+    return deduped
+
+
+def _build_partition_metadata(
+    *,
+    title: str,
+    description: str,
+    title_original: str = '',
+    description_original: str = '',
+    title_translated: str = '',
+    description_translated: str = '',
+    tags: Any = None,
+) -> Dict[str, Any]:
+    primary_title = _clean_partition_input(title, content_type="title")
+    primary_description = _clean_partition_input(description, content_type="description")
+    normalized_title_original = _clean_partition_input(title_original, content_type="title")
+    normalized_description_original = _clean_partition_input(description_original, content_type="description")
+    normalized_title_translated = _clean_partition_input(title_translated, content_type="title")
+    normalized_description_translated = _clean_partition_input(description_translated, content_type="description")
+
+    if not primary_title:
+        primary_title = normalized_title_translated or normalized_title_original
+    if not primary_description:
+        primary_description = normalized_description_translated or normalized_description_original
+
+    if not normalized_title_translated and primary_title and normalized_title_original and primary_title != normalized_title_original:
+        normalized_title_translated = primary_title
+    if not normalized_description_translated and primary_description and normalized_description_original and primary_description != normalized_description_original:
+        normalized_description_translated = primary_description
+
+    return {
+        "primary_title": primary_title,
+        "primary_description": primary_description,
+        "title_original": normalized_title_original,
+        "description_original": normalized_description_original,
+        "title_translated": normalized_title_translated,
+        "description_translated": normalized_description_translated,
+        "tags": _normalize_partition_tags(tags),
+    }
+
+
+def _truncate_partition_text(text: str, limit: int) -> str:
+    normalized = _normalize_whitespace(safe_str(text))
+    if not normalized:
+        return ''
+    return normalized[:limit]
+
+
+def _build_partition_analysis_payload(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source_metadata": {
+            "primary_title": metadata.get("primary_title", ''),
+            "primary_description": _truncate_partition_text(metadata.get("primary_description", ''), 1200),
+            "title_translated": metadata.get("title_translated", ''),
+            "description_translated": _truncate_partition_text(metadata.get("description_translated", ''), 1200),
+            "title_original": metadata.get("title_original", ''),
+            "description_original": _truncate_partition_text(metadata.get("description_original", ''), 1200),
+            "tags": metadata.get("tags", []),
+        }
+    }
+
+
+def _build_rule_fallback_inputs(metadata: Dict[str, Any]) -> Dict[str, str]:
+    title_parts = _dedupe_non_empty_text(
+        [
+            metadata.get("primary_title", ''),
+            metadata.get("title_translated", ''),
+            metadata.get("title_original", ''),
+        ]
+    )
+    description_parts = _dedupe_non_empty_text(
+        [
+            metadata.get("primary_description", ''),
+            metadata.get("description_translated", ''),
+            metadata.get("description_original", ''),
+            ' '.join(metadata.get("tags", [])),
+        ]
+    )
+    return {
+        "title": '\n'.join(title_parts),
+        "description": '\n'.join(description_parts),
+    }
+
+
+def _coerce_confidence(value: Any) -> Optional[float]:
+    try:
+        confidence = float(value)
+    except Exception:
+        return None
+    if confidence != confidence:
+        return None
+    if confidence < 0.0:
+        return 0.0
+    if confidence > 1.0:
+        return 1.0
+    return round(confidence, 4)
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = safe_str(value).strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _normalize_enum(value: Any, allowed_values: Collection[str], default: str) -> str:
+    text = safe_str(value).strip().lower()
+    if text in allowed_values:
+        return text
+    return default
+
+
+def _normalize_content_profile(parsed: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(parsed, dict):
+        return None
+
+    entities: List[str] = []
+    seen_entities = set()
+    for raw_entity in parsed.get("entities", []) if isinstance(parsed.get("entities"), list) else []:
+        entity = _normalize_whitespace(safe_str(raw_entity)).strip()
+        if not entity:
+            continue
+        entity = entity[:40]
+        lowered = entity.lower()
+        if lowered in seen_entities:
+            continue
+        seen_entities.add(lowered)
+        entities.append(entity)
+        if len(entities) >= 6:
+            break
+
+    profile = {
+        "domain": _normalize_enum(parsed.get("domain"), _PARTITION_DOMAIN_CHOICES, "other"),
+        "subdomain": _normalize_whitespace(safe_str(parsed.get("subdomain"))).strip()[:48],
+        "content_format": _normalize_enum(parsed.get("content_format"), _PARTITION_CONTENT_FORMAT_CHOICES, "other"),
+        "entities": entities,
+        "game_mode": _normalize_enum(parsed.get("game_mode"), _PARTITION_GAME_MODE_CHOICES, "unknown"),
+        "is_interview": _coerce_bool(parsed.get("is_interview")),
+        "confidence": _coerce_confidence(parsed.get("confidence")),
+        "reason_summary": _normalize_whitespace(safe_str(parsed.get("reason_summary"))).strip()[:120],
+    }
+    profile["low_confidence"] = bool(
+        profile["confidence"] is not None and profile["confidence"] < _PARTITION_LOW_CONFIDENCE_THRESHOLD
+    )
+
+    if not any(
+        [
+            profile["subdomain"],
+            profile["entities"],
+            profile["reason_summary"],
+            profile["domain"] != "other",
+            profile["content_format"] != "other",
+            profile["game_mode"] != "unknown",
+            profile["is_interview"],
+        ]
+    ):
+        return None
+    return profile
+
+
+def _make_partition_selection(content_profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "id": None,
+        "source": None,
+        "confidence": None,
+        "alternatives": [],
+        "low_confidence": False,
+        "reason_summary": '',
+        "content_profile": content_profile,
+    }
+
+
+def _compact_partition_candidates(partitions) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    for partition in partitions:
+        description = _normalize_whitespace(safe_str(partition.get("description")))
+        name = safe_str(partition.get("name")).strip()
+        parent = safe_str(partition.get("parent_name")).strip()
+        path_label = f"{parent} / {name}" if parent and parent != name else name
+        candidates.append(
+            {
+                "id": safe_str(partition.get("id")).strip(),
+                "name": name,
+                "parent": parent,
+                "path_label": path_label,
+                "description": description[:_PARTITION_CANDIDATE_DESCRIPTION_LIMIT],
+            }
+        )
+    return [candidate for candidate in candidates if candidate["id"] and candidate["name"]]
+
+
+def _build_cover_data_url(cover_path: str) -> Optional[str]:
+    path = safe_str(cover_path).strip()
+    if not path:
+        return None
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"封面文件不存在: {path}")
+
+    extension = os.path.splitext(path)[1].lower()
+    mime_types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }
+    mime_type = mime_types.get(extension)
+    if not mime_type:
+        raise ValueError(f"不支持的封面格式: {extension or 'unknown'}")
+
+    with open(path, "rb") as file_obj:
+        raw = file_obj.read()
+    if not raw:
+        raise ValueError("封面文件为空")
+
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _is_multimodal_input_unsupported_error(exc: Exception) -> bool:
+    text = safe_str(exc).lower()
+    signals = (
+        "image_url",
+        "input_image",
+        "image input",
+        "vision",
+        "multimodal",
+        "content type",
+        "invalid chat format",
+        "unsupported content",
+        "does not support image",
+        "only text",
+        "not support image",
+    )
+    return any(signal in text for signal in signals)
+
+
+def _request_content_profile(
+    *,
+    metadata: Dict[str, Any],
+    openai_config,
+    logger,
+    scene_name: str,
+    cover_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not openai_config or not openai_config.get("OPENAI_API_KEY"):
+        return None
+
+    client = get_openai_client(openai_config)
+    model_name = openai_config.get("OPENAI_MODEL_NAME", "gpt-3.5-turbo")
+    payload = _build_partition_analysis_payload(metadata)
+    system_prompt = (
+        "你是视频内容分析器。只输出一个JSON对象，禁止输出任何解释、前缀、后缀或代码标记。"
+        "根据 source_metadata 判断题材、内容形式与语义实体。"
+        "domain 只能是 game/music/dance/film/technology/lifestyle/knowledge/other。"
+        "content_format 只能是 interview/review/gameplay/news/tutorial/vlog/highlights/commentary/analysis/clip/other。"
+        "如果是游戏内容，game_mode 只能是 single_player/online/esports/mobile/unknown。"
+        "只有明显赛事、联赛、战队、职业选手、比赛结果类内容才可标记为 esports。"
+        "单机、主机、RPG、剧情、模组、开发者访谈等内容通常不属于 esports。"
+        "entities 输出数组，保留专有名词。"
+        "is_interview 输出布尔值。confidence 输出 0 到 1 的数字。"
+        "reason_summary 用简体中文简要概括判断依据。"
+        '只返回一个JSON对象，格式：{"domain":"","subdomain":"","content_format":"","entities":[],"game_mode":"unknown","is_interview":false,"confidence":0.0,"reason_summary":""}。'
+    )
+
+    parsed = None
+    if cover_path:
+        try:
+            cover_data_url = _build_cover_data_url(cover_path)
+            parsed = _request_json_object(
+                client=client,
+                model_name=model_name,
+                system_prompt=system_prompt,
+                payload=payload,
+                temperature=0.0,
+                thinking_enabled=openai_config.get('OPENAI_THINKING_ENABLED', False),
+                logger_obj=logger,
+                scene_name=scene_name,
+                user_content=[
+                    {
+                        "type": "text",
+                        "text": (
+                            "请结合以下 JSON 信息与封面图片，完成内容分析并只返回 JSON。\n"
+                            f"{json.dumps(payload, ensure_ascii=False)}"
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": cover_data_url},
+                    },
+                ],
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            logger.warning(f"{scene_name} 封面不可用于内容分析，已回退文本模式: {exc}")
+        except Exception as exc:
+            if _is_multimodal_input_unsupported_error(exc):
+                logger.warning(f"{scene_name} 当前模型或接口不支持图片输入，已回退文本模式: {exc}")
+            else:
+                raise
+
+    if parsed is None:
+        parsed = _request_json_object(
+            client=client,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            payload=payload,
+            temperature=0.0,
+            thinking_enabled=openai_config.get('OPENAI_THINKING_ENABLED', False),
+            logger_obj=logger,
+            scene_name=scene_name,
+        )
+
+    return _normalize_content_profile(parsed)
+
+
+def _normalize_partition_selection_entry(
+    platform_value: Any,
+    valid_ids,
+    content_profile: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    selection = _make_partition_selection(content_profile)
+    candidate_id = ""
+    confidence = None
+    alternatives_raw = []
+    reason_summary = ''
+
+    if isinstance(platform_value, dict):
+        candidate_id = safe_str(platform_value.get("id")).strip()
+        confidence = _coerce_confidence(platform_value.get("confidence"))
+        alternatives_raw = platform_value.get("alternatives", [])
+        reason_summary = _normalize_whitespace(safe_str(platform_value.get("reason_summary"))).strip()[:120]
+    else:
+        candidate_id = safe_str(platform_value).strip()
+
+    selection["_raw_id"] = candidate_id or None
+    if candidate_id in valid_ids:
+        selection["id"] = candidate_id
+    selection["confidence"] = confidence
+    selection["reason_summary"] = reason_summary
+
+    alternatives: List[str] = []
+    seen_alternatives = set()
+    if isinstance(alternatives_raw, list):
+        for raw_alt in alternatives_raw:
+            alt_id = safe_str(raw_alt).strip()
+            if not alt_id or alt_id not in valid_ids or alt_id == selection["id"] or alt_id in seen_alternatives:
+                continue
+            seen_alternatives.add(alt_id)
+            alternatives.append(alt_id)
+            if len(alternatives) >= _PARTITION_SELECTION_ALT_LIMIT:
+                break
+    selection["alternatives"] = alternatives
+    selection["low_confidence"] = bool(
+        selection["id"] and selection["confidence"] is not None and selection["confidence"] < _PARTITION_LOW_CONFIDENCE_THRESHOLD
+    )
+    return selection
+
+
+def _request_partition_selection(
+    *,
+    metadata: Dict[str, Any],
+    content_profile: Dict[str, Any],
+    platform_partitions: Dict[str, Sequence[Dict[str, Any]]],
+    openai_config,
+    logger,
+    scene_name: str,
+) -> Dict[str, Dict[str, Any]]:
+    platform_candidates = {
+        platform: _compact_partition_candidates(partitions)
+        for platform, partitions in (platform_partitions or {}).items()
+        if partitions
+    }
+    result_map: Dict[str, Dict[str, Any]] = {
+        platform: _make_partition_selection(content_profile) for platform in platform_candidates
+    }
+    if not openai_config or not openai_config.get("OPENAI_API_KEY") or not platform_candidates:
+        return result_map
+
+    client = get_openai_client(openai_config)
+    model_name = openai_config.get("OPENAI_MODEL_NAME", "gpt-3.5-turbo")
+    payload = {
+        "source_metadata": {
+            "primary_title": metadata.get("primary_title", ''),
+            "primary_description": _truncate_partition_text(metadata.get("primary_description", ''), 600),
+            "title_original": metadata.get("title_original", ''),
+            "title_translated": metadata.get("title_translated", ''),
+            "tags": metadata.get("tags", []),
+        },
+        "content_profile": content_profile,
+        "platforms": {
+            platform: {"candidates": candidates}
+            for platform, candidates in platform_candidates.items()
+        },
+    }
+    system_prompt = (
+        "你是多平台视频分区选择器。"
+        "你会收到 source_metadata、content_profile 和各平台候选分区。"
+        "请分别为每个平台只从该平台 candidates 中选 1 个最匹配的分区。"
+        "不要跨平台复用候选，不要编造候选ID。"
+        "当 content_profile.domain=game 时，优先根据 game_mode 判断："
+        "single_player 更偏单机/主机，online 更偏网络游戏，esports 仅用于明显赛事/战队/职业内容，mobile 更偏手游。"
+        "即使不确定，也要返回最佳猜测，但应降低 confidence。"
+        "alternatives 最多返回 3 个同平台候选ID。"
+        '只返回 JSON，例如：{"acfun":{"id":"候选ID","confidence":0.82,"alternatives":["候选ID"],"reason_summary":""},"bilibili":{"id":"候选ID","confidence":0.70,"alternatives":[],"reason_summary":""}}。'
+    )
+    parsed = _request_json_object(
+        client=client,
+        model_name=model_name,
+        system_prompt=system_prompt,
+        payload=payload,
+        temperature=0.0,
+        thinking_enabled=openai_config.get('OPENAI_THINKING_ENABLED', False),
+        logger_obj=logger,
+        scene_name=scene_name,
+    )
+
+    parsed = parsed if isinstance(parsed, dict) else {}
+    if "id" in parsed and len(platform_partitions) == 1:
+        only_platform = next(iter(platform_partitions.keys()))
+        parsed = {only_platform: parsed}
+
+    for platform, partitions in platform_partitions.items():
+        valid_ids = {safe_str(partition.get("id")).strip() for partition in (partitions or [])}
+        result_map[platform] = _normalize_partition_selection_entry(
+            parsed.get(platform),
+            valid_ids,
+            content_profile,
+        )
+    return result_map
+
+
+def _log_partition_selection(logger, platform: str, selection: Dict[str, Any]) -> None:
+    partition_id = selection.get("id")
+    if not partition_id:
+        return
+    if selection.get("low_confidence"):
+        logger.warning(
+            "%s 分区推荐 low_confidence: source=%s, id=%s, confidence=%s, alternatives=%s, reason=%s",
+            platform,
+            selection.get("source"),
+            partition_id,
+            selection.get("confidence"),
+            selection.get("alternatives") or [],
+            selection.get("reason_summary") or '',
+        )
+        return
+    logger.info(
+        "%s 分区推荐来源=%s, id=%s, confidence=%s, alternatives=%s, reason=%s",
+        platform,
+        selection.get("source"),
+        partition_id,
+        selection.get("confidence"),
+        selection.get("alternatives") or [],
+        selection.get("reason_summary") or '',
+    )
+
+
+def _recommend_partition_core(
+    *,
+    title: str,
+    description: str,
+    platform_sources: Dict[str, Sequence[Dict[str, Any]]],
+    title_original: str = '',
+    description_original: str = '',
+    title_translated: str = '',
+    description_translated: str = '',
+    tags: Any = None,
+    openai_config=None,
+    logger=None,
+    cover_path: Optional[str] = None,
+    include_cover_for_ai: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
+    openai_config = openai_config or {}
+    logger = logger or logging.getLogger(__name__)
+    metadata = _build_partition_metadata(
+        title=title,
+        description=description,
+        title_original=title_original,
+        description_original=description_original,
+        title_translated=title_translated,
+        description_translated=description_translated,
+        tags=tags,
+    )
+    result_map: Dict[str, Dict[str, Any]] = {
+        platform: _make_partition_selection() for platform in platform_sources
+    }
+    unresolved_partitions: Dict[str, Sequence[Dict[str, Any]]] = {}
+    fixed_key_map = {
+        "acfun": "FIXED_PARTITION_ID",
+        "bilibili": "FIXED_PARTITION_ID_BILIBILI",
+    }
+    platform_label_map = {
+        "acfun": "AcFun",
+        "bilibili": "bilibili",
+    }
+
+    if not metadata.get("primary_title") and not metadata.get("primary_description"):
+        logger.warning("缺少标题和描述，无法推荐分区")
+        return result_map
+
+    for platform, partitions in platform_sources.items():
+        if not partitions:
+            logger.warning("%s 分区数据为空，无法推荐", platform_label_map.get(platform, platform))
+            continue
+
+        fixed_key = fixed_key_map.get(platform, "")
+        fixed_pid = safe_str(openai_config.get(fixed_key)).strip() if fixed_key else ""
+        available_ids = {safe_str(partition.get("id")).strip() for partition in partitions}
+        if fixed_pid:
+            if fixed_pid in available_ids:
+                selection = _make_partition_selection()
+                selection.update(
+                    {
+                        "id": fixed_pid,
+                        "source": "fixed",
+                        "confidence": 1.0,
+                        "reason_summary": "命中固定分区配置",
+                    }
+                )
+                result_map[platform] = selection
+                logger.info("%s 分区推荐来源=fixed", platform_label_map.get(platform, platform))
+                continue
+            logger.warning("配置的 %s 无效，已忽略", fixed_key)
+
+        unresolved_partitions[platform] = partitions
+
+    if not unresolved_partitions:
+        return result_map
+    content_profile = None
+    if openai_config.get("OPENAI_API_KEY"):
+        use_cover = cover_path if include_cover_for_ai else None
+        try:
+            content_profile = _request_content_profile(
+                metadata=metadata,
+                openai_config=openai_config,
+                logger=logger,
+                scene_name='ai_enhancer_content_profile',
+                cover_path=use_cover,
+            )
+            if content_profile:
+                logger.info(
+                    "AI 内容分析结果: domain=%s, subdomain=%s, format=%s, game_mode=%s, interview=%s, confidence=%s, reason=%s, entities=%s",
+                    content_profile.get("domain"),
+                    content_profile.get("subdomain"),
+                    content_profile.get("content_format"),
+                    content_profile.get("game_mode"),
+                    content_profile.get("is_interview"),
+                    content_profile.get("confidence"),
+                    content_profile.get("reason_summary"),
+                    content_profile.get("entities"),
+                )
+                if content_profile.get("low_confidence"):
+                    logger.warning(
+                        "AI 内容分析 low_confidence: confidence=%s, reason=%s",
+                        content_profile.get("confidence"),
+                        content_profile.get("reason_summary"),
+                    )
+
+                ai_results = _request_partition_selection(
+                    metadata=metadata,
+                    content_profile=content_profile,
+                    platform_partitions=unresolved_partitions,
+                    openai_config=openai_config,
+                    logger=logger,
+                    scene_name='ai_enhancer_partition_selection',
+                )
+                for platform, ai_selection in ai_results.items():
+                    if ai_selection.get("id"):
+                        ai_selection["source"] = "ai"
+                        result_map[platform] = ai_selection
+                        _log_partition_selection(logger, platform_label_map.get(platform, platform), ai_selection)
+                    else:
+                        raw_id = ai_selection.get("_raw_id")
+                        if raw_id:
+                            logger.warning(
+                                "%s AI 返回非法分区ID: %s，回退规则兜底",
+                                platform_label_map.get(platform, platform),
+                                raw_id,
+                            )
+                        else:
+                            logger.warning(
+                                "%s AI 未返回有效分区ID，回退规则兜底",
+                                platform_label_map.get(platform, platform),
+                            )
+                        result_map[platform]["content_profile"] = content_profile
+            else:
+                logger.warning("AI 内容分析未返回有效 content_profile，回退规则兜底")
+        except Exception as e:
+            logger.error(f"AI 分区判断阶段发生错误: {str(e)}")
+            logger.error(traceback.format_exc())
+    else:
+        logger.info("缺少OpenAI配置或API密钥，跳过 AI 分区判断，直接使用规则兜底")
+
+    fallback_inputs = _build_rule_fallback_inputs(metadata)
+    for platform, partitions in unresolved_partitions.items():
+        if result_map.get(platform, {}).get("id"):
+            continue
+        rule_based_id = _rule_based_partition_fallback(
+            fallback_inputs.get("title", ''),
+            fallback_inputs.get("description", ''),
+            partitions,
+        )
+        if rule_based_id:
+            selection = _make_partition_selection(content_profile)
+            selection.update(
+                {
+                    "id": rule_based_id,
+                    "source": "rule_fallback",
+                    "reason_summary": "AI未命中，使用规则兜底",
+                }
+            )
+            result_map[platform] = selection
+            logger.info(
+                "%s 分区推荐来源=rule_fallback, id=%s",
+                platform_label_map.get(platform, platform),
+                rule_based_id,
+            )
+        else:
+            result_map[platform]["content_profile"] = content_profile
+            logger.warning("%s 分区推荐未命中", platform_label_map.get(platform, platform))
+    return result_map
+
+
+def recommend_partitions_aio(
+    title,
+    description,
+    *,
+    acfun_id_mapping_data=None,
+    bilibili_zone_data=None,
+    title_original: str = '',
+    description_original: str = '',
+    title_translated: str = '',
+    description_translated: str = '',
+    tags: Any = None,
+    openai_config=None,
+    task_id=None,
+    cover_path: Optional[str] = None,
+    include_cover_for_ai: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    logger = setup_task_logger(task_id or "unknown")
+    logger.info("开始AIO推荐多平台视频分区")
+
+    platform_sources: Dict[str, Sequence[Dict[str, Any]]] = {}
+    if acfun_id_mapping_data:
+        platform_sources["acfun"] = flatten_partitions(acfun_id_mapping_data)
+    if bilibili_zone_data:
+        platform_sources["bilibili"] = flatten_bilibili_partitions(bilibili_zone_data)
+
+    return _recommend_partition_core(
+        title=title,
+        description=description,
+        title_original=title_original,
+        description_original=description_original,
+        title_translated=title_translated,
+        description_translated=description_translated,
+        tags=tags,
+        platform_sources=platform_sources,
+        openai_config=openai_config,
+        logger=logger,
+        cover_path=cover_path,
+        include_cover_for_ai=include_cover_for_ai,
+    )
+
+
+def recommend_bilibili_partition(
+    title,
+    description,
+    zone_data,
+    *,
+    title_original: str = '',
+    description_original: str = '',
+    title_translated: str = '',
+    description_translated: str = '',
+    tags: Any = None,
+    openai_config=None,
+    task_id=None,
+    cover_path: Optional[str] = None,
+    include_cover_for_ai: bool = False,
+ ) -> Dict[str, Any]:
+    """
+    使用 AI 主判定 + 规则兜底策略推荐 Bilibili 分区。
+
+    Returns:
+        dict: partition_selection 结构
+    """
+    logger = setup_task_logger(task_id or "unknown")
+    logger.info("开始推荐 Bilibili 视频分区")
+
+    partitions = flatten_bilibili_partitions(zone_data)
+    if not partitions:
+        logger.warning("bilibili分区数据为空，无法推荐")
+        return _make_partition_selection()
+    result_map = _recommend_partition_core(
+        title=title,
+        description=description,
+        title_original=title_original,
+        description_original=description_original,
+        title_translated=title_translated,
+        description_translated=description_translated,
+        tags=tags,
+        platform_sources={"bilibili": partitions},
+        openai_config=openai_config,
+        logger=logger,
+        cover_path=cover_path,
+        include_cover_for_ai=include_cover_for_ai,
+    )
+    return result_map.get("bilibili", _make_partition_selection())
+
+def recommend_acfun_partition(
+    title,
+    description,
+    id_mapping_data,
+    *,
+    title_original: str = '',
+    description_original: str = '',
+    title_translated: str = '',
+    description_translated: str = '',
+    tags: Any = None,
+    openai_config=None,
+    task_id=None,
+    cover_path: Optional[str] = None,
+    include_cover_for_ai: bool = False,
+ ) -> Dict[str, Any]:
+    """
+    使用 AI 主判定 + 规则兜底策略推荐 AcFun 分区。
+    
+    Returns:
+        dict: partition_selection 结构
+    """
+    logger = setup_task_logger(task_id or "unknown")
+    logger.info(f"开始推荐AcFun视频分区")
+
+    if not id_mapping_data:
+        logger.warning("缺少分区映射数据 (id_mapping_data is empty or None)，无法推荐分区")
+        return _make_partition_selection()
+
+    partitions = flatten_partitions(id_mapping_data)
+    if not partitions:
+        logger.warning("分区映射数据格式错误或为空 (flatten_partitions returned empty list)，无法推荐分区")
+        return _make_partition_selection()
+
+    result_map = _recommend_partition_core(
+        title=title,
+        description=description,
+        title_original=title_original,
+        description_original=description_original,
+        title_translated=title_translated,
+        description_translated=description_translated,
+        tags=tags,
+        platform_sources={"acfun": partitions},
+        openai_config=openai_config,
+        logger=logger,
+        cover_path=cover_path,
+        include_cover_for_ai=include_cover_for_ai,
+    )
+    return result_map.get("acfun", _make_partition_selection())

@@ -1,0 +1,208 @@
+# 多阶段构建（兼容无 BuildKit 构建器）
+
+# ============================================================
+# 第一阶段：Python 依赖构建
+# ============================================================
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# 安装构建依赖（不使用 BuildKit 的 --mount 语法）
+ENV DEBIAN_FRONTEND=noninteractive
+RUN rm -f /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock || true \
+    && dpkg --configure -a || true \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb \
+    && apt-get clean
+
+# 复制依赖文件
+COPY requirements.txt .
+
+# 安装 Python 依赖到本地用户目录（不使用缓存挂载）
+# 先安装 CPU-only 版本的 torch 和 torchaudio（silero-vad 的硬依赖），避免从 PyPI 拉取包含 CUDA 的完整版本（~7GB）
+# 固定至 2.6.0：这是当前已验证与 silero-vad 6.2.x JIT 模型兼容的版本线
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN pip install --user --no-cache-dir --no-compile "torch==2.6.0" "torchaudio==2.6.0" --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --user --no-cache-dir --no-compile -r requirements.txt
+
+# 验证 yt-dlp 安装
+RUN /root/.local/bin/yt-dlp --version
+
+# 清理不必要的文件以减小镜像体积
+# - 删除 PyTorch / torchaudio 测试、C++ 头文件、CMake 等开发文件
+# - 删除所有 __pycache__ / .pyc / .pyo 缓存文件
+# - 去除共享库的调试符号
+RUN set -eux; \
+    SITE=/root/.local/lib/python3.11/site-packages; \
+    rm -rf "$SITE/torch/test" \
+           "$SITE/torch/testing/_internal" \
+           "$SITE/torch/include" \
+           "$SITE/torch/share" \
+           "$SITE/torch/utils/benchmark" \
+           "$SITE/torchaudio/test" \
+    && ( find /root/.local -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true ) \
+    && find /root/.local \( -name '*.pyc' -o -name '*.pyo' \) -delete \
+    && ( find /root/.local -name '*.so' -exec strip --strip-unneeded {} + 2>/dev/null || true ) \
+    && echo "Builder cleanup complete"
+
+# ============================================================
+# 第二阶段：FFmpeg 下载
+# ============================================================
+FROM debian:bookworm-slim AS ffmpeg-builder
+
+ARG TARGETARCH
+ARG FFMPEG_VARIANT=btbn
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux \
+    && mkdir -p /ffmpeg-out \
+    && arch="${TARGETARCH:-amd64}" \
+    && tmpdir="$(mktemp -d)" \
+    && case "${FFMPEG_VARIANT}" in \
+        btbn) \
+            case "$arch" in \
+                amd64|x86_64) ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz" ;; \
+                arm64|aarch64) ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linuxarm64-gpl-8.1.tar.xz" ;; \
+                *) echo "FFMPEG_VARIANT=btbn is not available for $arch" >&2 && exit 1 ;; \
+            esac ;; \
+        static) \
+            case "$arch" in \
+                amd64|x86_64) ffmpeg_url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" ;; \
+                arm64|aarch64) ffmpeg_url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" ;; \
+                arm|armv7l)   ffmpeg_url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-armhf-static.tar.xz" ;; \
+                *) echo "Unsupported TARGETARCH: $arch" >&2 && exit 1 ;; \
+            esac ;; \
+        *) echo "Unknown FFMPEG_VARIANT: ${FFMPEG_VARIANT}" >&2 && exit 1 ;; \
+    esac \
+    && curl -fsSL "$ffmpeg_url" -o "$tmpdir/ffmpeg.tar.xz" \
+    && tar -xf "$tmpdir/ffmpeg.tar.xz" -C "$tmpdir" \
+    && payload_dir="$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d -name 'ffmpeg*' | head -n 1)" \
+    && if [ -z "$payload_dir" ]; then echo "Unable to locate extracted ffmpeg directory" >&2 && exit 1; fi \
+    && if [ -x "$payload_dir/bin/ffmpeg" ]; then cp "$payload_dir/bin/ffmpeg" /ffmpeg-out/ffmpeg; \
+       elif [ -x "$payload_dir/ffmpeg" ]; then cp "$payload_dir/ffmpeg" /ffmpeg-out/ffmpeg; \
+       else echo "WARN: ffmpeg binary not found at '$payload_dir/bin/ffmpeg' or '$payload_dir/ffmpeg'" >&2; fi \
+    && if [ -x "$payload_dir/bin/ffprobe" ]; then cp "$payload_dir/bin/ffprobe" /ffmpeg-out/ffprobe; \
+       elif [ -x "$payload_dir/ffprobe" ]; then cp "$payload_dir/ffprobe" /ffmpeg-out/ffprobe; \
+       else echo "WARN: ffprobe binary not found at '$payload_dir/bin/ffprobe' or '$payload_dir/ffprobe'" >&2; fi \
+    && rm -rf "$tmpdir" \
+    && if [ ! -f /ffmpeg-out/ffmpeg ]; then echo "ERROR: ffmpeg binary not found" >&2 && exit 1; fi \
+    && if [ ! -f /ffmpeg-out/ffprobe ]; then echo "ERROR: ffprobe binary not found" >&2 && exit 1; fi \
+    && chmod +x /ffmpeg-out/ffmpeg /ffmpeg-out/ffprobe
+
+# ============================================================
+# 第三阶段：运行阶段
+# ============================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 安装运行时依赖（不使用 BuildKit 的 --mount 语法）
+ENV DEBIAN_FRONTEND=noninteractive
+RUN rm -f /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock || true \
+    && dpkg --configure -a || true \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        nodejs \
+        libfontconfig1 \
+        libfreetype6 \
+        libfribidi0 \
+        libgnutls30 \
+        libgomp1 \
+        libharfbuzz0b \
+        libunistring5 \
+        libxml2 \
+        libsndfile1 \
+        libsox3 \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb \
+    && apt-get clean \
+    && useradd --create-home --shell /bin/bash y2a
+
+# 安装 Deno（yt-dlp 的 YouTube n challenge 解密需要 ≥2.3.0 的 JS 运行时）
+# Debian bookworm 的 nodejs 版本（20.x）低于 yt-dlp 要求的最低版本（22.0.0），
+# 因此需要安装 Deno 作为 JS challenge solver 的运行时
+RUN set -eux \
+    && machine="$(uname -m)" \
+    && case "$machine" in \
+        x86_64) deno_arch="x86_64-unknown-linux-gnu" ;; \
+        aarch64) deno_arch="aarch64-unknown-linux-gnu" ;; \
+        *) echo "Unsupported arch for Deno: $machine" >&2 && exit 1 ;; \
+    esac \
+    && echo 'import urllib.request, zipfile, io, os' > /tmp/install_deno.py \
+    && echo 'import sys' >> /tmp/install_deno.py \
+    && echo 'arch = sys.argv[1]' >> /tmp/install_deno.py \
+    && echo 'url = f"https://github.com/denoland/deno/releases/latest/download/deno-{arch}.zip"' >> /tmp/install_deno.py \
+    && echo 'data = urllib.request.urlopen(url).read()' >> /tmp/install_deno.py \
+    && echo 'with zipfile.ZipFile(io.BytesIO(data)) as z:' >> /tmp/install_deno.py \
+    && echo '    z.extract("deno", "/usr/local/bin/")' >> /tmp/install_deno.py \
+    && echo 'os.chmod("/usr/local/bin/deno", 0o755)' >> /tmp/install_deno.py \
+    && python3 /tmp/install_deno.py "$deno_arch" \
+    && rm -f /tmp/install_deno.py \
+    && deno --version
+
+# 从构建阶段复制 Python 包
+COPY --from=builder /root/.local /home/y2a/.local
+
+# 从 ffmpeg-builder 阶段复制二进制文件（仅 ffmpeg + ffprobe）
+COPY --from=ffmpeg-builder /ffmpeg-out/ffmpeg /app/ffmpeg/bin/ffmpeg
+COPY --from=ffmpeg-builder /ffmpeg-out/ffprobe /app/ffmpeg/bin/ffprobe
+
+# 复制应用代码
+COPY --chown=y2a:y2a . .
+
+# 创建必要的目录和符号链接，设置权限
+RUN mkdir -p /app/config /app/db /app/downloads /app/logs /app/cookies /app/temp \
+    && ln -sf /app/ffmpeg/bin/ffmpeg /app/ffmpeg/ffmpeg \
+    && ln -sf /app/ffmpeg/bin/ffprobe /app/ffmpeg/ffprobe \
+    && ln -sf /app/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg \
+    && ln -sf /app/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe \
+    && chown -R y2a:y2a /app \
+    && chown -R y2a:y2a /home/y2a/.local \
+    && chmod +x /home/y2a/.local/bin/* 2>/dev/null || true \
+    && chmod 755 /app/config /app/db /app/downloads /app/logs /app/cookies /app/temp
+
+# 启动脚本
+RUN echo '#!/bin/bash\n\
+set -e\n\
+echo "Y2A-Auto Docker starting..."\n\
+export PYTHONUNBUFFERED=1\n\
+export PYTHONIOENCODING=utf-8\n\
+\n\
+# 确保目录权限\n\
+for dir in /app/config /app/db /app/downloads /app/logs /app/cookies /app/temp; do\n\
+    [ -d "$dir" ] || mkdir -p "$dir"\n\
+    [ -w "$dir" ] || chmod 755 "$dir" 2>/dev/null || true\n\
+done\n\
+\n\
+echo "Starting Y2A-Auto..."\n\
+exec "$@"' > /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# PATH 与 PYTHONPATH
+ENV PATH=/home/y2a/.local/bin:$PATH
+ENV PYTHONPATH=/home/y2a/.local/lib/python3.11/site-packages:/usr/local/lib/python3.11/site-packages
+
+# 切换到非 root 用户
+USER y2a
+
+# 验证 yt-dlp 在运行阶段可用
+RUN yt-dlp --version
+
+# 验证 VAD 依赖在运行阶段可导入，避免发布缺少 silero-vad/torch 的镜像
+RUN python -c "import torch, torchaudio, silero_vad; print('VAD deps OK')"
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/')" || exit 1
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["python", "app.py"]

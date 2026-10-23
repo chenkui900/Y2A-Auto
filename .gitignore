@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and temporary files
+logs/
+*.log
+temp/
+*.tmp
+
+# Downloads and generated content
+downloads/
+static/covers/
+ffmpeg/
+
+# Database files
+tasks.db
+*.db
+*.sqlite
+*.sqlite3
+db/
+security/
+
+# Configuration and secrets
+config/*
+cookies/
+*.key
+*.pem
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker development files (keep in git but ignore in docker)
+# docker-compose.yml
+# Dockerfile
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Documentation build
+docs/_build/
+site/ 
+
+tests/*
+!tests/*.py
+# 设置页搜索的 Node + DOM 桩测试夹具(由 tests/test_settings_search_keyboard.py 调用)
+!tests/js/
+!tests/js/*.js
+.uv-cache/
+.uv-python/
+build-tools/Y2A-Auto.spec
+
+# 打包产物与本地运行时（不需要入库）
+_internal/
+# 大字体文件（运行时自动下载/本地放置）
+fonts/*.otf

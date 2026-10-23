@@ -1,0 +1,1712 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import logging
+import math
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse, urlunparse
+
+import requests
+
+from .subtitle_pipeline_types import (
+    AsrSegmentTiming,
+    AsrTranscriptionResult,
+    AsrWordTiming,
+    DetectedSpeechWindow,
+)
+
+
+_LATIN_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?")
+_CJK_CHAR_RE = re.compile(r'[\u3400-\u9fff]')
+_VISIBLE_TEXT_RE = re.compile(r'[\w\u3400-\u9fff]', re.UNICODE)
+_INVALID_DURATION_FALLBACK = 0.5
+
+
+def _compute_synth_word_offsets(segment_text: str, words: List[AsrWordTiming]) -> None:
+    """为合成词计算在原始 segment 文本中的字符偏移 [char_start, char_end)。
+
+    顺序匹配每个 word.text 在 segment_text 中的位置，使下游能直接从原始
+    文本切片，完整保留空格和标点。
+    """
+    if not segment_text or not words:
+        return
+    pos = 0
+    search_lower = segment_text.lower()
+    for w in words:
+        wtext = str(w.text or '').strip()
+        if not wtext:
+            continue
+        idx = segment_text.find(wtext, pos)
+        if idx < 0:
+            idx = search_lower.find(wtext.lower(), pos)
+        if idx >= 0:
+            w.source_text = segment_text
+            w.char_start = idx
+            w.char_end = idx + len(wtext)
+            pos = idx + len(wtext)
+
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    total_millis = int(round(float(seconds or 0.0) * 1000))
+    hours = total_millis // 3_600_000
+    remaining = total_millis % 3_600_000
+    minutes = remaining // 60_000
+    remaining %= 60_000
+    secs = remaining // 1000
+    millis = remaining % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+@dataclass
+class AsrConfig:
+    provider: str = 'whisper'
+    api_key: str = ''
+    base_url: str = ''
+    model_name: str = 'whisper-1'
+    language: str = ''
+    prompt: str = ''
+    translate: bool = False
+    timestamp_granularities: str = 'segment,word'
+    diarize: bool = False
+    context_bias: str = ''
+    max_retries: int = 3
+    retry_delay_s: float = 2.0
+    max_workers: int = 3
+    request_timeout_s: float = 300.0
+    voxtral_max_audio_duration_s: float = 10800.0
+    voxtral_enforce_max_duration: bool = True
+    # Whisper decoding quality knobs.  These are legal form fields for
+    # OpenAI-compatible /audio/transcriptions endpoints and suppress
+    # hallucination loops and timestamp drift.  They must keep defaults so
+    # existing positional/named constructions (speech_recognition.py) stay
+    # valid; callers that do not pass them inherit the defaults below.
+    temperature: Optional[float] = 0.0
+    condition_on_previous_text: Optional[bool] = False
+    no_speech_threshold: Optional[float] = 0.6
+    compression_ratio_threshold: Optional[float] = 2.4
+    logprob_threshold: Optional[float] = -1.0
+
+
+@dataclass
+class _AsrCapabilityCache:
+    transcription_format: Optional[str] = None
+    language_detection_format: Optional[str] = None
+    transcription_granularities: Tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass
+class _AsrCapabilityProbeResult:
+    transcription_format: Optional[str] = None
+    language_detection_format: Optional[str] = None
+    transcription_granularities: Tuple[str, ...] = field(default_factory=tuple)
+    transcription_result: Optional[AsrTranscriptionResult] = None
+    language_data: Optional[Dict[str, Any]] = None
+
+
+class AsrFormatIncompatibleError(RuntimeError):
+    pass
+
+
+class AsrRequestError(RuntimeError):
+    pass
+
+
+class AsrHttpError(RuntimeError):
+    def __init__(self, status_code: int, response_text: str):
+        self.status_code = int(status_code)
+        super().__init__(f"HTTP {self.status_code}: {response_text[:300]}")
+
+
+class ImplausibleAsrResultError(RuntimeError):
+    pass
+
+
+class AsrApiClient:
+    def __init__(self, config: AsrConfig, logger: Optional[logging.Logger] = None):
+        self.config = config
+        self.logger = logger or logging.getLogger(__name__)
+        self.client: Any = None
+        self._language_hint: str = ''
+        self._capability_cache = _AsrCapabilityCache()
+        self._capability_probe_condition = threading.Condition()
+        self._capability_probe_in_progress = False
+        self._capability_probe_incompatible = False
+        self._logged_capability_signature: Optional[Tuple[str, str, Tuple[str, ...]]] = None
+        # Failure visibility for the last concurrent window batch.
+        self.last_failure_ratio: float = 0.0
+        self.last_failed_count: int = 0
+        self.last_window_count: int = 0
+        # 同一轮转录可能连续提交多批窗口（例如 VAD 主路径失败后走 fallback），
+        # 下面两个字段记录本轮的最大批次规模与最差失败占比：调用方读取
+        # last_failure_ratio 时拿到的是最差结局，而不是最后一批的乐观值。
+        self._quality_round_max_batch: int = 0
+        self._quality_round_worst_ratio: float = 0.0
+        self._init_client()
+
+    @staticmethod
+    def _normalize_language_code(lang: Any) -> str:
+        value = str(lang or '').strip().lower().replace('_', '-')
+        if not value or value == 'unknown':
+            return ''
+        aliases = {
+            'english': 'en',
+            'chinese': 'zh',
+            'mandarin': 'zh',
+            'cantonese': 'zh',
+            'japanese': 'ja',
+            'korean': 'ko',
+            'spanish': 'es',
+            'french': 'fr',
+            'german': 'de',
+            'italian': 'it',
+            'portuguese': 'pt',
+            'russian': 'ru',
+            'arabic': 'ar',
+            'hindi': 'hi',
+            'dutch': 'nl',
+            'turkish': 'tr',
+            'polish': 'pl',
+            'swedish': 'sv',
+            'indonesian': 'id',
+            'vietnamese': 'vi',
+            'thai': 'th',
+        }
+        if value in aliases:
+            return aliases[value]
+        primary = value.split('-', 1)[0]
+        if len(primary) == 2 and primary.isalpha():
+            return primary
+        return ''
+
+    def set_language_hint(self, lang: str):
+        normalized = self._normalize_language_code(lang)
+        if lang and not normalized:
+            self.logger.warning("Ignoring unsupported ASR language hint: %s", lang)
+        self._language_hint = normalized
+
+    def _init_client(self):
+        if not self.config.api_key:
+            self.logger.error("Missing ASR API key - ASR client not initialised")
+            return
+        try:
+            if self.config.provider == 'voxtral':
+                if not self.config.base_url:
+                    self.logger.error("Missing ASR base URL - ASR client not initialised")
+                    return
+                self.client = True
+                self.logger.info("%s client initialised successfully", self.config.provider)
+                return
+
+            import openai
+
+            opts: Dict[str, Any] = {}
+            if self.config.base_url:
+                opts['base_url'] = self.config.base_url
+            self.client = openai.OpenAI(api_key=self.config.api_key, **opts)
+            self.logger.info("ASR API client initialised successfully")
+        except Exception as exc:
+            self.logger.error("Failed to initialise ASR API client: %s", exc)
+
+    @staticmethod
+    def _is_format_error(exc: Exception) -> bool:
+        if isinstance(exc, AsrRequestError):
+            return False
+        err_str = str(exc).lower()
+        status_code = getattr(exc, 'status_code', None)
+        if status_code is None:
+            response = getattr(exc, 'response', None)
+            status_code = getattr(response, 'status_code', None)
+        if status_code is not None and int(status_code) not in (400, 422):
+            return False
+        parameter_markers = (
+            'response_format',
+            'response format',
+            'timestamp_granularities',
+            'timestamp granularities',
+            'unsupported format',
+        )
+        rejection_markers = (
+            'unsupported',
+            'not supported',
+            'invalid',
+            'unknown',
+            'unrecognized',
+            'not allowed',
+            'not permitted',
+        )
+        return (
+            'unsupported format' in err_str
+            or (
+                any(marker in err_str for marker in parameter_markers)
+                and any(marker in err_str for marker in rejection_markers)
+            )
+        )
+
+    @staticmethod
+    def _validate_verbose_json_payload(payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise RuntimeError("ASR verbose_json 响应不是 JSON 对象")
+        if payload.get('error'):
+            raise RuntimeError(f"ASR API 返回错误对象: {str(payload['error'])[:300]}")
+        expected_fields = {'text', 'segments', 'words', 'language', 'duration'}
+        if not expected_fields.intersection(payload):
+            raise RuntimeError("ASR verbose_json 响应缺少预期字段")
+        return payload
+
+    @staticmethod
+    def _text_density_metrics(text: str) -> Tuple[int, int]:
+        normalized = str(text or '').strip()
+        if not normalized:
+            return 0, 0
+        visible_chars = len(_VISIBLE_TEXT_RE.findall(normalized))
+        word_like_units = len(_LATIN_WORD_RE.findall(normalized)) + len(_CJK_CHAR_RE.findall(normalized))
+        return visible_chars, word_like_units
+
+    @classmethod
+    def _is_implausible_for_duration(cls, text: str, duration_s: float) -> bool:
+        normalized = str(text or '').strip()
+        if not normalized:
+            return False
+        visible_chars, word_like_units = cls._text_density_metrics(normalized)
+        safe_duration = max(float(duration_s or 0.0), 0.1)
+        chars_per_second = visible_chars / safe_duration
+        units_per_second = word_like_units / safe_duration
+        if safe_duration < 8.0 and visible_chars > 280:
+            return True
+        if safe_duration < 15.0 and visible_chars > 420:
+            return True
+        if chars_per_second > 45.0 or units_per_second > 8.0:
+            return True
+        return False
+
+    def _cache_capabilities(
+        self,
+        *,
+        transcription_fmt: Optional[str],
+        language_detection_fmt: Optional[str],
+        transcription_granularities: Tuple[str, ...],
+    ):
+        with self._capability_probe_condition:
+            if transcription_fmt:
+                self._capability_cache.transcription_format = transcription_fmt
+            if language_detection_fmt:
+                self._capability_cache.language_detection_format = language_detection_fmt
+            self._capability_cache.transcription_granularities = tuple(transcription_granularities or ())
+            self._capability_probe_incompatible = False
+            signature = (
+                self._capability_cache.transcription_format or '',
+                self._capability_cache.language_detection_format or '',
+                tuple(self._capability_cache.transcription_granularities),
+            )
+            if signature != self._logged_capability_signature:
+                self._logged_capability_signature = signature
+                self.logger.info(
+                    "Cached ASR response mode: format=%s, language_detection=%s, granularity=%s",
+                    signature[0],
+                    signature[1],
+                    ','.join(signature[2]) if signature[2] else 'none',
+                )
+
+    def _invalidate_capabilities(self):
+        with self._capability_probe_condition:
+            self._capability_cache = _AsrCapabilityCache()
+            self._capability_probe_incompatible = False
+            self._logged_capability_signature = None
+
+    def _needs_serial_format_probe(self) -> bool:
+        with self._capability_probe_condition:
+            return not self._capability_cache.transcription_format and not self._capability_probe_incompatible
+
+    def _build_incompatible_error(self) -> RuntimeError:
+        return AsrFormatIncompatibleError(
+            "ASR API 不兼容：无法协商出支持的转录格式。"
+        )
+
+    def _parse_requested_granularities(self) -> Tuple[str, ...]:
+        raw = str(self.config.timestamp_granularities or '').strip()
+        if not raw:
+            return ('segment',)
+        allowed = {'segment', 'word'}
+        result: List[str] = []
+        for part in raw.replace('\n', ',').split(','):
+            token = part.strip().lower()
+            if token in allowed and token not in result:
+                result.append(token)
+        if not result:
+            return ('segment',)
+        if 'segment' not in result:
+            result.insert(0, 'segment')
+        return tuple(result)
+
+    def _parse_voxtral_requested_granularities(self) -> Tuple[str, ...]:
+        return self._parse_requested_granularities()
+
+    def _whisper_granularity_candidates(self) -> List[Tuple[str, ...]]:
+        requested = self._parse_requested_granularities()
+        candidates: List[Tuple[str, ...]] = []
+        if requested:
+            candidates.append(requested)
+        segment_only = tuple(gran for gran in requested if gran == 'segment')
+        if segment_only and segment_only not in candidates:
+            candidates.append(segment_only)
+        if ('segment',) not in candidates:
+            candidates.append(('segment',))
+        candidates.append(tuple())
+        deduped: List[Tuple[str, ...]] = []
+        for candidate in candidates:
+            normalized = tuple(gran for gran in candidate if gran)
+            if normalized not in deduped:
+                deduped.append(normalized)
+        return deduped
+
+    def _probe_capabilities(
+        self,
+        wav_path: str,
+        model: str,
+        *,
+        window: Optional[DetectedSpeechWindow],
+        include_language_hint: bool = True,
+        include_prompt: bool = True,
+    ) -> _AsrCapabilityProbeResult:
+        if self.config.provider == 'voxtral':
+            result = self._transcribe_segment_voxtral(
+                wav_path,
+                window=window,
+                granularity_candidates=self._voxtral_granularity_candidates(),
+                include_language_hint=include_language_hint,
+            )
+            if result and result.ok:
+                return _AsrCapabilityProbeResult(
+                    transcription_format='verbose_json',
+                    language_detection_format='json',
+                    transcription_granularities=tuple(result.metadata.get('granularities') or ()),
+                    transcription_result=result,
+                    language_data={'language': result.language} if result.language else None,
+                )
+            raise self._build_incompatible_error()
+
+        format_errors: List[Exception] = []
+        for granularities in self._whisper_granularity_candidates():
+            try:
+                # Prefer raw HTTP to preserve segment-level words.
+                raw_exc: Optional[Exception] = None
+                try:
+                    payload = self._request_whisper_raw_json(
+                        wav_path,
+                        model,
+                        granularities=granularities,
+                        include_language_hint=include_language_hint,
+                        include_prompt=include_prompt,
+                    )
+                except Exception as exc:
+                    raw_exc = exc
+                    try:
+                        response = self._request_whisper_response(
+                            wav_path,
+                            model,
+                            'verbose_json',
+                            granularities=granularities,
+                            include_language_hint=include_language_hint,
+                            include_prompt=include_prompt,
+                        )
+                        payload = self._as_dict(response)
+                    except Exception as sdk_exc:
+                        if self._is_format_error(raw_exc) and self._is_format_error(sdk_exc):
+                            raise sdk_exc
+                        raise AsrRequestError(
+                            "ASR verbose_json 请求失败；"
+                            f"raw={type(raw_exc).__name__}: {str(raw_exc)[:300]}; "
+                            f"sdk={type(sdk_exc).__name__}: {str(sdk_exc)[:300]}"
+                        ) from sdk_exc
+                payload = self._validate_verbose_json_payload(payload)
+                result = self._payload_to_transcription_result(
+                    payload,
+                    provider='whisper',
+                    response_format='verbose_json',
+                    timestamp_mode='word' if self._payload_has_words(payload) else 'segment',
+                    window=window,
+                    granularities=granularities,
+                )
+                return _AsrCapabilityProbeResult(
+                    transcription_format='verbose_json',
+                    language_detection_format='verbose_json',
+                    transcription_granularities=granularities,
+                    transcription_result=result,
+                    language_data=payload,
+                )
+            except Exception as exc:
+                if self._is_format_error(exc):
+                    format_errors.append(exc)
+                    continue
+                raise
+
+        try:
+            srt_text = self._extract_text(
+                self._request_whisper_response(
+                    wav_path,
+                    model,
+                    'srt',
+                    granularities=tuple(),
+                    include_language_hint=include_language_hint,
+                    include_prompt=include_prompt,
+                )
+            )
+            return _AsrCapabilityProbeResult(
+                transcription_format='srt',
+                language_detection_format='json',
+                transcription_granularities=tuple(),
+                transcription_result=AsrTranscriptionResult(
+                    provider='whisper',
+                    response_format='srt',
+                    timestamp_mode='srt',
+                    text=srt_text,
+                    window=window,
+                    failure_token='asr_no_timestamps' if srt_text else 'asr_failed',
+                ),
+            )
+        except Exception as exc:
+            if self._is_format_error(exc):
+                format_errors.append(exc)
+            else:
+                raise
+
+        if format_errors:
+            raise self._build_incompatible_error()
+        return _AsrCapabilityProbeResult()
+
+    def _get_or_probe_capabilities(
+        self,
+        wav_path: str,
+        model: str,
+        *,
+        window: Optional[DetectedSpeechWindow],
+        include_language_hint: bool = True,
+        include_prompt: bool = True,
+    ) -> _AsrCapabilityProbeResult:
+        while True:
+            with self._capability_probe_condition:
+                if self._capability_cache.transcription_format:
+                    return _AsrCapabilityProbeResult(
+                        transcription_format=self._capability_cache.transcription_format,
+                        language_detection_format=self._capability_cache.language_detection_format,
+                        transcription_granularities=self._capability_cache.transcription_granularities,
+                    )
+                if self._capability_probe_incompatible:
+                    raise self._build_incompatible_error()
+                if self._capability_probe_in_progress:
+                    self._capability_probe_condition.wait()
+                    continue
+                self._capability_probe_in_progress = True
+                break
+
+        try:
+            probe_result = self._probe_capabilities(
+                wav_path,
+                model,
+                window=window,
+                include_language_hint=include_language_hint,
+                include_prompt=include_prompt,
+            )
+        except AsrFormatIncompatibleError:
+            with self._capability_probe_condition:
+                self._capability_probe_in_progress = False
+                self._capability_probe_incompatible = True
+                self._capability_probe_condition.notify_all()
+            raise
+        except Exception:
+            with self._capability_probe_condition:
+                self._capability_probe_in_progress = False
+                self._capability_probe_condition.notify_all()
+            raise
+
+        with self._capability_probe_condition:
+            self._capability_cache.transcription_format = probe_result.transcription_format
+            self._capability_cache.language_detection_format = probe_result.language_detection_format
+            self._capability_cache.transcription_granularities = tuple(
+                probe_result.transcription_granularities or ()
+            )
+            self._capability_probe_incompatible = False
+            self._capability_probe_in_progress = False
+            self._capability_probe_condition.notify_all()
+            signature = (
+                self._capability_cache.transcription_format or '',
+                self._capability_cache.language_detection_format or '',
+                tuple(self._capability_cache.transcription_granularities),
+            )
+            if signature != self._logged_capability_signature:
+                self._logged_capability_signature = signature
+                self.logger.info(
+                    "Cached ASR response mode: format=%s, language_detection=%s, granularity=%s",
+                    signature[0],
+                    signature[1],
+                    ','.join(signature[2]) if signature[2] else 'none',
+                )
+        return probe_result
+
+    def _request_whisper_response(
+        self,
+        wav_path: str,
+        model: str,
+        response_format: str,
+        *,
+        granularities: Tuple[str, ...],
+        temperature: Optional[float] = None,
+        include_language_hint: bool = True,
+        include_prompt: bool = True,
+        use_translation_endpoint: Optional[bool] = None,
+    ):
+        with open(wav_path, 'rb') as file_obj:
+            if use_translation_endpoint is None:
+                use_translation_endpoint = bool(self.config.translate)
+            effective_temperature = temperature
+            if effective_temperature is None:
+                effective_temperature = self.config.temperature
+            params: Dict[str, Any] = {
+                'model': model,
+                'file': file_obj,
+                'response_format': response_format,
+            }
+            # The SDK only exposes ``temperature``; the remaining decoding
+            # quality knobs are injected on the raw HTTP path instead.
+            if effective_temperature is not None:
+                params['temperature'] = effective_temperature
+            if include_language_hint:
+                language = self._language_hint or self._normalize_language_code(self.config.language)
+                if language:
+                    params['language'] = language
+            if include_prompt:
+                prompt = str(self.config.prompt or '').strip()
+                if prompt:
+                    params['prompt'] = prompt
+            # The translations endpoint rejects timestamp_granularities.
+            if response_format == 'verbose_json' and granularities and not use_translation_endpoint:
+                params['timestamp_granularities'] = list(granularities)
+
+            if use_translation_endpoint:
+                return self.client.audio.translations.create(**params)
+            return self.client.audio.transcriptions.create(**params)
+
+    def _build_whisper_audio_url(self, resource: str) -> str:
+        """Build the ``/audio/<resource>`` URL for direct HTTP requests."""
+        base = str(self.config.base_url or 'https://api.openai.com/v1').strip().rstrip('/')
+        for suffix in ('/audio/transcriptions', '/audio/translations'):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        base = base.rstrip('/')
+        if not base:
+            base = 'https://api.openai.com/v1'
+        return f"{base}/audio/{resource}"
+
+    def _build_whisper_transcriptions_url(self) -> str:
+        """Build the /v1/audio/transcriptions URL for direct HTTP requests."""
+        return self._build_whisper_audio_url('transcriptions')
+
+    def _build_whisper_translations_url(self) -> str:
+        """Build the /v1/audio/translations URL for direct HTTP requests."""
+        return self._build_whisper_audio_url('translations')
+
+    @staticmethod
+    def _format_form_scalar(value: Any) -> str:
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if isinstance(value, float):
+            return f"{value:.10g}"
+        return str(value)
+
+    def _whisper_quality_form_fields(self) -> List[Tuple[str, str]]:
+        """Decoding quality form fields for the raw HTTP transcriptions path.
+
+        Values set to ``None`` on ``AsrConfig`` are omitted so the server
+        default applies.
+        """
+        fields: List[Tuple[str, str]] = []
+        for name, value in (
+            ('temperature', self.config.temperature),
+            ('condition_on_previous_text', self.config.condition_on_previous_text),
+            ('no_speech_threshold', self.config.no_speech_threshold),
+            ('compression_ratio_threshold', self.config.compression_ratio_threshold),
+            ('logprob_threshold', self.config.logprob_threshold),
+        ):
+            if value is None:
+                continue
+            fields.append((name, self._format_form_scalar(value)))
+        return fields
+
+    def _request_whisper_raw_json(
+        self,
+        wav_path: str,
+        model: str,
+        *,
+        granularities: Tuple[str, ...],
+        include_language_hint: bool = True,
+        include_prompt: bool = True,
+    ) -> Dict[str, Any]:
+        """Direct HTTP request to whisper-compatible API, bypassing OpenAI SDK.
+
+        The OpenAI Python SDK's ``model_dump()`` only serialises fields defined
+        in its Pydantic schema.  LocalAI's crispasr backend returns per-segment
+        ``words`` arrays that the SDK schema does not include, so they are
+        silently dropped.  By making a raw ``requests.post`` we preserve the
+        full JSON response including segment-level word timestamps.
+        """
+        use_translation_endpoint = bool(self.config.translate)
+        if use_translation_endpoint:
+            endpoint_url = self._build_whisper_translations_url()
+        else:
+            endpoint_url = self._build_whisper_transcriptions_url()
+        headers: Dict[str, str] = {}
+        if self.config.api_key:
+            headers['Authorization'] = f"Bearer {self.config.api_key}"
+
+        form_data: List[Tuple[str, str]] = [('model', model), ('response_format', 'verbose_json')]
+        if include_language_hint:
+            language = self._language_hint or self._normalize_language_code(self.config.language)
+            if language:
+                form_data.append(('language', language))
+        if include_prompt:
+            prompt = str(self.config.prompt or '').strip()
+            if prompt:
+                form_data.append(('prompt', prompt))
+        # The translations endpoint rejects timestamp_granularities, so the
+        # granularity request is dropped there.  Downstream timestamp_mode is
+        # derived from the returned payload (see _payload_to_transcription_result),
+        # so it degrades to 'segment' automatically.
+        if not use_translation_endpoint:
+            for gran in granularities:
+                form_data.append(('timestamp_granularities', str(gran)))
+        form_data.extend(self._whisper_quality_form_fields())
+
+        with open(wav_path, 'rb') as file_obj:
+            response = requests.post(
+                endpoint_url,
+                headers=headers,
+                files={'file': (os.path.basename(wav_path), file_obj, 'audio/wav')},
+                data=form_data,
+                timeout=max(30.0, float(self.config.request_timeout_s or 300.0)),
+            )
+        if response.status_code != 200:
+            raise AsrHttpError(response.status_code, response.text)
+        payload: Dict[str, Any] = response.json()
+        return payload
+
+    def transcribe_window(
+        self,
+        wav_path: str,
+        window: Optional[DetectedSpeechWindow] = None,
+        segment_info: Optional[str] = None,
+    ) -> AsrTranscriptionResult:
+        if self.config.provider == 'voxtral':
+            return self._transcribe_segment_voxtral(wav_path, window=window, segment_info=segment_info)
+
+        model = self.config.model_name or 'whisper-1'
+        segment_desc = segment_info or wav_path
+        implausible_retry_used = False
+        for attempt in range(self.config.max_retries):
+            try:
+                probe_result = self._get_or_probe_capabilities(
+                    wav_path,
+                    model,
+                    window=window,
+                )
+                if probe_result.transcription_result is not None:
+                    return probe_result.transcription_result
+                result = self._transcribe_with_cached_capabilities(
+                    wav_path,
+                    model,
+                    window=window,
+                )
+                if result.ok or result.timestamp_mode == 'srt':
+                    return result
+            except ImplausibleAsrResultError as exc:
+                if implausible_retry_used:
+                    self.logger.warning("Implausible ASR result persists for [%s]: %s", segment_desc, exc)
+                else:
+                    implausible_retry_used = True
+                    self.logger.warning(
+                        "Implausible ASR result for [%s]; retrying once without prompt/language hint: %s",
+                        segment_desc,
+                        exc,
+                    )
+                    try:
+                        result = self._transcribe_with_cached_capabilities(
+                            wav_path,
+                            model,
+                            window=window,
+                            include_language_hint=False,
+                            include_prompt=False,
+                        )
+                        if result.ok:
+                            return result
+                    except Exception as retry_exc:
+                        self.logger.warning("Clean retry failed for [%s]: %s", segment_desc, retry_exc)
+            except AsrFormatIncompatibleError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "ASR request failed for [%s] with %s: %s (attempt %d/%d)",
+                    segment_desc,
+                    type(exc).__name__,
+                    exc,
+                    attempt + 1,
+                    self.config.max_retries,
+                )
+            if attempt < self.config.max_retries - 1:
+                delay = min(self.config.retry_delay_s * (2 ** attempt), 30.0)
+                time.sleep(delay)
+
+        return AsrTranscriptionResult(
+            provider=self.config.provider,
+            response_format='',
+            timestamp_mode='none',
+            window=window,
+            failure_token='asr_failed',
+        )
+
+    def _transcribe_with_cached_capabilities(
+        self,
+        wav_path: str,
+        model: str,
+        *,
+        window: Optional[DetectedSpeechWindow],
+        include_language_hint: bool = True,
+        include_prompt: bool = True,
+    ) -> AsrTranscriptionResult:
+        fmt = self._capability_cache.transcription_format
+        granularities = tuple(self._capability_cache.transcription_granularities or ())
+        if not fmt:
+            self._invalidate_capabilities()
+            probe_result = self._get_or_probe_capabilities(
+                wav_path,
+                model,
+                window=window,
+                include_language_hint=include_language_hint,
+                include_prompt=include_prompt,
+            )
+            if probe_result.transcription_result:
+                return probe_result.transcription_result
+            fmt = probe_result.transcription_format
+            granularities = tuple(probe_result.transcription_granularities or ())
+        if not fmt:
+            raise self._build_incompatible_error()
+
+        if fmt == 'srt':
+            response = self._request_whisper_response(
+                wav_path,
+                model,
+                'srt',
+                granularities=tuple(),
+                include_language_hint=include_language_hint,
+                include_prompt=include_prompt,
+            )
+            return AsrTranscriptionResult(
+                provider='whisper',
+                response_format='srt',
+                timestamp_mode='srt',
+                text=self._extract_text(response),
+                window=window,
+                failure_token='asr_no_timestamps',
+            )
+
+        # For verbose_json, prefer direct HTTP over OpenAI SDK to preserve
+        # segment-level ``words`` that ``model_dump()`` strips.
+        if fmt == 'verbose_json':
+            try:
+                payload = self._request_whisper_raw_json(
+                    wav_path,
+                    model,
+                    granularities=granularities,
+                    include_language_hint=include_language_hint,
+                    include_prompt=include_prompt,
+                )
+            except Exception as exc:
+                self.logger.debug("Raw HTTP fallback failed (%s), using SDK path", exc)
+                response = self._request_whisper_response(
+                    wav_path, model, fmt,
+                    granularities=granularities,
+                    include_language_hint=include_language_hint,
+                    include_prompt=include_prompt,
+                )
+                payload = self._as_dict(response) or {}
+        else:
+            response = self._request_whisper_response(
+                wav_path, model, fmt,
+                granularities=granularities,
+                include_language_hint=include_language_hint,
+                include_prompt=include_prompt,
+            )
+            payload = self._as_dict(response) or {}
+        return self._payload_to_transcription_result(
+            payload,
+            provider='whisper',
+            response_format=fmt,
+            timestamp_mode='word' if self._payload_has_words(payload) else 'segment',
+            window=window,
+            granularities=granularities,
+        )
+
+    def _voxtral_granularity_candidates(self) -> List[Tuple[str, ...]]:
+        requested = self._parse_voxtral_requested_granularities()
+        candidates: List[Tuple[str, ...]] = []
+        if requested:
+            candidates.append(requested)
+        segment_only = tuple(gran for gran in requested if gran == 'segment')
+        if segment_only and segment_only not in candidates:
+            candidates.append(segment_only)
+        if ('segment',) not in candidates:
+            candidates.append(('segment',))
+        candidates.append(tuple())
+        deduped: List[Tuple[str, ...]] = []
+        for candidate in candidates:
+            normalized = tuple(gran for gran in candidate if gran)
+            if normalized not in deduped:
+                deduped.append(normalized)
+        return deduped
+
+    def _transcribe_segment_voxtral(
+        self,
+        wav_path: str,
+        *,
+        window: Optional[DetectedSpeechWindow],
+        segment_info: Optional[str] = None,
+        granularity_candidates: Optional[Sequence[Tuple[str, ...]]] = None,
+        include_language_hint: bool = True,
+    ) -> AsrTranscriptionResult:
+        endpoint_url = self._build_voxtral_transcriptions_url(self.config.base_url)
+        if not endpoint_url:
+            return AsrTranscriptionResult(
+                provider='voxtral',
+                response_format='',
+                timestamp_mode='none',
+                window=window,
+                failure_token='asr_failed',
+            )
+        duration_s = self._probe_wav_duration(wav_path)
+        if (
+            self.config.voxtral_enforce_max_duration
+            and duration_s is not None
+            and duration_s > max(1.0, float(self.config.voxtral_max_audio_duration_s or 10800.0))
+        ):
+            return AsrTranscriptionResult(
+                provider='voxtral',
+                response_format='',
+                timestamp_mode='none',
+                window=window,
+                failure_token='asr_failed',
+                fallback_token='voxtral_max_duration_exceeded',
+            )
+
+        headers: Dict[str, str] = {}
+        if self.config.api_key:
+            headers['x-api-key'] = self.config.api_key
+
+        candidates = list(granularity_candidates or self._voxtral_granularity_candidates())
+        model = self.config.model_name or 'voxtral-mini-latest'
+        lang_hint = (self._language_hint or self.config.language or '').strip()
+        for attempt in range(self.config.max_retries):
+            for granularities in candidates:
+                try:
+                    form_data: List[Tuple[str, str]] = [('model', model)]
+                    for granularity in granularities:
+                        form_data.append(('timestamp_granularities', granularity))
+                    if self.config.diarize:
+                        form_data.append(('diarize', 'true'))
+                    for item in self._parse_context_bias(self.config.context_bias):
+                        form_data.append(('context_bias', item))
+                    if include_language_hint and lang_hint and lang_hint.lower() != 'unknown':
+                        form_data.append(('language', lang_hint))
+
+                    with open(wav_path, 'rb') as file_obj:
+                        response = requests.post(
+                            endpoint_url,
+                            headers=headers,
+                            files={'file': (os.path.basename(wav_path), file_obj, 'audio/wav')},
+                            data=form_data,
+                            timeout=max(30.0, float(self.config.request_timeout_s or 300.0)),
+                        )
+                    if response.status_code != 200:
+                        raise AsrHttpError(response.status_code, response.text)
+                    payload = response.json()
+                    result = self._payload_to_transcription_result(
+                        payload,
+                        provider='voxtral',
+                        response_format='verbose_json',
+                        timestamp_mode='word' if self._payload_has_words(payload) else 'segment',
+                        window=window,
+                        granularities=granularities,
+                    )
+                    result.metadata['granularities'] = list(granularities)
+                    return result
+                except Exception as exc:
+                    if self._is_format_error(exc):
+                        continue
+                    if attempt >= self.config.max_retries - 1:
+                        return AsrTranscriptionResult(
+                            provider='voxtral',
+                            response_format='',
+                            timestamp_mode='none',
+                            window=window,
+                            failure_token='asr_failed',
+                        )
+                    delay = min(self.config.retry_delay_s * (2 ** attempt), 30.0)
+                    self.logger.warning("Voxtral request failed: %s, retrying in %.1fs", exc, delay)
+                    time.sleep(delay)
+                    break
+        return AsrTranscriptionResult(
+            provider='voxtral',
+            response_format='',
+            timestamp_mode='none',
+            window=window,
+            failure_token='asr_failed',
+        )
+
+    def transcribe_segment(self, wav_path: str, segment_info: Optional[str] = None) -> Optional[str]:
+        result = self.transcribe_window(wav_path, window=None, segment_info=segment_info)
+        return self._render_result_to_srt(result)
+
+    def transcribe_segments_concurrent(
+        self,
+        segments: List[Tuple[float, str]],
+    ) -> List[Tuple[float, Optional[str]]]:
+        windows = []
+        for offset, wav_path in segments:
+            duration_s = self._probe_wav_duration(wav_path) or 0.0
+            window = DetectedSpeechWindow(
+                start_s=float(offset),
+                end_s=float(offset) + duration_s,
+                ownership_start_s=float(offset),
+                ownership_end_s=float(offset) + duration_s,
+            )
+            result = self.transcribe_window(wav_path, window=window)
+            windows.append((offset, self._render_result_to_srt(result, relative_to_window=True)))
+        return windows
+
+    def reset_quality_counters(self) -> None:
+        """清零本轮转录的失败占比统计，供新一轮转录（新任务/新尝试）开始时调用。
+
+        ``transcribe_windows_concurrent`` 会把连续多批窗口的失败占比取较差值，
+        因此同一轮内部的 fallback 不会覆盖主路径已经暴露的降级信号；只有在明确
+        进入新一轮时才需要调用本方法。
+        """
+        self.last_failure_ratio = 0.0
+        self.last_failed_count = 0
+        self.last_window_count = 0
+        self._quality_round_max_batch = 0
+        self._quality_round_worst_ratio = 0.0
+
+    def transcribe_windows_concurrent(
+        self,
+        windows: List[Tuple[DetectedSpeechWindow, str]],
+    ) -> List[AsrTranscriptionResult]:
+        if not windows:
+            # 空批次代表本轮没有可转录窗口，直接清零并准备下一轮统计。
+            self.reset_quality_counters()
+            return []
+
+        results: Dict[int, AsrTranscriptionResult] = {}
+        workers = max(1, int(self.config.max_workers or 1))
+        total_failures = 0
+        # 15% 失败容错，但下限随窗口规模收缩：3 次容错在 n<20 时会盖过 15% 本身，
+        # n=10 时放宽到 30%、n=4 时放宽到 75%，反而比旧的「半数」策略更宽。
+        # 这里最多允许 min(3, n//4) 次失败，小批量因此收紧到 1 次（n<=7）或 2 次
+        # （n<=11），大批量仍以 15% 为主。
+        max_total_failures = max(min(3, len(windows) // 4), int(len(windows) * 0.15))
+        jobs: List[Tuple[int, DetectedSpeechWindow, str, str]] = []
+        for idx, (window, wav_path) in enumerate(windows):
+            jobs.append((idx, window, wav_path, f"{window.start_s:.2f}s-{window.end_s:.2f}s"))
+
+        remaining_jobs = jobs
+        if self._needs_serial_format_probe():
+            idx, window, wav_path, segment_info = jobs[0]
+            result = self.transcribe_window(wav_path, window=window, segment_info=segment_info)
+            results[idx] = result
+            if not result.ok and result.timestamp_mode != 'srt':
+                total_failures += 1
+            remaining_jobs = jobs[1:]
+
+        cancelled_jobs = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(self.transcribe_window, wav_path, window, segment_info): (idx, window)
+                for idx, window, wav_path, segment_info in remaining_jobs
+            }
+            for future in as_completed(futures):
+                idx, window = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = AsrTranscriptionResult(
+                        provider=self.config.provider,
+                        response_format='',
+                        timestamp_mode='none',
+                        window=window,
+                        failure_token='asr_failed',
+                        metadata={'exception': str(exc)},
+                    )
+                results[idx] = result
+                if not result.ok and result.timestamp_mode != 'srt':
+                    total_failures += 1
+                    if total_failures >= max_total_failures:
+                        # 容错已耗尽：取消所有未启动的任务，整批作废。
+                        # cancel() 只对排队中的任务生效，已在运行的任务仍会返回结果。
+                        for pending in futures:
+                            if pending.cancel():
+                                cancelled_jobs += 1
+                        break
+
+        ordered: List[AsrTranscriptionResult] = []
+        skipped_failures = 0
+        for idx in range(len(windows)):
+            result = results.get(idx)
+            if result is None:
+                # 被取消 / 从未执行的窗口按失败记账：它们在最终产物里同样是
+                # asr_failed stub，漏记会让失败占比被系统性低估。
+                skipped_failures += 1
+                result = AsrTranscriptionResult(
+                    provider=self.config.provider,
+                    response_format='',
+                    timestamp_mode='none',
+                    window=windows[idx][0],
+                    failure_token='asr_failed',
+                )
+            ordered.append(result)
+        total_failures += skipped_failures
+
+        # 本轮最差结局：last_failure_ratio 取本轮各批失败占比的最大值，避免
+        # fallback 等后续小批次把主路径已经暴露的降级信号稀释掉；只有当新批次
+        # 比本轮此前的最大批次还大时才视为新一轮转录，重置统计。
+        if len(windows) > self._quality_round_max_batch:
+            self._quality_round_max_batch = len(windows)
+            self._quality_round_worst_ratio = 0.0
+        batch_ratio = total_failures / len(windows)
+        self._quality_round_worst_ratio = max(self._quality_round_worst_ratio, batch_ratio)
+        self.last_failure_ratio = self._quality_round_worst_ratio
+        self.last_window_count = self._quality_round_max_batch
+        self.last_failed_count = int(round(self.last_failure_ratio * self.last_window_count))
+        if total_failures:
+            self.logger.warning(
+                "ASR window batch finished with %d/%d failed windows (%.1f%% failure ratio, "
+                "%d cancelled, round worst %d/%d, %.1f%%)",
+                total_failures,
+                len(windows),
+                batch_ratio * 100.0,
+                cancelled_jobs,
+                self.last_failed_count,
+                self.last_window_count,
+                self.last_failure_ratio * 100.0,
+            )
+        return ordered
+
+    def detect_language(self, wav_path: str) -> str:
+        if self.config.provider == 'voxtral':
+            return self._detect_language_voxtral(wav_path)
+        last_error: Optional[Exception] = None
+        for granularities in (('segment',), tuple()):
+            try:
+                response = self._request_whisper_response(
+                    wav_path,
+                    self.config.model_name or 'whisper-1',
+                    'verbose_json',
+                    granularities=granularities,
+                    temperature=0,
+                    include_language_hint=False,
+                    include_prompt=False,
+                    use_translation_endpoint=False,
+                )
+                data = self._as_dict(response) or {}
+                return self._extract_language_from_data(data)
+            except Exception as exc:
+                last_error = exc
+                if self._is_format_error(exc) and granularities:
+                    continue
+                break
+        if last_error:
+            self.logger.warning("Language detection failed: %s", last_error)
+        return ''
+
+    def detect_language_from_segments(
+        self,
+        audio_wav: str,
+        segments: Iterable[Any],
+        extract_clip_fn,
+    ) -> str:
+        normalized_segments: List[Tuple[float, float]] = []
+        for item in segments or []:
+            if isinstance(item, DetectedSpeechWindow):
+                normalized_segments.append((item.start_s, item.end_s))
+            else:
+                try:
+                    normalized_segments.append((float(item[0]), float(item[1])))
+                except Exception:
+                    continue
+        if not normalized_segments:
+            return ''
+        sorted_segments = sorted(normalized_segments, key=lambda segment: segment[0])
+        count = len(sorted_segments)
+        # Sample five evenly spread windows (head/quarter/middle/three-quarter/tail)
+        # instead of the previous three, so a single dominant mid-roll segment
+        # cannot decide the language on its own.
+        pick_indices = {0, count // 4, count // 2, (3 * count) // 4, count - 1}
+        picks = [sorted_segments[index] for index in sorted(pick_indices) if 0 <= index < len(sorted_segments)]
+
+        detected: List[Tuple[str, float]] = []
+        for start_s, end_s in picks:
+            clip = extract_clip_fn(audio_wav, start_s, end_s)
+            if not clip:
+                continue
+            lang = self.detect_language(clip)
+            if lang:
+                detected.append((lang, max(0.0, float(end_s) - float(start_s))))
+        if not detected:
+            self.logger.warning(
+                "Language detection produced no usable sample from %d window(s) "
+                "(%d sampled); falling back to configured language or auto-detection",
+                count,
+                len(picks),
+            )
+            return ''
+
+        counts: Dict[str, int] = {}
+        durations: Dict[str, float] = {}
+        first_seen: Dict[str, int] = {}
+        for index, (lang, duration_s) in enumerate(detected):
+            normalized_lang = self._normalize_language_code(lang)
+            if not normalized_lang:
+                continue
+            counts[normalized_lang] = counts.get(normalized_lang, 0) + 1
+            durations[normalized_lang] = durations.get(normalized_lang, 0.0) + float(duration_s)
+            first_seen.setdefault(normalized_lang, index)
+        if not counts:
+            self.logger.warning(
+                "Language detection returned only unusable language codes "
+                "(%s); falling back to configured language or auto-detection",
+                ', '.join(sorted({str(lang)[:24] for lang, _ in detected})),
+            )
+            return ''
+        return sorted(
+            counts,
+            key=lambda lang: (-counts[lang], -durations.get(lang, 0.0), first_seen.get(lang, 0)),
+        )[0]
+
+    def _payload_to_transcription_result(
+        self,
+        payload: Dict[str, Any],
+        *,
+        provider: str,
+        response_format: str,
+        timestamp_mode: str,
+        window: Optional[DetectedSpeechWindow],
+        granularities: Tuple[str, ...] = tuple(),
+    ) -> AsrTranscriptionResult:
+        if not isinstance(payload, dict):
+            return AsrTranscriptionResult(
+                provider=provider,
+                response_format=response_format,
+                timestamp_mode='none',
+                window=window,
+                failure_token='asr_failed',
+            )
+
+        language = self._extract_language_from_data(payload)
+        segments_data = payload.get('segments')
+        raw_words = payload.get('words')
+        top_level_words: List[Any] = raw_words if isinstance(raw_words, list) else []
+        expected_duration_s = 0.0
+        if window is not None:
+            expected_duration_s = max(0.0, float(window.duration_s or 0.0))
+        raw_duration = self._to_optional_float(payload.get('duration')) or self._probe_result_duration(payload)
+        if expected_duration_s <= 0.0 and raw_duration:
+            expected_duration_s = max(0.0, float(raw_duration))
+        timing_scale = self._detect_timing_scale(
+            segments_data if isinstance(segments_data, list) else [],
+            top_level_words,
+            expected_duration_s=expected_duration_s,
+        )
+        if timing_scale != 1.0 and isinstance(segments_data, list) and segments_data:
+            self.logger.info(
+                "Normalizing ASR timestamps by scale %.0f for %s payload (expected_duration=%.2fs)",
+                timing_scale,
+                provider,
+                expected_duration_s,
+            )
+        segments: List[AsrSegmentTiming] = []
+
+        if isinstance(segments_data, list):
+            for raw_segment in segments_data:
+                if not isinstance(raw_segment, dict):
+                    continue
+                text = str(raw_segment.get('text') or '').strip()
+                if not text:
+                    continue
+                start_s = self._normalize_timing_value(raw_segment.get('start', 0.0), timing_scale)
+                end_s = self._normalize_timing_value(raw_segment.get('end', 0.0), timing_scale)
+                if end_s <= start_s:
+                    end_s = start_s + _INVALID_DURATION_FALLBACK
+                # Extract real per-segment word timings if present.
+                # LocalAI's crispasr backend returns word-level timestamps
+                # in the segment's ``words`` array when using direct HTTP
+                # (bypassing the OpenAI SDK's model_dump which strips them).
+                words = self._extract_words(raw_segment.get('words') or raw_segment.get('tokens') or [], timing_scale=timing_scale)
+                # When a VAD window is provided, use the window duration for the
+                # plausibility check.  Some ASR backends (e.g. qwen3-asr) return
+                # locally compressed timestamps that span only a fraction of the
+                # actual audio clip.  The alignment code in _align_segment will
+                # clamp these to window boundaries, so evaluating density against
+                # the window duration avoids false rejections.
+                check_duration = max(end_s - start_s, 0.1)
+                if window is not None and window.duration_s > 0:
+                    check_duration = max(check_duration, window.duration_s)
+                if self._is_implausible_for_duration(text, check_duration):
+                    raise ImplausibleAsrResultError(
+                        f"segment is implausible for returned timing {start_s:.2f}s-{end_s:.2f}s"
+                    )
+                segments.append(
+                    AsrSegmentTiming(
+                        start_s=start_s,
+                        end_s=end_s,
+                        text=text,
+                        words=words,
+                        confidence=self._to_optional_float(raw_segment.get('avg_logprob') or raw_segment.get('confidence')),
+                        metadata={'id': raw_segment.get('id'), 'timing_scale': timing_scale},
+                    )
+                )
+
+        # Diagnostic: log per-segment word counts to trace native word timestamps
+        if segments:
+            seg_word_counts = [len(s.words) for s in segments]
+            total_words = sum(seg_word_counts)
+            if total_words:
+                self.logger.info(
+                    "ASR Phase-1 segment words: %d total across %d segments (%s)",
+                    total_words, len(segments), seg_word_counts,
+                )
+
+        # Phase 2: Attach top-level words (LocalAI/whisper verbose_json puts
+        # word-level data here, not inside segments).  This must happen BEFORE
+        # the text-split synthesis fallback so real word timings are preserved.
+        if segments and top_level_words:
+            top_words = self._extract_words(top_level_words, timing_scale=timing_scale)
+            if top_words:
+                self._attach_top_level_words_to_segments(segments, top_words)
+                self.logger.info(
+                    "ASR top-level words: %d word-level entries received and attached to segments",
+                    len(top_words),
+                )
+            else:
+                self.logger.info(
+                    "ASR top-level words field present but no extractable word timings (raw count=%d)",
+                    len(top_level_words),
+                )
+        elif segments:
+            self.logger.info(
+                "ASR response has no top-level words field; per-word data unavailable for this backend",
+            )
+
+        # Phase 2.5: Redistribute parakeet global words.
+        # LocalAI's crispasr backend attaches parakeet word-level timestamps
+        # only to the FIRST segment (global word list, not per-segment).
+        # When there are multiple segments, redistribute those words across
+        # all segments based on timing so every segment gets real word data.
+        if len(segments) > 1:
+            segs_with_words = [s for s in segments if s.words]
+            segs_without = [s for s in segments if not s.words]
+            if len(segs_with_words) == 1 and segs_with_words[0] is segments[0] and segs_without:
+                donor = segments[0]
+                donor_words = list(donor.words)
+                redistributed = 0
+                for seg in segments[1:]:
+                    seg_words = [
+                        w for w in donor_words
+                        if w.start_s >= seg.start_s and w.start_s < seg.end_s
+                    ]
+                    if seg_words:
+                        seg.words = seg_words
+                        redistributed += 1
+                # Keep only words that belong to segment 0's range
+                remaining = [
+                    w for w in donor_words
+                    if w.start_s < segments[1].start_s
+                ]
+                if remaining:
+                    donor.words = remaining
+                if redistributed:
+                    self.logger.info(
+                        "Redistributed parakeet global words: %d words from seg[0] → %d/%d segments now have word data",
+                        len(donor_words), redistributed + 1, len(segments),
+                    )
+
+        text = str(payload.get('text') or '').strip()
+        if not segments and text:
+            duration = self._normalize_timing_value(raw_duration, timing_scale) if raw_duration is not None else 0.0
+            if duration <= 0.0 and window is not None:
+                duration = max(0.0, float(window.duration_s or 0.0))
+            if duration <= 0.0:
+                duration = 1.0
+            if self._is_implausible_for_duration(text, duration):
+                raise ImplausibleAsrResultError("fallback cue without segments is implausible")
+            segments.append(AsrSegmentTiming(start_s=0.0, end_s=duration, text=text))
+
+        if not text:
+            text = ' '.join(segment.text for segment in segments).strip()
+
+        # Some ASR backends (e.g. qwen3-asr) return severely compressed
+        # timestamps that only span a small fraction of the actual audio clip.
+        # When a VAD window is available, rescale segment timestamps
+        # proportionally so they fill the window duration.  This preserves
+        # relative ordering while ensuring subtitles are visible for the
+        # correct amount of time.
+        if window is not None and window.duration_s > 0 and segments:
+            max_ts = max(seg.end_s for seg in segments)
+            if max_ts > 0 and max_ts < window.duration_s * 0.4:
+                scale = window.duration_s / max_ts
+                self.logger.info(
+                    "Rescaling compressed ASR timestamps by %.2f for window [%.1fs-%.1fs] "
+                    "(max_ts=%.2fs, window_dur=%.2fs)",
+                    scale, window.start_s, window.end_s, max_ts, window.duration_s,
+                )
+                for seg in segments:
+                    seg.start_s *= scale
+                    seg.end_s *= scale
+                    for w in seg.words:
+                        w.start_s *= scale
+                        w.end_s *= scale
+
+        result_mode = 'word' if any(segment.words for segment in segments) else timestamp_mode
+        return AsrTranscriptionResult(
+            provider=provider,
+            response_format=response_format,
+            timestamp_mode=result_mode,
+            text=text,
+            language=language,
+            segments=segments,
+            window=window,
+            failure_token='' if segments or text else 'asr_failed',
+            metadata={'granularities': list(granularities), 'timing_scale': timing_scale},
+        )
+
+    @staticmethod
+    def _payload_has_words(payload: Dict[str, Any]) -> bool:
+        top_level_words = payload.get('words') or []
+        if AsrApiClient._extract_words(top_level_words):
+            return True
+        segments = payload.get('segments') or []
+        if isinstance(segments, list):
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                if AsrApiClient._extract_words(segment.get('words') or []):
+                    return True
+                if AsrApiClient._extract_words(segment.get('tokens') or []):
+                    return True
+        return False
+
+    @staticmethod
+    def _extract_words(raw_words: Iterable[Any], timing_scale: float = 1.0) -> List[AsrWordTiming]:
+        words: List[AsrWordTiming] = []
+        for raw_word in raw_words or []:
+            if not isinstance(raw_word, dict):
+                continue
+            text = str(raw_word.get('word') or raw_word.get('text') or raw_word.get('token') or '').strip()
+            if not text:
+                continue
+            start_s = AsrApiClient._normalize_timing_value(raw_word.get('start', raw_word.get('start_s', raw_word.get('start_time', 0.0))), timing_scale)
+            end_s = AsrApiClient._normalize_timing_value(raw_word.get('end', raw_word.get('end_s', raw_word.get('end_time', 0.0))), timing_scale)
+            if end_s <= start_s:
+                continue
+            words.append(AsrWordTiming(start_s=start_s, end_s=end_s, text=text))
+        return words
+
+    @staticmethod
+    def _normalize_timing_value(value: Any, timing_scale: float = 1.0) -> float:
+        try:
+            numeric = float(value or 0.0)
+        except Exception:
+            return 0.0
+        scale = float(timing_scale or 1.0)
+        if scale <= 0.0:
+            scale = 1.0
+        return numeric / scale
+
+    @classmethod
+    def _detect_timing_scale(
+        cls,
+        raw_segments: Iterable[Any],
+        raw_words: Iterable[Any],
+        *,
+        expected_duration_s: float,
+    ) -> float:
+        values: List[float] = []
+        for raw_segment in raw_segments or []:
+            if not isinstance(raw_segment, dict):
+                continue
+            for key in ('start', 'end'):
+                numeric = cls._to_optional_float(raw_segment.get(key))
+                if numeric and numeric > 0:
+                    values.append(abs(numeric))
+            for raw_word in raw_segment.get('words') or []:
+                if not isinstance(raw_word, dict):
+                    continue
+                for key in ('start', 'end', 'start_s', 'end_s'):
+                    numeric = cls._to_optional_float(raw_word.get(key))
+                    if numeric and numeric > 0:
+                        values.append(abs(numeric))
+        for raw_word in raw_words or []:
+            if not isinstance(raw_word, dict):
+                continue
+            for key in ('start', 'end', 'start_s', 'end_s'):
+                numeric = cls._to_optional_float(raw_word.get(key))
+                if numeric and numeric > 0:
+                    values.append(abs(numeric))
+
+        if not values:
+            return 1.0
+
+        max_value = max(values)
+        if max_value <= 0.0:
+            return 1.0
+
+        if expected_duration_s > 0.0:
+            candidate_scales = (1.0, 1e3, 1e6, 1e9)
+            best_scale = 1.0
+            best_score = float('inf')
+            for scale in candidate_scales:
+                normalized = max_value / scale
+                ratio = max(normalized / max(expected_duration_s, 1e-6), 1e-9)
+                score = abs(math.log(ratio))
+                if normalized < expected_duration_s * 0.05:
+                    score += 4.0
+                elif normalized > expected_duration_s * 20.0:
+                    score += 4.0
+                if score < best_score:
+                    best_score = score
+                    best_scale = scale
+            if best_scale != 1.0 and max_value > expected_duration_s * 100.0:
+                return best_scale
+
+        if max_value >= 1e8:
+            return 1e9
+        if max_value >= 1e5:
+            return 1e6
+        if max_value >= 1e4:
+            return 1e3
+        return 1.0
+
+    @staticmethod
+    def _attach_top_level_words_to_segments(
+        segments: List[AsrSegmentTiming],
+        words: List[AsrWordTiming],
+    ):
+        if not segments or not words:
+            return
+        # Track segments that already have per-segment words — top-level
+        # words should only fill gaps, not duplicate or override per-segment
+        # data (which may be real or synthesized from token/text fallbacks).
+        segments_with_own_words = set(id(s) for s in segments if s.words)
+        for segment in segments:
+            if segment.words:
+                continue
+            segment.words = []
+        for word in words:
+            selected_segment: Optional[AsrSegmentTiming] = None
+            best_overlap = -1.0
+            for segment in segments:
+                if id(segment) in segments_with_own_words:
+                    continue
+                overlap = min(word.end_s, segment.end_s) - max(word.start_s, segment.start_s)
+                if overlap > best_overlap and overlap > 0.0:
+                    best_overlap = overlap
+                    selected_segment = segment
+            if selected_segment is None:
+                candidates = [s for s in segments if id(s) not in segments_with_own_words]
+                if candidates:
+                    selected_segment = min(
+                        candidates,
+                        key=lambda segment: min(
+                            abs(word.start_s - segment.start_s),
+                            abs(word.end_s - segment.end_s),
+                        ),
+                    )
+            if selected_segment is not None:
+                word.source_text = selected_segment.text
+                selected_segment.words.append(word)
+        # 为每个 segment 的 words 计算字符偏移，使下游能从原始文本切片
+        for segment in segments:
+            if segment.words and segment.text:
+                _compute_synth_word_offsets(segment.text, segment.words)
+
+    @staticmethod
+    def _extract_language_from_data(data: Dict[str, Any]) -> str:
+        language = data.get('language', '')
+        if language:
+            return str(language).strip()
+        segments = data.get('segments') or []
+        if segments and isinstance(segments, list):
+            first = segments[0]
+            if isinstance(first, dict):
+                return str(first.get('language', '')).strip()
+        return ''
+
+    def _detect_language_voxtral(self, wav_path: str) -> str:
+        endpoint_url = self._build_voxtral_transcriptions_url(self.config.base_url)
+        if not endpoint_url:
+            return ''
+        headers: Dict[str, str] = {}
+        if self.config.api_key:
+            headers['x-api-key'] = self.config.api_key
+        try:
+            with open(wav_path, 'rb') as file_obj:
+                response = requests.post(
+                    endpoint_url,
+                    headers=headers,
+                    files={'file': (os.path.basename(wav_path), file_obj, 'audio/wav')},
+                    data=[('model', self.config.model_name or 'voxtral-mini-latest')],
+                    timeout=max(30.0, float(self.config.request_timeout_s or 300.0)),
+                )
+            if response.status_code != 200:
+                return ''
+            return self._extract_language_from_data(response.json() if response.content else {})
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _render_result_to_srt(
+        result: AsrTranscriptionResult,
+        *,
+        relative_to_window: bool = False,
+    ) -> Optional[str]:
+        if not result:
+            return None
+        if result.timestamp_mode == 'srt':
+            return str(result.text or '').strip() or None
+        if not result.segments:
+            return None
+        base_offset = result.window.start_s if (relative_to_window and result.window) else 0.0
+        lines: List[str] = []
+        for idx, segment in enumerate(result.segments, start=1):
+            lines.append(str(idx))
+            lines.append(
+                f"{_format_srt_timestamp(max(0.0, segment.start_s - base_offset))} --> "
+                f"{_format_srt_timestamp(max(0.0, segment.end_s - base_offset))}"
+            )
+            lines.append(segment.text)
+            lines.append('')
+        return '\n'.join(lines).strip() + '\n'
+
+    @staticmethod
+    def _extract_text(resp: Any) -> str:
+        if resp is None:
+            return ''
+        if isinstance(resp, str):
+            return resp.strip()
+        text = getattr(resp, 'text', None)
+        if isinstance(text, str):
+            return text.strip()
+        if hasattr(resp, 'read'):
+            try:
+                return str(resp.read() or '').strip()
+            except Exception:
+                return ''
+        return str(resp).strip()
+
+    @staticmethod
+    def _as_dict(resp: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(resp, dict):
+            return resp
+        if hasattr(resp, 'model_dump'):
+            try:
+                data = resp.model_dump()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                return None
+        if hasattr(resp, 'to_dict'):
+            try:
+                data = resp.to_dict()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                return None
+        payload = getattr(resp, '__dict__', None)
+        if isinstance(payload, dict):
+            return payload
+        return None
+
+    @staticmethod
+    def _parse_context_bias(value: str) -> List[str]:
+        raw = str(value or '').strip()
+        if not raw:
+            return []
+        deduped: List[str] = []
+        for item in raw.replace('\n', ',').split(','):
+            piece = item.strip()
+            if piece and piece not in deduped:
+                deduped.append(piece)
+        return deduped
+
+    @staticmethod
+    @staticmethod
+    def _build_voxtral_transcriptions_url(base_url: str) -> str:
+        raw = (base_url or '').strip()
+        if not raw:
+            return ''
+        if '://' not in raw:
+            raw = f"https://{raw}"
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return ''
+        path = (parsed.path or '').rstrip('/')
+        if path.endswith('/audio/transcriptions'):
+            normalized_path = path
+        elif path.endswith('/v1'):
+            normalized_path = f"{path}/audio/transcriptions"
+        elif path:
+            normalized_path = f"{path}/v1/audio/transcriptions"
+        else:
+            normalized_path = '/v1/audio/transcriptions'
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            normalized_path,
+            parsed.params,
+            '',
+            parsed.fragment,
+        ))
+
+    @staticmethod
+    def _probe_wav_duration(wav_path: str) -> Optional[float]:
+        try:
+            import wave
+
+            with wave.open(wav_path, 'rb') as file_obj:
+                rate = file_obj.getframerate()
+                if rate <= 0:
+                    return None
+                return file_obj.getnframes() / rate
+        except Exception:
+            return None
+
+    @staticmethod
+    def _probe_result_duration(payload: Dict[str, Any]) -> Optional[float]:
+        duration = payload.get('duration')
+        try:
+            if duration is None:
+                return None
+            return float(duration)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _to_optional_float(value: Any) -> Optional[float]:
+        try:
+            if value is None or value == '':
+                return None
+            return float(value)
+        except Exception:
+            return None

@@ -1,0 +1,167 @@
+<tr data-task-id="{{ task.id }}" data-status="{{ task.status }}" class="status-{{ task.status }}">
+    <!-- 1. 复选框 -->
+    <td class="col-check">
+        <input type="checkbox" class="form-check-input task-checkbox" value="{{ task.id }}" 
+               onchange="handleCheckboxChange(this)" {% if task.id in selected_task_ids %}checked{% endif %}>
+    </td>
+
+    <!-- 2. 视频标题 (自适应占据剩余宽度) -->
+    <td class="col-title">
+        <div class="d-flex align-items-start gap-2">
+            {% if task.cover_path_local %}
+            <div class="flex-shrink-0 d-none d-lg-block">
+                <img src="{{ url_for('get_task_cover', task_id=task.id) }}" alt="cover" class="rounded" style="width: 80px; height: 45px; object-fit: cover;" onerror="this.style.display='none'">
+            </div>
+            {% endif %}
+            
+            <div class="flex-grow-1" style="min-width: 0;">
+                <div class="title-clamp fw-bold text-dark" title="{{ task.video_title_translated or task.video_title_original or '未获取标题' }}">
+                    {{ task.video_title_translated or task.video_title_original or '未获取标题' }}
+                </div>
+                
+                {% if task.video_title_original and task.video_title_translated and task.video_title_original != task.video_title_translated %}
+                <div class="text-muted small text-truncate mt-1" title="{{ task.video_title_original }}">
+                    <i class="bi bi-youtube text-danger"></i> {{ task.video_title_original }}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </td>
+
+    <!-- 3. 状态 -->
+    <td class="col-status text-center">
+        <span class="badge bg-{{ task_status_color(task.status) }} task-status-badge">
+            {{ task_status_display(task.status) }}
+        </span>
+        {% if task.upload_progress %}
+        <div class="progress progress-thin mt-1 mx-auto" style="width: 80%;">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                 data-pct="{{ task.upload_progress|replace('%','') }}"></div>
+        </div>
+        <div class="small text-muted mt-1" data-task-progress>{{ task.upload_progress }}</div>
+        {% else %}
+        <div class="small text-muted mt-1 d-none" data-task-progress></div>
+        {% endif %}
+    </td>
+
+    <!-- 4. 更新时间 (由 JS 渲染为 MM-DD HH:mm) -->
+    <td class="col-time text-center">
+        <span class="task-datetime text-muted" style="font-size: 0.85rem; white-space: nowrap;" data-datetime="{{ task.updated_at }}">
+            {{ task.updated_at }}
+        </span>
+    </td>
+
+    <!-- 5. 平台 -->
+    <td class="col-platform text-center">
+        {% if task.upload_target == 'both' %}
+            <span class="badge bg-primary">双平台</span>
+        {% elif task.upload_target == 'bilibili' %}
+            <span class="badge bg-info text-dark">bilibili</span>
+        {% else %}
+            <span class="badge bg-danger">AcFun</span>
+        {% endif %}
+    </td>
+
+    <!-- 6. 分区 -->
+    <td class="col-partition text-center">
+        <div class="d-flex flex-column align-items-center gap-1">
+            {% if task.upload_target in ['acfun', 'both'] %}
+                {% set acfun_pid = task.selected_partition_id_acfun or task.recommended_partition_id_acfun %}
+                {% if acfun_pid %}
+                    <span class="badge bg-light text-dark border">A: {{ get_partition_name(acfun_pid, 'acfun') or acfun_pid }}</span>
+                {% endif %}
+            {% endif %}
+            {% if task.upload_target in ['bilibili', 'both'] %}
+                {% set bili_pid = task.selected_partition_id_bilibili or task.recommended_partition_id_bilibili %}
+                {% if bili_pid %}
+                    <span class="badge bg-light text-dark border">B: {{ get_partition_name(bili_pid, 'bilibili') or bili_pid }}</span>
+                {% endif %}
+            {% endif %}
+            {% if not task.selected_partition_id_acfun and not task.recommended_partition_id_acfun and not task.selected_partition_id_bilibili and not task.recommended_partition_id_bilibili %}
+                <span class="text-muted small">未设置</span>
+            {% endif %}
+        </div>
+    </td>
+
+    <!-- 7. 标签 -->
+    <td class="col-tags">
+        {% set tags_list = parse_json(task.tags_generated) %}
+        {% if tags_list %}
+            <div class="tags-container d-flex flex-wrap gap-1">
+                {% for tag in tags_list[:5] %}
+                <span class="badge bg-secondary" title="{{ tag }}" style="font-size: 0.7rem;">{{ tag }}</span>
+                {% endfor %}
+                {% if tags_list|length > 5 %}
+                <span class="badge bg-light text-secondary border" title="更多标签">+{{ tags_list|length - 5 }}</span>
+                {% endif %}
+            </div>
+        {% else %}
+            <span class="text-muted small">-</span>
+        {% endif %}
+    </td>
+
+    <!-- 8. 上传结果 -->
+    <td class="col-result">
+        <div class="upload-result-container">
+            {% if task.acfun_upload_response %}
+                {% set acfun_res = parse_json(task.acfun_upload_response) %}
+                <span class="badge bg-danger" title="AcFun AC号">AC{{ acfun_res.get('ac_number', '?') }}</span>
+            {% endif %}
+            {% if task.bilibili_upload_response %}
+                {% set bili_res = parse_json(task.bilibili_upload_response) %}
+                <span class="badge bg-info text-dark" title="bilibili BV号">{{ bili_res.get('bvid', '?') }}</span>
+            {% endif %}
+            {% if not task.acfun_upload_response and not task.bilibili_upload_response %}
+                <span class="text-muted small">-</span>
+            {% endif %}
+        </div>
+    </td>
+
+    <!-- 9. 操作 -->
+    <td class="col-actions">
+        <div class="d-flex justify-content-end gap-1 flex-wrap">
+            <a href="{{ url_for('edit_task', task_id=task.id) }}" class="btn btn-sm btn-outline-primary" title="编辑/审核">
+                <i class="bi bi-pencil-square"></i>
+            </a>
+            {% if task.status == 'failed' or task.status == 'pending' %}
+                <form method="post" action="{{ url_for('start_task_route', task_id=task.id) }}" class="d-inline">
+                    <button type="submit" class="btn btn-sm btn-outline-success" title="开始处理"><i class="bi bi-play-fill"></i></button>
+                </form>
+            {% endif %}
+            {% if task.status == 'ready_for_upload' %}
+                <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="d-inline">
+                    <button type="submit" class="btn btn-sm btn-outline-primary" title="立即上传"><i class="bi bi-cloud-arrow-up"></i></button>
+                </form>
+            {% endif %}
+            {% if task.status in ['downloading', 'translating', 'tagging', 'partitioning', 'moderating', 'uploading', 'asr_transcribing', 'translating_subtitle', 'encoding_video', 'fetching_info'] %}
+                <button type="button" class="btn btn-sm btn-outline-warning" title="停止任务" 
+                        data-task-id="{{ task.id }}" data-task-title="{{ task.video_title_translated or task.video_title_original }}"
+                        onclick="confirmStopTask(this.dataset.taskId, this.dataset.taskTitle)">
+                    <i class="bi bi-stop-fill"></i>
+                </button>
+            {% endif %}
+            <button type="button" class="btn btn-sm btn-outline-danger" title="删除任务"
+                    data-task-id="{{ task.id }}" data-task-title="{{ task.video_title_translated or task.video_title_original }}"
+                    onclick="confirmDelete(this.dataset.taskId, this.dataset.taskTitle)">
+                <i class="bi bi-trash"></i>
+            </button>
+        </div>
+    </td>
+
+    <!-- 10. 失败原因 -->
+    <td class="col-failreason">
+        {% if task.error_message %}
+        <div class="fail-reason-cell">
+            <span class="badge bg-danger-subtle text-danger border border-danger-subtle error-message-trigger fail-reason-badge"
+                  data-task-id="{{ task.id }}" data-task-title="{{ task.video_title_translated or task.video_title_original }}"
+                  data-error-message="{{ task.error_message }}"
+                  title="{{ task.error_message|friendly_error }}">
+                <i class="bi bi-exclamation-triangle-fill"></i>
+                <span class="fail-reason-text">{{ task.error_message|friendly_error }}</span>
+            </span>
+        </div>
+        {% else %}
+        <span class="text-muted small">-</span>
+        {% endif %}
+    </td>
+</tr>

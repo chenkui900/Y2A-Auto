@@ -1,0 +1,291 @@
+import ast
+import pathlib
+import unittest
+from unittest.mock import MagicMock, patch
+
+from modules import task_manager as tm
+
+
+def _load_app_partition_helper():
+    app_path = pathlib.Path(__file__).resolve().parents[1] / 'app.py'
+    source = app_path.read_text(encoding='utf-8')
+    tree = ast.parse(source, filename=str(app_path))
+    selected = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == '_missing_upload_partition_labels'
+    ]
+    isolated = ast.Module(body=selected, type_ignores=[])
+    namespace = {}
+    exec(compile(isolated, str(app_path), 'exec'), namespace)
+    return namespace['_missing_upload_partition_labels']
+
+
+class ForceUploadMetadataTests(unittest.TestCase):
+    def test_normalize_tags_list_handles_none_and_invalid_json(self):
+        self.assertEqual(tm._normalize_tags_list(None), [])
+        self.assertEqual(tm._normalize_tags_list(''), [])
+        self.assertEqual(tm._normalize_tags_list('not-json'), [])
+        self.assertEqual(tm._normalize_tags_list('["asmr", "", null, "game"]'), ['asmr', 'game'])
+
+    def test_force_upload_generates_missing_tags_and_partitions(self):
+        task_id = 'task-force-upload'
+        task = {
+            'id': task_id,
+            'upload_target': 'both',
+            'video_title_original': 'Matching game in ASMR',
+            'description_original': 'Ys: 45\nTo: 90',
+            'video_title_translated': 'ASMR中的配对游戏',
+            'description_translated': '',
+            'tags_generated': None,
+            'selected_partition_id_acfun': '',
+            'recommended_partition_id_acfun': '',
+            'selected_partition_id_bilibili': '',
+            'recommended_partition_id_bilibili': '',
+        }
+
+        def fake_get_task(_task_id):
+            self.assertEqual(_task_id, task_id)
+            return dict(task)
+
+        def fake_update_task(_task_id, **kwargs):
+            self.assertEqual(_task_id, task_id)
+            task.update({k: v for k, v in kwargs.items() if k != 'silent'})
+            return True
+
+        processor = tm.TaskProcessor({
+            'GENERATE_TAGS': True,
+            'RECOMMEND_PARTITION': True,
+            'CONTENT_MODERATION_ENABLED': True,
+        })
+        processor._generate_tags = MagicMock(side_effect=lambda *_args: task.update({
+            'tags_generated': '["ASMR", "配对游戏"]'
+        }) or True)
+        processor._recommend_partition = MagicMock(side_effect=lambda *_args: task.update({
+            'recommended_partition_id_acfun': '1001',
+            'selected_partition_id_acfun': '1001',
+            'recommended_partition_id_bilibili': '2001',
+            'selected_partition_id_bilibili': '2001',
+        }) or True)
+        processor._moderate_content = MagicMock(side_effect=lambda *_args: task.update({
+            'moderation_result': '{"overall_pass": true}'
+        }) or True)
+
+        with patch.object(tm, 'get_task', side_effect=fake_get_task), \
+             patch.object(tm, 'update_task', side_effect=fake_update_task):
+            result = processor._ensure_force_upload_metadata_ready(task_id, MagicMock())
+
+        self.assertEqual(result['tags_generated'], '["ASMR", "配对游戏"]')
+        self.assertEqual(result['selected_partition_id_acfun'], '1001')
+        self.assertEqual(result['selected_partition_id_bilibili'], '2001')
+        self.assertEqual(result['moderation_result'], '{"overall_pass": true}')
+        processor._generate_tags.assert_called_once()
+        processor._recommend_partition.assert_called_once()
+        processor._moderate_content.assert_called_once()
+
+    def test_force_upload_respects_existing_tags_and_partitions(self):
+        task_id = 'task-existing-metadata'
+        task = {
+            'id': task_id,
+            'upload_target': 'both',
+            'video_title_original': 'Original title',
+            'description_original': 'Original description',
+            'video_title_translated': '',
+            'description_translated': '',
+            'tags_generated': '["手动标签"]',
+            'selected_partition_id_acfun': '1001',
+            'recommended_partition_id_acfun': '',
+            'selected_partition_id_bilibili': '2001',
+            'recommended_partition_id_bilibili': '',
+            'moderation_result': '{"overall_pass": true}',
+        }
+
+        processor = tm.TaskProcessor({
+            'GENERATE_TAGS': True,
+            'RECOMMEND_PARTITION': True,
+            'CONTENT_MODERATION_ENABLED': True,
+        })
+        processor._generate_tags = MagicMock()
+        processor._recommend_partition = MagicMock()
+        processor._moderate_content = MagicMock()
+
+        with patch.object(tm, 'get_task', return_value=dict(task)):
+            result = processor._ensure_force_upload_metadata_ready(task_id, MagicMock())
+
+        self.assertEqual(result['tags_generated'], '["手动标签"]')
+        self.assertEqual(result['selected_partition_id_acfun'], '1001')
+        self.assertEqual(result['selected_partition_id_bilibili'], '2001')
+        processor._generate_tags.assert_not_called()
+        processor._recommend_partition.assert_not_called()
+        processor._moderate_content.assert_not_called()
+
+    def test_force_upload_pauses_when_moderation_requires_review(self):
+        task_id = 'task-moderation-review'
+        task = {
+            'id': task_id,
+            'upload_target': 'acfun',
+            'status': tm.TASK_STATES['READY_FOR_UPLOAD'],
+            'video_title_original': 'Original title',
+            'description_original': 'Original description',
+            'tags_generated': '["tag"]',
+            'selected_partition_id_acfun': '1001',
+            'recommended_partition_id_acfun': '',
+            'moderation_result': None,
+        }
+
+        processor = tm.TaskProcessor({
+            'GENERATE_TAGS': True,
+            'RECOMMEND_PARTITION': True,
+            'CONTENT_MODERATION_ENABLED': True,
+        })
+        processor._moderate_content = MagicMock(side_effect=lambda *_args: task.update({
+            'status': tm.TASK_STATES['AWAITING_REVIEW'],
+            'moderation_result': '{"overall_pass": false}',
+        }) or True)
+
+        with patch.object(tm, 'get_task', side_effect=lambda _task_id: dict(task)), \
+             patch.object(tm, 'update_task', side_effect=lambda _task_id, **kwargs: True):
+            result = processor._ensure_force_upload_metadata_ready(task_id, MagicMock())
+
+        self.assertIsNone(result)
+        processor._moderate_content.assert_called_once()
+
+    def test_预设标签启用时标签为空也会补跑标签阶段(self):
+        task_id = 'task-preset-empty-tags'
+        task = {
+            'id': task_id,
+            'upload_target': 'acfun',
+            'video_title_original': 'Original title',
+            'description_original': 'Original description',
+            'video_title_translated': '译文标题',
+            'description_translated': '',
+            'tags_generated': None,
+            'selected_partition_id_acfun': '1001',
+            'recommended_partition_id_acfun': '',
+        }
+
+        def fake_get_task(_task_id):
+            self.assertEqual(_task_id, task_id)
+            return dict(task)
+
+        def fake_update_task(_task_id, **kwargs):
+            task.update({k: v for k, v in kwargs.items() if k != 'silent'})
+            return True
+
+        processor = tm.TaskProcessor({
+            'GENERATE_TAGS': False,
+            'PRESET_TAGS_ENABLED': True,
+            'PRESET_TAGS': '预1\n预2',
+            'RECOMMEND_PARTITION': False,
+            'CONTENT_MODERATION_ENABLED': False,
+        })
+        processor._generate_tags = MagicMock(side_effect=lambda *_args: task.update({
+            'tags_generated': '["预1", "预2"]'
+        }) or True)
+
+        with patch.object(tm, 'get_task', side_effect=fake_get_task), \
+             patch.object(tm, 'update_task', side_effect=fake_update_task):
+            result = processor._ensure_force_upload_metadata_ready(task_id, MagicMock())
+
+        # 「自动生成标签」关闭但预设生效：仍需补跑标签阶段把预设落到任务上
+        processor._generate_tags.assert_called_once()
+        self.assertEqual(result['tags_generated'], '["预1", "预2"]')
+
+    def test_预设标签启用且缺少文本时只写入预设标签(self):
+        task_id = 'task-preset-no-text'
+        task = {
+            'id': task_id,
+            'upload_target': 'acfun',
+            'video_title_original': '',
+            'description_original': '',
+            'video_title_translated': '',
+            'description_translated': '',
+            'tags_generated': None,
+            'selected_partition_id_acfun': '1001',
+            'recommended_partition_id_acfun': '',
+        }
+
+        def fake_update_task(_task_id, **kwargs):
+            task.update({k: v for k, v in kwargs.items() if k != 'silent'})
+            return True
+
+        processor = tm.TaskProcessor({
+            'GENERATE_TAGS': True,
+            'PRESET_TAGS_ENABLED': True,
+            'PRESET_TAGS': '预1, 预2',
+            'RECOMMEND_PARTITION': False,
+            'CONTENT_MODERATION_ENABLED': False,
+        })
+        processor._generate_tags = MagicMock()
+
+        with patch.object(tm, 'get_task', side_effect=lambda _task_id: dict(task)), \
+             patch.object(tm, 'update_task', side_effect=fake_update_task):
+            result = processor._ensure_force_upload_metadata_ready(task_id, MagicMock())
+
+        # 没有标题/简介就无法补 AI，但预设是纯本地数据，必须照样写进去
+        processor._generate_tags.assert_not_called()
+        self.assertEqual(result['tags_generated'], '["预1", "预2"]')
+
+    def test_预设标签未启用时保持原有强制上传行为(self):
+        task_id = 'task-no-preset'
+        task = {
+            'id': task_id,
+            'upload_target': 'acfun',
+            'video_title_original': 'Original title',
+            'description_original': 'Original description',
+            'video_title_translated': '',
+            'description_translated': '',
+            'tags_generated': None,
+            'selected_partition_id_acfun': '1001',
+            'recommended_partition_id_acfun': '',
+        }
+
+        def fake_update_task(_task_id, **kwargs):
+            task.update({k: v for k, v in kwargs.items() if k != 'silent'})
+            return True
+
+        processor = tm.TaskProcessor({
+            'GENERATE_TAGS': False,
+            'PRESET_TAGS_ENABLED': False,
+            'RECOMMEND_PARTITION': False,
+            'CONTENT_MODERATION_ENABLED': False,
+        })
+        processor._generate_tags = MagicMock()
+
+        with patch.object(tm, 'get_task', side_effect=lambda _task_id: dict(task)), \
+             patch.object(tm, 'update_task', side_effect=fake_update_task):
+            result = processor._ensure_force_upload_metadata_ready(task_id, MagicMock())
+
+        # 与改动前一致：标签生成关闭时既不补跑阶段，也不注入任何预设
+        processor._generate_tags.assert_not_called()
+        self.assertEqual(result['tags_generated'], None)
+
+    def test_partition_precheck_blocks_only_when_no_recommendation_or_fixed_partition(self):
+        missing_upload_partition_labels = _load_app_partition_helper()
+        task = {
+            'upload_target': 'both',
+            'selected_partition_id_acfun': '',
+            'recommended_partition_id_acfun': '',
+            'selected_partition_id_bilibili': '',
+            'recommended_partition_id_bilibili': '',
+        }
+
+        self.assertEqual(
+            missing_upload_partition_labels(task, {'RECOMMEND_PARTITION': 'false'}),
+            ['AcFun 分区', 'bilibili 分区'],
+        )
+        self.assertEqual(
+            missing_upload_partition_labels(task, {'RECOMMEND_PARTITION': True}),
+            [],
+        )
+        self.assertEqual(
+            missing_upload_partition_labels(task, {
+                'RECOMMEND_PARTITION': False,
+                'FIXED_PARTITION_ID': '1001',
+                'FIXED_PARTITION_ID_BILIBILI': '2001',
+            }),
+            [],
+        )
+
+
+if __name__ == '__main__':
+    unittest.main()

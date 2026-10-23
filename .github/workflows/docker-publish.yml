@@ -1,0 +1,148 @@
+name: Docker Image CI/CD
+
+"on":
+  push:
+    tags: [ "*.*.*" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY_DOCKERHUB: docker.io
+  REGISTRY_GHCR: ghcr.io
+  IMAGE_NAME: y2a-auto
+  LOCAL_IMAGE: local/y2a-auto
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python for release tests
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install -r requirements.txt
+
+      - name: Run full test suite
+        run: python -m pytest tests/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract metadata for Docker Hub
+        id: meta-dockerhub
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Extract metadata for GHCR
+        id: meta-ghcr
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_GHCR }}/fqscfqj/y2a-auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Validate semver tag metadata
+        shell: bash
+        run: |
+          if [ -z "${{ steps.meta-dockerhub.outputs.tags }}" ] || [ -z "${{ steps.meta-ghcr.outputs.tags }}" ]; then
+            echo "No semver tags were generated; ensure the git tag matches X.Y.Z."
+            exit 1
+          fi
+
+      - name: Build local Docker image for validation (linux/amd64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_IMAGE }}:${{ steps.meta-dockerhub.outputs.version }}
+          labels: |
+            ${{ steps.meta-dockerhub.outputs.labels }}
+            ${{ steps.meta-ghcr.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test local Docker image
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.meta-dockerhub.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "No image tag available from metadata output."
+            exit 1
+          fi
+
+          container_name="test-y2a-auto"
+          local_image="${{ env.LOCAL_IMAGE }}:${IMAGE_TAG}"
+          trap 'docker rm -f "$container_name" >/dev/null 2>&1 || true' EXIT
+
+          docker run --rm -d --name "$container_name" -p 5001:5000 "$local_image"
+
+          for i in $(seq 1 12); do
+            if curl -sf http://localhost:5001/ >/dev/null; then
+              break
+            fi
+            echo "Waiting for application startup... ($i/12)"
+            sleep 5
+          done
+
+          curl -f http://localhost:5001/
+          docker exec "$container_name" yt-dlp --version
+          docker exec "$container_name" python -c "import torch, torchaudio, silero_vad; print('VAD deps OK')"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_DOCKERHUB }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Docker image to registries (linux/amd64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.meta-dockerhub.outputs.tags }}
+            ${{ steps.meta-ghcr.outputs.tags }}
+          labels: |
+            ${{ steps.meta-dockerhub.outputs.labels }}
+            ${{ steps.meta-ghcr.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

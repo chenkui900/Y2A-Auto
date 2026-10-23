@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 安全漏洞私下报告
+    url: https://github.com/fqscfqj/Y2A-Auto/security/policy
+    about: 请勿公开提交安全漏洞、Cookie、密钥、Token、完整配置或私人内容；请按 SECURITY.md 私下报告。

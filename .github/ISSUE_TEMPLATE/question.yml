@@ -1,0 +1,62 @@
+name: 使用与配置咨询
+description: 询问部署、配置或使用方式；可复现异常请改用错误报告。
+title: "[Question]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提问前请先查阅 README 与现有 Issue。请勿发布 Cookie、密码、API Key、Token、Webhook、完整配置、完整日志、私人视频链接或账号信息。
+  - type: textarea
+    id: goal
+    attributes:
+      label: 想完成的目标
+      description: 描述期望完成的工作流或配置结果。
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: 当前部署方式
+      options:
+        - Docker 官方镜像
+        - Docker 本地构建
+        - Python 本地运行
+        - Windows 便携包
+        - 尚未部署
+    validations:
+      required: true
+  - type: checkboxes
+    id: documentation
+    attributes:
+      label: 已查阅的文档
+      options:
+        - label: README 的快速开始或部署与运行章节
+        - label: README 的配置说明章节
+        - label: 现有 Issue
+  - type: textarea
+    id: attempted
+    attributes:
+      label: 已执行的操作与结果
+      description: 列出命令、页面操作或配置开关。请删除命令中的敏感值。
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: 错误摘要或相关日志（可选，已脱敏）
+      description: 仅粘贴最小相关片段；不要上传完整日志或运行目录。
+      render: text
+  - type: textarea
+    id: settings
+    attributes:
+      label: 相关非敏感配置（可选）
+      description: 只提供开关、模型名、部署方式等，不要提供密钥、URL、账号、Cookie 或 Token。
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我没有提交 Cookie、密钥、密码、Token、Webhook、完整配置、完整日志或私人内容。
+          required: true
+        - label: 这不是安全漏洞；安全漏洞将按 SECURITY.md 私下报告。
+          required: true

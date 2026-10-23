@@ -1,0 +1,5045 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import hashlib
+import logging
+import mimetypes
+import re
+import secrets
+import shutil
+import subprocess
+import time
+import uuid
+import threading
+
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, send_file, session, Response, stream_with_context
+from functools import wraps
+from flask_cors import CORS
+from PIL import Image, UnidentifiedImageError
+from werkzeug.security import safe_join
+from modules.youtube_handler import extract_video_urls_from_playlist
+from modules.utils import get_app_subdir
+from modules.config_manager import load_config, update_config, reset_specific_config, DEFAULT_CONFIG
+from modules.whisper_languages import WHISPER_LANGUAGE_LIST
+from modules.subtitle_style import normalize_hex_color
+from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path, is_task_active
+from modules.acfun_auth import AcfunQrLoginSession
+from modules.bilibili_auth import BilibiliQrLoginSession
+from queue import Empty, Queue
+from modules.youtube_monitor import youtube_monitor
+from modules.speech_pipeline_settings import (
+    SPEECH_PIPELINE_CHECKBOXES,
+    SPEECH_PIPELINE_FLOAT_FIELDS,
+    SPEECH_PIPELINE_INT_FIELDS,
+)
+from modules.tag_presets import (
+    is_preset_tags_enabled,
+    normalize_preset_tags_config,
+)
+from modules.cookiecloud import (
+    CookieCloudError,
+    sync_cookiecloud_to_youtube_file,
+    test_cookiecloud_youtube_sync,
+)
+from modules.notifications import (
+    CHANNEL_LABELS,
+    CHANNEL_MESSAGE_PUSHER,
+    CHANNEL_SERVERCHAN,
+    CHANNEL_WECOM,
+    EVENT_LOGIN_LOCKED,
+    EVENT_LOGIN_SUCCESS,
+    EVENT_QR_LOGIN_FAILED,
+    EVENT_QR_LOGIN_SUCCESS,
+    NotificationEvent,
+    emit_notification_event,
+    get_global_notification_service,
+    iter_enabled_channel_ids,
+    validate_channel_config_fields,
+)
+from apscheduler.schedulers.background import BackgroundScheduler
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)  # 用于flash消息
+# 模板改动即时生效（无需重启服务；仅在模板文件变化时才重新加载，开销可忽略）
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+
+# HTML 页面禁用浏览器缓存：页面样式内嵌在 HTML 里，缓存旧页面会导致新样式不生效
+@app.after_request
+def _no_cache_html(response):
+    if response.mimetype == 'text/html':
+        response.headers['Cache-Control'] = 'no-cache, must-revalidate'
+    return response
+
+
+@app.context_processor
+def inject_app_settings():
+    app_settings = app.config.get('Y2A_SETTINGS', {})
+    if not isinstance(app_settings, dict):
+        app_settings = {}
+    return {
+        'now': datetime.now(),  # 每次请求动态获取当前时间
+        'app_settings': app_settings,
+        'show_logout_in_nav': bool(
+            app_settings.get('password_protection_enabled') and session.get('logged_in')
+        ),
+    }
+
+ALLOWED_COVER_EXTENSIONS = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.webp': 'image/webp',
+}
+
+# bilibili二维码登录会话（内存）
+_BILIBILI_QR_SESSIONS = {}
+_BILIBILI_QR_SESSION_LOCK = threading.Lock()
+_BILIBILI_QR_SESSION_TTL_SECONDS = 300
+# AcFun二维码登录会话（内存）
+_ACFUN_QR_SESSIONS = {}
+_ACFUN_QR_SESSION_LOCK = threading.Lock()
+_ACFUN_QR_SESSION_TTL_SECONDS = 420
+# 登录安全状态存储
+def _get_security_state_path():
+    try:
+        db_dir = get_app_subdir('db')
+    except Exception:
+        # 回退到当前目录下的db
+        db_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'db')
+    os.makedirs(db_dir, exist_ok=True)
+    return os.path.join(db_dir, 'security_state.json')
+
+def _load_security_state():
+    path = _get_security_state_path()
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # 兼容缺失字段
+                if not isinstance(data, dict):
+                    data = {}
+        else:
+            data = {}
+    except Exception:
+        data = {}
+    # 默认值
+    return {
+        'failed_attempts': int(data.get('failed_attempts', 0) or 0),
+        'locked_until': float(data.get('locked_until', 0) or 0.0),
+        'last_attempt': float(data.get('last_attempt', 0) or 0.0),
+    }
+
+def _save_security_state(state):
+    try:
+        path = _get_security_state_path()
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _describe_youtube_api_status(status_code: str) -> str:
+    messages = {
+        'direct_ready': 'YouTube API 初始化成功，当前为直连模式',
+        'proxy_ready': 'YouTube API 初始化成功，独立代理已启用',
+        'missing_api_key': 'YouTube API 密钥未配置，请先在设置页完成接入。',
+        'init_failed': 'YouTube监控 API 初始化失败，请检查 API 密钥、代理配置与网络连通性。',
+    }
+    return messages.get(status_code, 'YouTube监控 API 状态未知，请检查设置。')
+
+
+def _build_startup_config_log_summary(config: dict | None) -> dict:
+    normalized = dict(config or {})
+
+    return {
+        'feature_flags': {
+            'AUTO_MODE_ENABLED': bool(normalized.get('AUTO_MODE_ENABLED', False)),
+            'NOTIFY_ENABLED': bool(normalized.get('NOTIFY_ENABLED', False)),
+            'password_protection_enabled': bool(normalized.get('password_protection_enabled', False)),
+            'CONTENT_MODERATION_ENABLED': bool(normalized.get('CONTENT_MODERATION_ENABLED', False)),
+            'YOUTUBE_PROXY_ENABLED': bool(normalized.get('YOUTUBE_PROXY_ENABLED', False)),
+            'YOUTUBE_API_PROXY_ENABLED': bool(normalized.get('YOUTUBE_API_PROXY_ENABLED', False)),
+            'COOKIECLOUD_ENABLED': bool(normalized.get('COOKIECLOUD_ENABLED', False)),
+            'SUBTITLE_TRANSLATION_ENABLED': bool(normalized.get('SUBTITLE_TRANSLATION_ENABLED', False)),
+            'SPEECH_RECOGNITION_ENABLED': bool(normalized.get('SPEECH_RECOGNITION_ENABLED', False)),
+        },
+        'config_keys_total': len(normalized),
+    }
+
+
+def _sync_notification_service(config: dict | None = None):
+    effective_config = dict(config or load_config())
+    try:
+        get_global_notification_service(effective_config)
+        logger.info("通知服务配置已同步")
+    except Exception as e:
+        logger.warning(f"同步通知服务配置失败: {e}")
+
+
+def _append_notification_config_warnings(messages: list, config: dict | None):
+    effective_config = dict(config or {})
+    if not effective_config.get('NOTIFY_ENABLED'):
+        return
+    for channel_id in iter_enabled_channel_ids(effective_config):
+        missing_fields = validate_channel_config_fields(channel_id, effective_config)
+        if missing_fields:
+            readable_fields = '、'.join(missing_fields)
+            channel_label = CHANNEL_LABELS.get(channel_id, channel_id)
+            _append_settings_message(
+                messages,
+                'warning',
+                f'已启用 {channel_label} 通知，但缺少配置：{readable_fields}。该渠道会暂时跳过发送。'
+            )
+
+
+def _coerce_checkbox_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or '').strip().lower() in ('true', '1', 'on', 'yes', 'y')
+
+
+def _merge_cookiecloud_runtime_settings(payload: dict | None, base_config: dict | None = None) -> dict:
+    effective_config = dict(base_config or load_config())
+    incoming = dict(payload) if isinstance(payload, dict) else {}
+
+    bool_fields = {'COOKIECLOUD_ENABLED', 'COOKIECLOUD_ALLOW_PLAINTEXT_EXPORT'}
+    text_fields = {
+        'COOKIECLOUD_SERVER_URL',
+        'COOKIECLOUD_UUID',
+        'COOKIECLOUD_PASSWORD',
+        'COOKIECLOUD_CRYPTO_TYPE',
+        'YOUTUBE_COOKIES_PATH',
+    }
+
+    for key in bool_fields:
+        if key in incoming:
+            effective_config[key] = _coerce_checkbox_value(incoming.get(key))
+
+    for key in text_fields:
+        if key in incoming:
+            value = str(incoming.get(key) or '').strip()
+            if key == 'COOKIECLOUD_PASSWORD' and not value:
+                continue
+            effective_config[key] = value
+
+    return effective_config
+
+
+def _cookiecloud_operation_error_message(action: str, retry_later: bool = False) -> str:
+    action_key = str(action or '').strip().lower()
+    if action_key == 'test':
+        return 'CookieCloud 连接测试失败，请稍后重试。' if retry_later else 'CookieCloud 连接测试失败，请检查配置后重试。'
+    if action_key == 'sync':
+        return 'CookieCloud 立即拉取失败，请稍后重试。' if retry_later else 'CookieCloud 立即拉取失败，请检查配置后重试。'
+    return 'CookieCloud 操作失败，请稍后重试。' if retry_later else 'CookieCloud 操作失败，请检查配置后重试。'
+
+
+def _remember_cookiecloud_sync_result(success: bool, message: str):
+    status = 'success' if success else 'error'
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        update_config({
+            'COOKIECLOUD_LAST_SYNC_AT': timestamp,
+            'COOKIECLOUD_LAST_SYNC_STATUS': status,
+            'COOKIECLOUD_LAST_SYNC_MESSAGE': str(message or '').strip(),
+        })
+    except Exception as e:
+        logger.warning(f'记录 CookieCloud 最近同步状态失败: {e}')
+    return timestamp
+
+
+def _get_request_ip_address() -> str:
+    forwarded_for = request.headers.get('X-Forwarded-For', '')
+    if forwarded_for:
+        return forwarded_for.split(',')[0].strip()
+    return str(request.remote_addr or 'unknown').strip() or 'unknown'
+
+
+def _emit_login_event(event_type: str, payload: dict):
+    emit_notification_event(NotificationEvent(event_type=event_type, payload=payload))
+
+
+def _cleanup_bilibili_qr_sessions():
+    now_ts = time.time()
+    with _BILIBILI_QR_SESSION_LOCK:
+        stale_ids = []
+        for sid, item in _BILIBILI_QR_SESSIONS.items():
+            created_at = float(item.get('created_at', 0) or 0)
+            if now_ts - created_at > _BILIBILI_QR_SESSION_TTL_SECONDS:
+                stale_ids.append(sid)
+        for sid in stale_ids:
+            _BILIBILI_QR_SESSIONS.pop(sid, None)
+
+
+def _create_bilibili_qr_session():
+    _cleanup_bilibili_qr_sessions()
+    session_id = str(uuid.uuid4())
+    session_obj = BilibiliQrLoginSession()
+    with _BILIBILI_QR_SESSION_LOCK:
+        _BILIBILI_QR_SESSIONS[session_id] = {
+            'created_at': time.time(),
+            'session': session_obj,
+            'success_notified': False,
+            'failure_notified': False,
+        }
+    return session_id, session_obj
+
+
+def _get_bilibili_qr_session(session_id: str):
+    if not session_id:
+        return None
+    _cleanup_bilibili_qr_sessions()
+    with _BILIBILI_QR_SESSION_LOCK:
+        item = _BILIBILI_QR_SESSIONS.get(session_id)
+    if not item:
+        return None
+    return item.get('session')
+
+
+def _cleanup_acfun_qr_sessions():
+    now_ts = time.time()
+    with _ACFUN_QR_SESSION_LOCK:
+        stale_ids = []
+        for sid, item in _ACFUN_QR_SESSIONS.items():
+            created_at = float(item.get('created_at', 0) or 0)
+            if now_ts - created_at > _ACFUN_QR_SESSION_TTL_SECONDS:
+                stale_ids.append(sid)
+        for sid in stale_ids:
+            _ACFUN_QR_SESSIONS.pop(sid, None)
+
+
+def _create_acfun_qr_session():
+    _cleanup_acfun_qr_sessions()
+    session_id = str(uuid.uuid4())
+    session_obj = AcfunQrLoginSession()
+    with _ACFUN_QR_SESSION_LOCK:
+        _ACFUN_QR_SESSIONS[session_id] = {
+            'created_at': time.time(),
+            'session': session_obj,
+            'success_notified': False,
+            'failure_notified': False,
+        }
+    return session_id, session_obj
+
+
+def _get_acfun_qr_session(session_id: str):
+    if not session_id:
+        return None
+    _cleanup_acfun_qr_sessions()
+    with _ACFUN_QR_SESSION_LOCK:
+        item = _ACFUN_QR_SESSIONS.get(session_id)
+    if not item:
+        return None
+    return item.get('session')
+
+
+def _mark_qr_notification_sent(session_store: dict, lock: threading.Lock, session_id: str, success: bool) -> bool:
+    flag_name = 'success_notified' if success else 'failure_notified'
+    with lock:
+        item = session_store.get(session_id)
+        if not item or item.get(flag_name):
+            return False
+        item[flag_name] = True
+        return True
+
+
+def _emit_qr_login_event_once(
+    session_store: dict,
+    lock: threading.Lock,
+    session_id: str,
+    platform: str,
+    status_data: dict,
+):
+    status = str((status_data or {}).get('status') or '').strip().lower()
+    if status not in ('done', 'failed'):
+        return
+    is_success = status == 'done'
+    if not _mark_qr_notification_sent(session_store, lock, session_id, is_success):
+        return
+    _emit_login_event(
+        EVENT_QR_LOGIN_SUCCESS if is_success else EVENT_QR_LOGIN_FAILED,
+        {
+            'platform': platform,
+            'message': str((status_data or {}).get('message') or ('Cookies 已保存' if is_success else '登录失败')).strip(),
+        }
+    )
+
+
+_SETTINGS_SAVE_OPERATIONS = {}
+_SETTINGS_SAVE_LOCK = threading.Lock()
+_SETTINGS_SAVE_TTL_SECONDS = 600
+_MONITOR_RUN_OPERATIONS = {}
+_MONITOR_RUN_LOCK = threading.Lock()
+_MONITOR_RUN_TTL_SECONDS = 600
+
+
+def _new_settings_save_state(operation_id: str) -> dict:
+    now_ts = time.time()
+    return {
+        'operation_id': operation_id,
+        'stage': 'saving_config',
+        'message': '正在准备保存设置',
+        'detail': '正在提交保存任务，请稍候。',
+        'percent': None,
+        'downloaded_bytes': None,
+        'total_bytes': None,
+        'done': False,
+        'level': 'info',
+        'success': None,
+        'messages': [],
+        'created_at': now_ts,
+        'updated_at': now_ts,
+        'expires_at': None,
+    }
+
+
+def _cleanup_settings_save_operations():
+    now_ts = time.time()
+    with _SETTINGS_SAVE_LOCK:
+        stale_ids = []
+        for operation_id, state in _SETTINGS_SAVE_OPERATIONS.items():
+            expires_at = state.get('expires_at')
+            if expires_at and now_ts >= float(expires_at):
+                stale_ids.append(operation_id)
+        for operation_id in stale_ids:
+            _SETTINGS_SAVE_OPERATIONS.pop(operation_id, None)
+
+
+def _update_settings_save_progress(operation_id: str, **fields) -> dict:
+    _cleanup_settings_save_operations()
+    with _SETTINGS_SAVE_LOCK:
+        state = dict(_SETTINGS_SAVE_OPERATIONS.get(operation_id) or _new_settings_save_state(operation_id))
+        state.update(fields)
+        state['updated_at'] = time.time()
+        if state.get('done'):
+            state['expires_at'] = state['updated_at'] + _SETTINGS_SAVE_TTL_SECONDS
+        _SETTINGS_SAVE_OPERATIONS[operation_id] = state
+        return dict(state)
+
+
+def _get_settings_save_progress(operation_id: str):
+    _cleanup_settings_save_operations()
+    with _SETTINGS_SAVE_LOCK:
+        state = _SETTINGS_SAVE_OPERATIONS.get(operation_id)
+        return dict(state) if state else None
+
+
+def _new_monitor_run_state(operation_id: str, config_id: int) -> dict:
+    now_ts = time.time()
+    return {
+        'operation_id': operation_id,
+        'config_id': config_id,
+        'message': '监控任务已创建',
+        'detail': '正在后台执行 YouTube 监控，请稍候。',
+        'done': False,
+        'level': 'info',
+        'success': None,
+        'created_at': now_ts,
+        'updated_at': now_ts,
+        'expires_at': None,
+    }
+
+
+def _cleanup_monitor_run_operations():
+    now_ts = time.time()
+    with _MONITOR_RUN_LOCK:
+        stale_ids = []
+        for operation_id, state in _MONITOR_RUN_OPERATIONS.items():
+            expires_at = state.get('expires_at')
+            if expires_at and now_ts >= float(expires_at):
+                stale_ids.append(operation_id)
+        for operation_id in stale_ids:
+            _MONITOR_RUN_OPERATIONS.pop(operation_id, None)
+
+
+def _update_monitor_run_progress(operation_id: str, config_id: int, **fields) -> dict:
+    _cleanup_monitor_run_operations()
+    with _MONITOR_RUN_LOCK:
+        state = dict(_MONITOR_RUN_OPERATIONS.get(operation_id) or _new_monitor_run_state(operation_id, config_id))
+        state.update(fields)
+        state['config_id'] = config_id
+        state['updated_at'] = time.time()
+        if state.get('done'):
+            state['expires_at'] = state['updated_at'] + _MONITOR_RUN_TTL_SECONDS
+        _MONITOR_RUN_OPERATIONS[operation_id] = state
+        return dict(state)
+
+
+def _get_monitor_run_progress(operation_id: str):
+    _cleanup_monitor_run_operations()
+    with _MONITOR_RUN_LOCK:
+        state = _MONITOR_RUN_OPERATIONS.get(operation_id)
+        return dict(state) if state else None
+
+
+def _finalize_monitor_run_operation(operation_id: str, config_id: int, success: bool, message: str, detail: str = ''):
+    _update_monitor_run_progress(
+        operation_id,
+        config_id,
+        message=message,
+        detail=detail or message,
+        done=True,
+        level='success' if success else 'error',
+        success=success,
+    )
+
+
+def _run_monitor_operation(operation_id: str, config_id: int):
+    try:
+        success, message = youtube_monitor.run_monitor(config_id)
+    except Exception as exc:
+        logger.exception("后台执行 YouTube 监控失败，配置ID: %s", config_id)
+        success = False
+        message = f"监控失败: {exc}"
+
+    detail = '监控记录已更新，可刷新页面查看最新结果。' if success else message
+    _finalize_monitor_run_operation(operation_id, config_id, success, message, detail)
+
+
+def _start_monitor_run_operation(config_id: int):
+    config = youtube_monitor.get_monitor_config(config_id)
+    if not config:
+        return None, None, "监控配置不存在"
+
+    operation_id = str(uuid.uuid4())
+    _update_monitor_run_progress(
+        operation_id,
+        config_id,
+        message=f"已启动监控任务：{config['name']}",
+        detail='正在后台执行 YouTube 监控，请稍候。',
+        done=False,
+        level='info',
+        success=None,
+    )
+
+    monitor_thread = threading.Thread(
+        target=_run_monitor_operation,
+        args=(operation_id, config_id),
+        daemon=True,
+        name=f'youtube-monitor-run-{config_id}-{operation_id[:8]}'
+    )
+    monitor_thread.start()
+    return operation_id, config, None
+
+
+def _append_settings_message(messages: list, category: str, text: str):
+    clean_text = str(text or '').strip()
+    if not clean_text:
+        return
+    messages.append({'category': category, 'text': clean_text})
+
+
+def _get_task_dir_real(task_id: str) -> str:
+    downloads_dir_real = os.path.realpath(get_app_subdir('downloads'))
+    try:
+        normalized_task_id = str(uuid.UUID(str(task_id or '').strip()))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError('非法任务目录') from exc
+
+    safe_task_dir = safe_join(downloads_dir_real, normalized_task_id)
+    if not safe_task_dir:
+        raise ValueError('非法任务目录')
+    task_dir_real = os.path.realpath(safe_task_dir)
+    if os.path.commonpath([downloads_dir_real, task_dir_real]) != downloads_dir_real:
+        raise ValueError('非法任务目录')
+    return task_dir_real
+
+
+def _safe_join_task_dir(task_dir_real: str, *parts: str) -> str | None:
+    try:
+        safe_path = safe_join(task_dir_real, *[str(part) for part in parts])
+        if not safe_path:
+            return None
+        file_real = os.path.realpath(safe_path)
+        if os.path.commonpath([task_dir_real, file_real]) != task_dir_real:
+            return None
+        return file_real
+    except (ValueError, OSError):
+        return None
+
+
+def _get_cover_file_info(path: str):
+    ext = os.path.splitext(str(path or ''))[1].lower()
+    return ext, ALLOWED_COVER_EXTENSIONS.get(ext)
+
+
+def _validate_cover_upload(file_storage):
+    if not file_storage or not getattr(file_storage, 'filename', ''):
+        raise ValueError('请选择要上传的封面图片')
+
+    ext, _ = _get_cover_file_info(file_storage.filename)
+    if ext not in ALLOWED_COVER_EXTENSIONS:
+        raise ValueError('仅支持 JPG、JPEG、PNG、WEBP 格式的封面图片')
+
+    current_pos = file_storage.stream.tell()
+    try:
+        with Image.open(file_storage.stream) as img:
+            img.verify()
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError(f'上传文件不是有效图片: {exc}') from exc
+    finally:
+        file_storage.stream.seek(current_pos)
+
+    return ext
+
+
+def _find_original_cover_backup(task_dir_real: str):
+    for ext in ALLOWED_COVER_EXTENSIONS:
+        candidate = _safe_join_task_dir(task_dir_real, f'original_cover{ext}')
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _get_current_cover_path(task: dict, task_dir_real: str):
+    cover_path = str(task.get('cover_path_local') or '').strip()
+    if cover_path:
+        candidate = _safe_join_task_dir(task_dir_real, os.path.basename(cover_path))
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    for name in ('cover.jpg', 'cover.png', 'cover.webp', 'thumbnail.jpg', 'thumbnail.png', 'thumbnail.webp'):
+        candidate = _safe_join_task_dir(task_dir_real, name)
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    if os.path.isdir(task_dir_real):
+        with os.scandir(task_dir_real) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                if entry.name.lower().endswith(tuple(ALLOWED_COVER_EXTENSIONS.keys())):
+                    candidate = _safe_join_task_dir(task_dir_real, entry.name)
+                    if candidate and os.path.exists(candidate):
+                        return candidate
+
+    return ''
+
+
+def _replace_task_cover(task: dict, uploaded_file):
+    task_id = str(task.get('id') or '').strip()
+    if not task_id:
+        raise ValueError('任务不存在')
+
+    task_dir_real = _get_task_dir_real(task_id)
+    os.makedirs(task_dir_real, exist_ok=True)
+
+    current_cover_path = _get_current_cover_path(task, task_dir_real)
+
+    ext = _validate_cover_upload(uploaded_file)
+    original_backup = _find_original_cover_backup(task_dir_real)
+
+    if not original_backup and current_cover_path:
+        current_ext, _ = _get_cover_file_info(current_cover_path)
+        if current_ext not in ALLOWED_COVER_EXTENSIONS:
+            raise ValueError('当前原始封面格式不受支持，无法创建恢复备份')
+        original_backup = _safe_join_task_dir(task_dir_real, f'original_cover{current_ext}')
+        if not original_backup:
+            raise ValueError('无法创建原始封面备份路径')
+        shutil.copy2(current_cover_path, original_backup)
+
+    for existing_ext in ALLOWED_COVER_EXTENSIONS:
+        custom_candidate = _safe_join_task_dir(task_dir_real, f'custom_cover{existing_ext}')
+        if custom_candidate and os.path.exists(custom_candidate):
+            os.remove(custom_candidate)
+
+    new_cover_path = _safe_join_task_dir(task_dir_real, f'custom_cover{ext}')
+    if not new_cover_path:
+        raise ValueError('无法创建封面保存路径')
+    uploaded_file.save(new_cover_path)
+    update_task(task_id, cover_path_local=new_cover_path, silent=True)
+    return new_cover_path
+
+
+def _restore_task_cover(task: dict):
+    task_id = str(task.get('id') or '').strip()
+    if not task_id:
+        raise ValueError('任务不存在')
+
+    task_dir_real = _get_task_dir_real(task_id)
+    if not os.path.isdir(task_dir_real):
+        raise ValueError('任务目录不存在，无法恢复原封面')
+
+    original_backup = _find_original_cover_backup(task_dir_real)
+    if not original_backup:
+        raise ValueError('未找到原始封面备份，无法恢复')
+
+    update_task(task_id, cover_path_local=original_backup, silent=True)
+    return original_backup
+
+
+def _is_ajax_request() -> bool:
+    requested_with = request.headers.get('X-Requested-With', '')
+    accept_header = request.headers.get('Accept', '')
+    return requested_with == 'XMLHttpRequest' or 'application/json' in accept_header
+
+
+def _extract_settings_uploads(files_storage) -> dict:
+    uploads = {}
+    for field_name in ('youtube_cookies_file', 'acfun_cookies_file', 'bilibili_cookies_file'):
+        file_storage = files_storage.get(field_name)
+        if not file_storage or not getattr(file_storage, 'filename', ''):
+            continue
+        uploads[field_name] = {
+            'filename': file_storage.filename,
+            'content': file_storage.read()
+        }
+    return uploads
+
+
+def _persist_settings_uploads(form_data: dict, uploads: dict):
+    cookies_dir = get_app_subdir('cookies')
+    os.makedirs(cookies_dir, exist_ok=True)
+
+    file_specs = {
+        'youtube_cookies_file': ('yt_cookies.txt', 'YOUTUBE_COOKIES_PATH', 'cookies/yt_cookies.txt', 'YouTube'),
+        'acfun_cookies_file': ('ac_cookies.json', 'ACFUN_COOKIES_PATH', 'cookies/ac_cookies.json', 'AcFun'),
+        'bilibili_cookies_file': ('bili_cookies.json', 'BILIBILI_COOKIES_PATH', 'cookies/bili_cookies.json', 'Bilibili'),
+    }
+
+    for field_name, payload in uploads.items():
+        spec = file_specs.get(field_name)
+        if not spec or not payload.get('filename'):
+            continue
+        save_name, config_key, relative_path, service_name = spec
+        target_path = os.path.join(cookies_dir, save_name)
+        with open(target_path, 'wb') as target_file:
+            target_file.write(payload.get('content') or b'')
+        form_data[config_key] = relative_path
+        logger.info(f"{service_name} cookies文件已上传并保存到: {target_path}")
+
+
+def _build_settings_progress_reporter(operation_id: str | None):
+    if not operation_id:
+        return None
+
+    def _report(payload: dict):
+        _update_settings_save_progress(
+            operation_id,
+            stage=payload.get('stage', 'saving_config'),
+            message=payload.get('message', ''),
+            detail=payload.get('detail', ''),
+            percent=payload.get('percent'),
+            downloaded_bytes=payload.get('downloaded_bytes'),
+            total_bytes=payload.get('total_bytes'),
+            level=payload.get('level', 'info')
+        )
+
+    return _report
+
+
+# 设置页表单字段白名单。
+# 必须与 templates/settings.html 中的控件保持一致：
+#   - 复选框若不在表单数据里就会被当作未勾选，所以"UI 有开关但漏登记"会让该开关永远无法关闭；
+#     反之"登记了但 UI 没有控件"会让该键在每次保存时被强制写成 off。
+#   - 数值字段用于类型归一化，非法值回退到 DEFAULT_CONFIG 中的默认值。
+# tests/test_settings_template_layout.py 会断言模板控件与这些集合一致。
+SETTINGS_CHECKBOX_FIELDS = list(dict.fromkeys([
+    'AUTO_MODE_ENABLED', 'TRANSLATE_TITLE', 'TRANSLATE_DESCRIPTION',
+    'UPLOAD_APPEND_REPOST_NOTICE', 'DELETE_DOWNLOAD_FILES_AFTER_UPLOAD',
+    'GENERATE_TAGS', 'YOUTUBE_UPLOADER_AS_FIRST_TAG', 'RECOMMEND_PARTITION',
+    'PRESET_TAGS_ENABLED',
+    'RECOMMEND_PARTITION_WITH_COVER', 'CONTENT_MODERATION_ENABLED',
+    'OPENAI_THINKING_ENABLED', 'SUBTITLE_OPENAI_THINKING_ENABLED', 'SUBTITLE_QC_THINKING_ENABLED',
+    'LOG_CLEANUP_ENABLED', 'DOWNLOAD_CLEANUP_ENABLED',
+    'SUBTITLE_TRANSLATION_ENABLED', 'SUBTITLE_EMBED_IN_VIDEO',
+    'SUBTITLE_KEEP_ORIGINAL', 'YOUTUBE_AUTO_GENERATED_SUBTITLES_ENABLED',
+    'YOUTUBE_PROXY_ENABLED', 'YOUTUBE_API_PROXY_ENABLED', 'password_protection_enabled',
+    'SPEECH_RECOGNITION_ENABLED',
+    'VAD_ENABLED',
+    'SUBTITLE_NORMALIZE_PUNCTUATION', 'SUBTITLE_FILTER_FILLER_WORDS',
+    'SUBTITLE_TIME_OFFSET_ENABLED', 'SUBTITLE_MIN_CUE_DURATION_ENABLED',
+    'SUBTITLE_MERGE_GAP_ENABLED', 'SUBTITLE_MIN_TEXT_LENGTH_ENABLED',
+    'SUBTITLE_MAX_LINE_LENGTH_ENABLED', 'SUBTITLE_MAX_LINES_ENABLED',
+    'SUBTITLE_QC_ENABLED',
+    'SUBTITLE_TEXT_BOLD', 'SUBTITLE_OUTLINE_ENABLED', 'SUBTITLE_SHADOW_ENABLED',
+    'SUBTITLE_BACKGROUND_ENABLED', 'VIDEO_HW_QUALITY_BOOST',
+    'FFMPEG_AUTO_DOWNLOAD', 'WHISPER_TRANSLATE',
+    'VIDEO_CUSTOM_PARAMS_ENABLED',
+    'VOXTRAL_DIARIZE', 'VOXTRAL_ENFORCE_MAX_DURATION',
+    'NOTIFY_ENABLED',
+    'NOTIFY_EVENT_TASK_ADDED',
+    'NOTIFY_EVENT_TASK_COMPLETED',
+    'NOTIFY_EVENT_TASK_FAILED',
+    'NOTIFY_EVENT_LOGIN_SUCCESS',
+    'NOTIFY_EVENT_LOGIN_LOCKED',
+    'NOTIFY_EVENT_QR_LOGIN_SUCCESS',
+    'NOTIFY_EVENT_QR_LOGIN_FAILED',
+    'NOTIFY_WECOM_ENABLED',
+    'NOTIFY_SERVERCHAN_ENABLED',
+    'NOTIFY_MESSAGE_PUSHER_ENABLED',
+    'COOKIECLOUD_ENABLED',
+    'COOKIECLOUD_ALLOW_PLAINTEXT_EXPORT',
+] + SPEECH_PIPELINE_CHECKBOXES))
+
+SETTINGS_INT_FIELDS = list(dict.fromkeys([
+    'MAX_CONCURRENT_TASKS', 'MAX_CONCURRENT_UPLOADS',
+    'LOG_CLEANUP_HOURS', 'LOG_CLEANUP_INTERVAL',
+    'DOWNLOAD_CLEANUP_HOURS', 'DOWNLOAD_CLEANUP_INTERVAL',
+    'SUBTITLE_BATCH_SIZE', 'SUBTITLE_MAX_RETRIES',
+    'SUBTITLE_RETRY_DELAY', 'SUBTITLE_MAX_WORKERS', 'YOUTUBE_DOWNLOAD_THREADS',
+    'YOUTUBE_DOWNLOAD_MAX_HEIGHT',
+    'LOGIN_MAX_FAILED_ATTEMPTS', 'LOGIN_LOCKOUT_MINUTES', 'LOGIN_SESSION_TIMEOUT_MINUTES',
+    'AI_FAILOVER_TIMEOUT_SECONDS',
+    'VAD_SILERO_MIN_SPEECH_MS', 'VAD_SILERO_MIN_SILENCE_MS', 'VAD_SILERO_MAX_SPEECH_S',
+    'VAD_SILERO_SPEECH_PAD_MS',
+    'SUBTITLE_QC_SAMPLE_MAX_ITEMS', 'SUBTITLE_QC_MAX_CHARS',
+    'SUBTITLE_QC_TIMEOUT_SECONDS',
+    'SUBTITLE_MIN_TEXT_LENGTH',
+    'WHISPER_MAX_WORKERS', 'WHISPER_MAX_RETRIES',
+] + list(SPEECH_PIPELINE_INT_FIELDS)))
+
+SETTINGS_FLOAT_FIELDS = list(dict.fromkeys([
+    'VAD_SILERO_THRESHOLD',
+    'SUBTITLE_TIME_OFFSET_S', 'SUBTITLE_MIN_CUE_DURATION_S', 'SUBTITLE_MERGE_GAP_S',
+    'SUBTITLE_QC_THRESHOLD',
+    'WHISPER_RETRY_DELAY_S', 'AUDIO_CHUNK_WINDOW_S', 'AUDIO_CHUNK_OVERLAP_S',
+    'VAD_MERGE_GAP_S', 'VAD_MIN_SEGMENT_S', 'VAD_MAX_SEGMENT_S_FOR_SPLIT',
+    'SUBTITLE_FONT_SIZE_SCALE', 'SUBTITLE_MARGIN_V_SCALE',
+    'SUBTITLE_OUTLINE_SCALE', 'SUBTITLE_SHADOW_SCALE',
+    'SUBTITLE_BACKGROUND_OPACITY', 'VIDEO_QUALITY_VALUE',
+] + list(SPEECH_PIPELINE_FLOAT_FIELDS)))
+
+# 同一个键不得同时出现在整数与浮点白名单里：整数分支先执行，会把 "15.5"
+# 判为非法并回退成默认值，随后浮点分支再处理，导致小数精度被静默丢弃。
+# 用显式 raise 而非 assert：assert 在 python -O 下会被整体剥离，这条不变量
+# 就会悄悄失效。此处也不另写守卫测试——一旦交叉，import 期即抛错，
+# 测试文件根本收集不到，那种测试永远不可能失败。错误信息里带冲突键名。
+_NUMERIC_WHITELIST_OVERLAP = sorted(set(SETTINGS_INT_FIELDS) & set(SETTINGS_FLOAT_FIELDS))
+if _NUMERIC_WHITELIST_OVERLAP:
+    raise RuntimeError(f'数值白名单存在交叉：{_NUMERIC_WHITELIST_OVERLAP}')
+
+# 此前 SUBTITLE_MAX_LINE_LENGTH / SUBTITLE_MAX_LINES 在模板中用 hidden 钉死为
+# 999 / 1，与 DEFAULT_CONFIG 的 42 / 2 分叉：全新安装（从未保存过设置页）用 42/2，
+# 一旦保存过设置页就变成「永不换行的单行字幕」，同一版本出现两种换行格式。
+# 现已改为设置页真实控件，钉死表保留为空以维持 _settings_fallback_default 的
+# 统一语义（回退值一律取 DEFAULT_CONFIG）。
+_PINNED_SETTINGS_DEFAULTS = {}
+
+# 数值范围校验表：(键, 下限, 上限)。表里有两类键，都有防御价值：
+# 1. 设置页有数值控件的键 —— 浏览器原生校验只在「值违反控件 min/max」时挡住提交，
+#    而多数控件只写了 min 没写 max（分片窗口、最大片段、语音覆盖率等），
+#    直接 POST、旧标签页或脚本提交都能绕过，服务端必须再拦一次；
+# 2. 设置页没有控件的键（VAD_MIN_SEGMENT_S / WHISPER_* / SUBTITLE_QC_* 等）——
+#    它们没有 UI 入口，但 /settings 用 request.form.to_dict() 接收任意键名，
+#    键集合不受模板限制，同一个 POST 依然能写坏配置
+#    （SUBTITLE_QC_MIN_COVERAGE_RATIO > 1 会让质检覆盖率维度恒失败、字幕永不烧录）。
+# 越界或非法值一律回退 DEFAULT_CONFIG，并汇总成一条用户可见的提示，
+# 见 _format_settings_revert_message —— 不允许「值被改掉却提示保存成功」。
+SETTINGS_RANGE_GUARDS = (
+    ('VAD_MAX_SEGMENT_S', 10.0, 120.0),      # 下限与设置页控件 min=10 对齐
+    ('AUDIO_CHUNK_WINDOW_S', 5.0, 120.0),    # 下限与设置页控件 min=5 对齐
+    ('AUDIO_CHUNK_OVERLAP_S', 0.0, 5.0),
+    ('VAD_MIN_SEGMENT_S', 0.0, 5.0),
+    ('VAD_MERGE_GAP_S', 0.0, 5.0),
+    ('VAD_MAX_SEGMENT_S_FOR_SPLIT', 5.0, 120.0),
+    ('VAD_MIN_SPEECH_COVERAGE_RATIO', 0.0, 1.0),
+    ('SUBTITLE_MAX_LINE_LENGTH', 10.0, 200.0),
+    ('SUBTITLE_MAX_LINES', 1.0, 5.0),
+    ('SUBTITLE_MAX_CUE_DURATION_S', 1.0, 30.0),
+    ('SUBTITLE_MAX_CPS', 5.0, 60.0),
+    ('SUBTITLE_TRANSLATION_MAX_CHARS_PER_BATCH', 200.0, 20000.0),
+    ('WHISPER_TEMPERATURE', 0.0, 1.0),
+    ('WHISPER_NO_SPEECH_THRESHOLD', 0.0, 1.0),
+    # 质检时间轴阈值：modules/subtitle_qc.py 直接采信这三个键，超出物理含义的值
+    # （覆盖率比值 > 1、负的空档秒数）会让整条质检线恒失败，必须挡在配置层。
+    ('SUBTITLE_QC_MIN_COVERAGE_RATIO', 0.0, 1.0),
+    ('SUBTITLE_QC_MAX_GAP_S', 1.0, 3600.0),
+    ('SUBTITLE_QC_MAX_CPS', 1.0, 200.0),
+    # 烧录字幕外观（倍率型，越界回退默认）
+    ('SUBTITLE_FONT_SIZE_SCALE', 0.5, 2.0),
+    ('SUBTITLE_MARGIN_V_SCALE', 0.5, 2.0),
+    ('SUBTITLE_OUTLINE_SCALE', 0.0, 3.0),
+    ('SUBTITLE_SHADOW_SCALE', 0.0, 3.0),
+    ('SUBTITLE_BACKGROUND_OPACITY', 0.0, 1.0),
+    # 编码质量（manual 模式下的 CRF/CQ/QP）
+    ('VIDEO_QUALITY_VALUE', 0.0, 51.0),
+)
+
+# 回退提示里的中文名称（取自设置页控件文案），仅用于让用户看懂被改了哪一项。
+SETTINGS_GUARD_LABELS = {
+    'VAD_MAX_SEGMENT_S': '最大片段（秒）',
+    'AUDIO_CHUNK_WINDOW_S': '分片窗口（秒）',
+    'AUDIO_CHUNK_OVERLAP_S': '分片重叠（秒）',
+    'VAD_MIN_SEGMENT_S': '最短语音段（秒）',
+    'VAD_MERGE_GAP_S': '语音段合并间隔（秒）',
+    'VAD_MAX_SEGMENT_S_FOR_SPLIT': '切片上限（秒）',
+    'VAD_MIN_SPEECH_COVERAGE_RATIO': '最低语音覆盖率',
+    'SUBTITLE_MAX_LINE_LENGTH': '每行最大字符数',
+    'SUBTITLE_MAX_LINES': '最大行数',
+    'SUBTITLE_MAX_CUE_DURATION_S': '单条字幕最长时长（秒）',
+    'SUBTITLE_MAX_CPS': '字幕最大每秒字符数',
+    'SUBTITLE_TRANSLATION_MAX_CHARS_PER_BATCH': '翻译单批最大字符数',
+    'WHISPER_TEMPERATURE': 'Whisper 解码温度',
+    'WHISPER_NO_SPEECH_THRESHOLD': 'Whisper 无语音判定阈值',
+    'SUBTITLE_QC_MIN_COVERAGE_RATIO': '质检最低覆盖率',
+    'SUBTITLE_QC_MAX_GAP_S': '质检最大空档（秒）',
+    'SUBTITLE_QC_MAX_CPS': '质检最大每秒字符数',
+    'AI_FAILOVER_TIMEOUT_SECONDS': 'AI 故障转移超时（秒）',
+    'SUBTITLE_QC_TIMEOUT_SECONDS': '字幕质检接口超时（秒）',
+    'SUBTITLE_MAX_LINE_LENGTH_ENABLED': '每行最大字符数开关',
+    'SUBTITLE_MAX_LINES_ENABLED': '最大行数开关',
+    # 烧录字幕外观（倍率型）
+    'SUBTITLE_FONT_SIZE_SCALE': '字幕字号倍率',
+    'SUBTITLE_MARGIN_V_SCALE': '字幕垂直边距倍率',
+    'SUBTITLE_OUTLINE_SCALE': '字幕描边倍率',
+    'SUBTITLE_SHADOW_SCALE': '字幕阴影倍率',
+    'SUBTITLE_BACKGROUND_OPACITY': '字幕背景不透明度',
+    # 编码质量
+    'VIDEO_QUALITY_VALUE': '画质数值（CRF/CQ/QP）',
+}
+
+
+def _settings_fallback_default(field, fallback=1):
+    """非法数值的回退值统一取 DEFAULT_CONFIG，避免与页面展示的默认值不一致。
+
+    回退值一律来自 DEFAULT_CONFIG（_PINNED_SETTINGS_DEFAULTS 当前为空表，
+    它一旦非空就会让某些键的回退值与 DEFAULT_CONFIG 分叉，历史上 999/1 的
+    字幕换行就是这样写进来的）；DEFAULT_CONFIG 里没有的键才用 fallback 兜底。
+    """
+    if field in _PINNED_SETTINGS_DEFAULTS:
+        return _PINNED_SETTINGS_DEFAULTS[field]
+    if field in DEFAULT_CONFIG:
+        return DEFAULT_CONFIG[field]
+    return fallback
+
+
+def _format_guard_bound(value) -> str:
+    """把 guard 边界格式化成展示文本：整数边界不显示小数点（10 而不是 10.0）。"""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if numeric.is_integer():
+        return str(int(numeric))
+    return f'{numeric:g}'
+
+
+def _format_guard_range(guard_min, guard_max) -> str:
+    """把 guard 区间格式化成「下限–上限」文本。"""
+    return f'{_format_guard_bound(guard_min)}–{_format_guard_bound(guard_max)}'
+
+
+def _guard_bounds(key):
+    """取 SETTINGS_RANGE_GUARDS 中某键的 (下限, 上限)；未登记时返回 (None, None)。"""
+    for guard_key, guard_min, guard_max in SETTINGS_RANGE_GUARDS:
+        if guard_key == key:
+            return guard_min, guard_max
+    return None, None
+
+
+def _format_settings_revert_message(reverts: list) -> str:
+    """汇总本轮回退项，生成用户可见的提示文本。
+
+    每条包含：中文名（配置键）、提交值、最终生效值、允许范围 / 交叉约束说明。
+    """
+    parts = []
+    for item in reverts:
+        key = str(item.get('key') or '')
+        label = SETTINGS_GUARD_LABELS.get(key, key)
+        prefix = key if label == key else f'{label}（{key}）'
+        text = f'{prefix}：提交 {item.get("submitted")} → 生效 {item.get("applied")}'
+        if item.get('allowed'):
+            text += f'，允许 {item["allowed"]}'
+        if item.get('note'):
+            text += f'；{item["note"]}'
+        parts.append(text)
+    if not parts:
+        return ''
+    return '以下设置项超出允许范围，已回退后再保存：' + '；'.join(parts) + '。'
+
+
+def _perform_settings_save(form_data: dict, uploads: dict, operation_id: str | None = None) -> dict:
+    form_data = dict(form_data or {})
+    uploads = uploads or {}
+    messages = []
+    progress_reporter = _build_settings_progress_reporter(operation_id)
+
+    def report(stage: str, message: str, detail: str = '', percent=None, level: str = 'info', downloaded_bytes=None, total_bytes=None):
+        if not progress_reporter:
+            return
+        progress_reporter({
+            'stage': stage,
+            'message': message,
+            'detail': detail,
+            'percent': percent,
+            'downloaded_bytes': downloaded_bytes,
+            'total_bytes': total_bytes,
+            'level': level,
+        })
+
+    try:
+        report('saving_config', '正在保存配置', '正在校验并写入设置。')
+        form_data.pop('save_operation_id', None)
+
+        # 本轮回退记录：键 / 提交值 / 生效值 / 允许范围。所有「值被改掉」的分支都要登记，
+        # 保存成功后统一追加一条 warning 消息，避免用户只看到「配置已成功保存」。
+        reverts: list = []
+        revert_index: dict = {}
+        guard_keys = {key for key, _, _ in SETTINGS_RANGE_GUARDS}
+
+        def remember_revert(key, submitted, applied, allowed=None, note=''):
+            """登记一次回退；同一键只保留首条提交值，生效值取最后一次。"""
+            item = revert_index.get(key)
+            if item is None:
+                item = {
+                    'key': key,
+                    'submitted': submitted,
+                    'applied': applied,
+                    'allowed': allowed,
+                    'note': note,
+                }
+                revert_index[key] = item
+                reverts.append(item)
+            else:
+                item['applied'] = applied
+                if allowed and not item.get('allowed'):
+                    item['allowed'] = allowed
+                if note and not item.get('note'):
+                    item['note'] = note
+            return item['applied']
+
+        new_password = form_data.get('new_password')
+        confirm_password = form_data.get('confirm_password')
+        if new_password:
+            if new_password == confirm_password:
+                form_data['password'] = new_password
+            else:
+                _append_settings_message(messages, 'danger', '新密码两次输入不一致，密码未更新。')
+
+        form_data.pop('new_password', None)
+        form_data.pop('confirm_password', None)
+
+        for checkbox in SETTINGS_CHECKBOX_FIELDS:
+            if checkbox not in form_data:
+                form_data[checkbox] = 'off'
+
+        numeric_fields = SETTINGS_INT_FIELDS
+        for field in numeric_fields:
+            if field in form_data:
+                try:
+                    original_value = form_data[field]
+                    normalized_value = int(original_value)
+                    if field == 'LOGIN_SESSION_TIMEOUT_MINUTES':
+                        normalized_value = max(1, normalized_value)
+                    form_data[field] = str(normalized_value)
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"整数转换失败 - field: {field}, value: {form_data[field]}, error: {e}")
+                    # AI_FAILOVER_TIMEOUT_SECONDS 必须回退到 8：若落到 1，它会处于合法的
+                    # 1–60 区间内，后续范围校验不会再纠正，稍慢的连接会被 1s 误判为宕机。
+                    _submitted_int = form_data[field]
+                    form_data[field] = str(_settings_fallback_default(field))
+                    logger.debug(f"整数字段使用默认值 - field: {field}, value: {form_data[field]}")
+                    # 非数字提交在归一化阶段就被改掉，范围校验根本看不到它，
+                    # 所以对 guard 覆盖的键在这里补一条回退记录。
+                    if field in guard_keys:
+                        remember_revert(
+                            field, _submitted_int, form_data[field],
+                            allowed=_format_guard_range(*_guard_bounds(field)),
+                            note='不是有效数值',
+                        )
+
+        # AI_FAILOVER_TIMEOUT_SECONDS 范围校验：设置页声明 1–60 秒。
+        # 越界或非法（手工配置 / 直接 POST 负值）回退默认值，
+        # 避免 httpx 在创建客户端 / 请求时抛 timeout range error。
+        _fkey = 'AI_FAILOVER_TIMEOUT_SECONDS'
+        if _fkey in form_data:
+            try:
+                _fv = int(str(form_data[_fkey]).strip())
+            except (ValueError, TypeError):
+                _fv = None
+            if _fv is None or _fv < 1 or _fv > 60:
+                _fkey_default = _settings_fallback_default(_fkey)
+                logger.debug(f"{_fkey} 越界或非法，回退默认 {_fkey_default}: {form_data.get(_fkey)}")
+                _submitted_fkey = form_data[_fkey]
+                form_data[_fkey] = str(_fkey_default)
+                remember_revert(_fkey, _submitted_fkey, form_data[_fkey], allowed='1–60')
+
+        # SUBTITLE_QC_TIMEOUT_SECONDS 范围校验：设置页声明 10–600 秒。
+        # 越界或非法（手工配置 / 直接 POST 负值 / 非数字）回退默认值，
+        # 避免负值或超限值被透传给 httpx 客户端时抛 timeout range error。
+        _qc_timeout_key = 'SUBTITLE_QC_TIMEOUT_SECONDS'
+        if _qc_timeout_key in form_data:
+            try:
+                _qc_tv = int(str(form_data[_qc_timeout_key]).strip())
+            except (ValueError, TypeError):
+                _qc_tv = None
+            if _qc_tv is None or _qc_tv < 10 or _qc_tv > 600:
+                _qc_default = _settings_fallback_default(_qc_timeout_key)
+                logger.debug(f"{_qc_timeout_key} 越界或非法，回退默认 {_qc_default}: {form_data.get(_qc_timeout_key)}")
+                _submitted_qc_timeout = form_data[_qc_timeout_key]
+                form_data[_qc_timeout_key] = str(_qc_default)
+                remember_revert(
+                    _qc_timeout_key, _submitted_qc_timeout, form_data[_qc_timeout_key],
+                    allowed='10–600',
+                )
+
+        for field in SETTINGS_FLOAT_FIELDS:
+            if field in form_data:
+                try:
+                    original_value = form_data[field]
+                    if str(original_value).strip() == '':
+                        raise ValueError('empty string')
+                    form_data[field] = str(float(original_value))
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"浮点数转换失败 - field: {field}, value: {form_data[field]}, error: {e}")
+                    _submitted_float = form_data[field]
+                    form_data[field] = str(float(_settings_fallback_default(field, 0.0)))
+                    logger.debug(f"浮点字段使用默认值 - field: {field}, value: {form_data[field]}")
+                    if field in guard_keys:
+                        remember_revert(
+                            field, _submitted_float, form_data[field],
+                            allowed=_format_guard_range(*_guard_bounds(field)),
+                            note='不是有效数值',
+                        )
+
+        # 表单可达数值键的范围校验 + 无控件数值键的防御性校验（表见 SETTINGS_RANGE_GUARDS）。
+        # 关于前端：settings-form 没有 novalidate，保存按钮是 <button type="submit">，
+        # 浏览器原生约束校验在 submit 事件派发之前执行（所以 event.preventDefault()
+        # 并不会跳过它，有 max 的控件确实拦得住越界值；不要因为这段注释曾经写错就删掉
+        # 模板里的 min/max）。真正的问题是覆盖面：多数控件只声明 min（分片窗口、最大片段、
+        # 语音覆盖率），且原生校验只作用于「有控件的键」——直接 POST / 脚本 / 旧页面提交的
+        # 键根本不在模板里，原生校验无从谈起。所以服务端必须独立拦一遍。
+        # 越界或非法一律回退 DEFAULT_CONFIG 的默认值，并由 remember_revert 记录，
+        # 保存结束后汇总成一条可见的 warning 消息。
+        for _guard_key, _guard_min, _guard_max in SETTINGS_RANGE_GUARDS:
+            if _guard_key not in form_data:
+                continue
+            _submitted_guard = form_data[_guard_key]
+            try:
+                _guard_value = float(str(_submitted_guard).strip())
+            except (ValueError, TypeError):
+                _guard_value = None
+            if _guard_value is None or _guard_value != _guard_value or not (_guard_min <= _guard_value <= _guard_max):
+                _guard_default = _settings_fallback_default(_guard_key)
+                logger.debug(
+                    f"{_guard_key} 越界或非法，回退默认 {_guard_default}: {form_data.get(_guard_key)}"
+                )
+                form_data[_guard_key] = str(_guard_default)
+                remember_revert(
+                    _guard_key, _submitted_guard, form_data[_guard_key],
+                    allowed=_format_guard_range(_guard_min, _guard_max),
+                )
+
+        # 交叉约束：分片重叠必须严格小于分片窗口。modules/speech_recognition.py 的
+        # _create_audio_chunks 每片前进 (window - overlap) 秒，overlap >= window 时
+        # 步进 <= 0，分片循环永不终止、ASR 线程挂死（模块侧另有兜底，这里从配置层拦住）。
+        # 钳到 window - 1.0 而不是 window - ε：留 1 秒余量既保证严格正步进，
+        # 也避免步进趋近于 0 时同一段音频被反复切片、ASR 调用量爆炸。
+        _window_key = 'AUDIO_CHUNK_WINDOW_S'
+        _overlap_key = 'AUDIO_CHUNK_OVERLAP_S'
+
+        _cross_cache: dict = {}
+
+        def _cross_constraint_value(key):
+            """取该键本次生效的数值；本次未提交时回读已存配置，取不到返回 None。"""
+            raw = form_data.get(key)
+            if raw is None:
+                if 'config' not in _cross_cache:
+                    try:
+                        _cross_cache['config'] = load_config() or {}
+                    except Exception as exc:  # 读配置失败不应阻断保存
+                        logger.debug(f"读取已存配置用于分片交叉校验失败: {exc}")
+                        _cross_cache['config'] = {}
+                raw = _cross_cache['config'].get(key)
+            try:
+                return float(str(raw).strip())
+            except (ValueError, TypeError):
+                return None
+
+        # 终态校验：位置必须在全部范围 guard 之后、update_config 之前，且两侧都取
+        # 「本次生效值」而非「本次提交值」。只校验「本次提交了 overlap」这一侧是不够的：
+        # 先保存 window=15 / overlap=5（两者都在各自区间内，完全合法），再只提交
+        # window=5 —— 旧逻辑因为 overlap 不在 form_data 里而完全不触发交叉校验，
+        # 落盘 5/5、步进 0，且不产生任何 warning。模块侧兜底会把 overlap 钳到
+        # window-0.01，步进只剩 0.01 秒：60 秒素材被切成 5502 片、2 小时素材 719501 片，
+        # 每片都要重抽一次音频再跑一轮 ASR，等同于把任务拖垮。所以这里不论哪一侧
+        # 缺失，都回读已存配置补齐后再判一次，保证落盘配置永远满足 overlap < window。
+        _window_value = _cross_constraint_value(_window_key)
+        _overlap_value = _cross_constraint_value(_overlap_key)
+        if (
+            _window_value is not None
+            and _overlap_value is not None
+            and _overlap_value >= _window_value
+        ):
+            _overlap_limit = max(0.0, _window_value - 1.0)
+            # 未提交 overlap 时 submitted 取当前生效值：提示里的「提交值」必须对得上
+            # 用户此刻看到的旧值，否则提示会引用一个用户没提交过的数字。
+            _submitted_overlap = form_data.get(_overlap_key, _overlap_value)
+            form_data[_overlap_key] = str(_overlap_limit)
+            remember_revert(
+                _overlap_key, _submitted_overlap, form_data[_overlap_key],
+                allowed=f'0–{_format_guard_bound(_overlap_limit)}',
+                note=f'须小于分片窗口 {_format_guard_bound(_window_value)}',
+            )
+
+        # 旧模板把字幕换行上限钉死为 999/1 且强制两个开关为 on（当时控件是 disabled，
+        # 用户选不出这个组合），配置侧由 migrate_pinned_subtitle_wrap_config 迁回
+        # 42/2/False/False。设置页路径上只有 999 会越界回退，SUBTITLE_MAX_LINES=1 落在
+        # 合法区间会被保留，落盘成 42/1/True/True —— 同一个组合两条路径结果不同。
+        # 这里对同一组合整组回退 DEFAULT_CONFIG，与迁移落点保持一致：该组合只可能来自
+        # 旧模板或异常提交，不是用户真实意图，而 guard 的既有语义就是「非法值回退默认值」。
+        if (
+            'SUBTITLE_MAX_LINE_LENGTH' in revert_index
+            and str(form_data.get('SUBTITLE_MAX_LINES', '')).strip() == '1'
+            and str(form_data.get('SUBTITLE_MAX_LINE_LENGTH_ENABLED', '')).strip().lower() in ('on', 'true', '1')
+            and str(form_data.get('SUBTITLE_MAX_LINES_ENABLED', '')).strip().lower() in ('on', 'true', '1')
+        ):
+            # 两个开关回到「未启用」（DEFAULT_CONFIG 中均为 False），行数上限回到默认 2。
+            for _wrap_key, _wrap_is_toggle in (
+                ('SUBTITLE_MAX_LINES', False),
+                ('SUBTITLE_MAX_LINE_LENGTH_ENABLED', True),
+                ('SUBTITLE_MAX_LINES_ENABLED', True),
+            ):
+                _submitted_wrap = form_data.get(_wrap_key)
+                form_data[_wrap_key] = (
+                    False if _wrap_is_toggle else str(_settings_fallback_default(_wrap_key))
+                )
+                remember_revert(
+                    _wrap_key, _submitted_wrap, form_data[_wrap_key],
+                    note='旧模板钉死的字幕换行组合，整组回退为默认值',
+                )
+
+        if 'SUBTITLE_FONT_NAME' in form_data:
+            form_data['SUBTITLE_FONT_NAME'] = str(form_data['SUBTITLE_FONT_NAME']).strip()
+
+        # 枚举型外观/编码配置：非法值回退默认，避免脏值进入配置文件
+        _enum_guards = (
+            ('VIDEO_QUALITY_MODE', ('auto', 'manual')),
+            ('VIDEO_HW_QUALITY_LEVEL', ('fast', 'balanced', 'quality')),
+            ('VIDEO_COLOR_METADATA_MODE', ('auto', 'bt709', 'off')),
+        )
+        for _enum_key, _enum_allowed in _enum_guards:
+            if _enum_key not in form_data:
+                continue
+            _enum_value = str(form_data[_enum_key] or '').strip().lower()
+            if _enum_value not in _enum_allowed:
+                _enum_value = str(_settings_fallback_default(_enum_key)).strip().lower()
+                logger.debug(f"{_enum_key} 非法值，回退默认 {_enum_value}")
+            form_data[_enum_key] = _enum_value
+
+        # 颜色字段统一成 #RRGGBB，非法值回退默认
+        for _color_key in (
+            'SUBTITLE_FONT_COLOR',
+            'SUBTITLE_OUTLINE_COLOR',
+            'SUBTITLE_BACKGROUND_COLOR',
+        ):
+            if _color_key not in form_data:
+                continue
+            form_data[_color_key] = normalize_hex_color(
+                form_data[_color_key], str(_settings_fallback_default(_color_key))
+            )
+
+        # 预设标签（Issue #139）：统一成「每行一个」后落盘，使重复保存幂等；
+        # 超量（>12）只保留前 12 个、超长（>20 字）保留原文，两者的后果都由
+        # normalize_preset_tags_config 返回用户可见的 warning，不做静默丢弃。
+        if 'PRESET_TAGS' in form_data:
+            _preset_text, _preset_warnings = normalize_preset_tags_config(form_data.get('PRESET_TAGS'))
+            form_data['PRESET_TAGS'] = _preset_text
+            for _preset_warning in _preset_warnings:
+                _append_settings_message(messages, 'warning', _preset_warning)
+            # 勾选启用但解析后为空时，行为等同未启用，必须让用户知道
+            if not _preset_text and is_preset_tags_enabled(form_data):
+                _append_settings_message(
+                    messages, 'warning',
+                    '已勾选「使用预设标签」但没有填写任何标签，当前等同于未启用。'
+                )
+
+        _persist_settings_uploads(form_data, uploads)
+        updated_config = update_config(form_data)
+
+        try:
+            from modules.task_manager import get_global_task_processor
+            configure_app(app, updated_config)
+            get_global_task_processor(updated_config)
+            logger.info("配置已更新并同步到任务处理器")
+        except Exception as e:
+            logger.warning(f"同步任务处理器配置失败: {e}")
+
+        _sync_notification_service(updated_config)
+        _append_notification_config_warnings(messages, updated_config)
+
+        # 立即应用清理调度相关设置（日志清理/下载清理），无需重启服务。
+        try:
+            _reschedule_cleanup_jobs()
+        except Exception as e:
+            logger.warning(f"同步清理定时任务配置失败: {e}")
+
+        try:
+            need_ffmpeg = False
+            if str(updated_config.get('SPEECH_RECOGNITION_ENABLED', False)).lower() in ['true', '1', 'on']:
+                need_ffmpeg = True
+            if str(updated_config.get('SUBTITLE_EMBED_IN_VIDEO', False)).lower() in ['true', '1', 'on']:
+                need_ffmpeg = True
+
+            if need_ffmpeg:
+                from modules.ffmpeg_manager import get_windows_ffmpeg_manual_setup_message
+                from modules.youtube_handler import get_ffmpeg_path
+                report('checking_ffmpeg', '正在检查 FFmpeg', '已启用依赖 FFmpeg 的功能，正在检查本地环境。')
+                ff_path = get_ffmpeg_path(
+                    logger=logger,
+                    force_refresh=True,
+                    progress_callback=progress_reporter
+                )
+                if ff_path and os.path.exists(ff_path):
+                    logger.info(f"FFmpeg 已就绪: {ff_path}")
+                    report('completed', 'FFmpeg 已就绪', ff_path, percent=100.0, level='success')
+                else:
+                    warning_msg = get_windows_ffmpeg_manual_setup_message()
+                    logger.warning(warning_msg)
+                    _append_settings_message(messages, 'warning', warning_msg)
+                    report('warning', 'FFmpeg 未就绪', warning_msg, level='warning')
+            else:
+                report('completed', '配置已保存', '当前设置不需要额外下载 FFmpeg。', percent=100.0, level='success')
+        except Exception as e:
+            from modules.ffmpeg_manager import get_windows_ffmpeg_manual_setup_message
+            warning_msg = f'检查内置 FFmpeg 状态失败，请查看服务日志。{get_windows_ffmpeg_manual_setup_message()}'
+            logger.warning("检查内置 FFmpeg 状态失败: %s", e)
+            _append_settings_message(messages, 'warning', warning_msg)
+            report('warning', 'FFmpeg 检查失败', warning_msg, level='warning')
+
+        api_key = str(updated_config.get('YOUTUBE_API_KEY') or '').strip()
+        api_ready, api_status = youtube_monitor.reload_api_client(updated_config)
+        if api_key:
+            if api_ready:
+                youtube_monitor.start_all_schedules()
+                if api_status == 'proxy_ready':
+                    logger.info("YouTube监控 API 已重建并同步到监控系统，独立代理已启用")
+                else:
+                    logger.info("YouTube监控 API 已重建并同步到监控系统，当前为直连模式")
+            else:
+                youtube_monitor.stop_all_schedules()
+                if api_status == 'missing_api_key':
+                    warning_msg = 'YouTube API 密钥未配置，请先在设置页完成接入。'
+                else:
+                    warning_msg = 'YouTube监控 API 初始化失败，请检查 API 密钥、代理配置与网络连通性。'
+                logger.warning(warning_msg)
+                _append_settings_message(messages, 'warning', warning_msg)
+        else:
+            youtube_monitor.stop_all_schedules()
+            logger.info("YouTube API密钥未配置，已跳过监控系统初始化")
+
+        # Issue 101: 非阻断提示——CookieCloud 已启用时，逐项检查服务地址/UUID/密码是否缺失
+        if str(updated_config.get('COOKIECLOUD_ENABLED', False)).lower() in ('true', '1', 'on'):
+            _cookiecloud_missing = []
+            if not str(updated_config.get('COOKIECLOUD_SERVER_URL', '') or '').strip():
+                _cookiecloud_missing.append('服务地址')
+            if not str(updated_config.get('COOKIECLOUD_UUID', '') or '').strip():
+                _cookiecloud_missing.append('UUID')
+            if not str(updated_config.get('COOKIECLOUD_PASSWORD', '') or '').strip():
+                _cookiecloud_missing.append('密码')
+            if _cookiecloud_missing:
+                _append_settings_message(
+                    messages, 'warning',
+                    f'CookieCloud 已启用，但以下必填项为空：{"、".join(_cookiecloud_missing)}。'
+                    'CookieCloud 需要服务地址、UUID、密码三者均非空才能正常同步，'
+                    '请补全后保存，或暂时关闭 CookieCloud。'
+                )
+
+        # 值被回退过就必须让用户看见：放在 success 之前，保存本身的成功语义不变
+        # （success=True、仍有「配置已成功保存」），但不再出现「全部成功」的假象。
+        _revert_message = _format_settings_revert_message(reverts)
+        if _revert_message:
+            logger.warning('设置保存时回退了越界值: %s', _revert_message)
+            _append_settings_message(messages, 'warning', _revert_message)
+
+        _append_settings_message(messages, 'success', '配置已成功保存')
+        final_level = 'warning' if any(msg['category'] in ('warning', 'danger') for msg in messages) else 'success'
+        final_stage = 'warning' if final_level == 'warning' else 'completed'
+        final_message = '配置已保存，但有提醒需要处理。' if final_level == 'warning' else '配置已成功保存'
+        final_detail = next((msg['text'] for msg in messages if msg['category'] in ('warning', 'danger')), '设置已生效。')
+        return {
+            'success': True,
+            'messages': messages,
+            'updated_config': updated_config,
+            'final_stage': final_stage,
+            'final_message': final_message,
+            'final_detail': final_detail,
+            'final_level': final_level,
+        }
+    except Exception as e:
+        logger.exception("保存设置失败: %s", e)
+        public_message = '保存设置失败，请查看服务日志。'
+        _append_settings_message(messages, 'danger', public_message)
+        return {
+            'success': False,
+            'messages': messages,
+            'updated_config': None,
+            'final_stage': 'failed',
+            'final_message': '保存设置失败',
+            'final_detail': public_message,
+            'final_level': 'error',
+        }
+
+
+def _finalize_settings_save_operation(operation_id: str, result: dict):
+    current_state = _get_settings_save_progress(operation_id) or _new_settings_save_state(operation_id)
+    percent = current_state.get('percent')
+    if result.get('success') and percent is None:
+        percent = 100.0
+
+    _update_settings_save_progress(
+        operation_id,
+        stage=result.get('final_stage', 'completed'),
+        message=result.get('final_message', ''),
+        detail=result.get('final_detail', ''),
+        percent=percent,
+        done=True,
+        level=result.get('final_level', 'success'),
+        success=result.get('success'),
+        messages=result.get('messages', []),
+    )
+
+
+def _run_settings_save_operation(operation_id: str, form_data: dict, uploads: dict):
+    result = _perform_settings_save(form_data, uploads, operation_id=operation_id)
+    _finalize_settings_save_operation(operation_id, result)
+
+
+TG_BOT_API_TOKEN_PREFIX = 'y2a_tgbot_v1_'
+TG_BOT_API_TOKEN_HASH_PREFIX = 'pbkdf2_sha256:'
+TG_BOT_API_TOKEN_HASH_ITERATIONS = 260000
+_TG_BOT_API_TOKEN_RANDOM_RE = re.compile(r'^[A-Za-z0-9_-]{32,}$')
+_TG_BOT_UPLOAD_RATE_LIMIT_WINDOW_SECONDS = 60
+_TG_BOT_UPLOAD_RATE_LIMIT_MAX_REQUESTS = 60
+_TG_BOT_UPLOAD_RATE_LIMIT_MAX_BUCKETS = 10000
+_TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS = {}
+_TG_BOT_UPLOAD_RATE_LIMIT_LOCK = threading.Lock()
+
+
+def _generate_tgbot_api_token() -> str:
+    return f'{TG_BOT_API_TOKEN_PREFIX}{secrets.token_urlsafe(32)}'
+
+
+def _is_valid_tgbot_api_token_format(token: str | None) -> bool:
+    token = str(token or '').strip()
+    if not token.startswith(TG_BOT_API_TOKEN_PREFIX):
+        return False
+    random_part = token[len(TG_BOT_API_TOKEN_PREFIX):]
+    return bool(_TG_BOT_API_TOKEN_RANDOM_RE.fullmatch(random_part))
+
+
+def _hash_tgbot_api_token(token: str) -> str:
+    salt = secrets.token_urlsafe(16)
+    digest = hashlib.pbkdf2_hmac(
+        'sha256',
+        token.encode('utf-8'),
+        salt.encode('utf-8'),
+        TG_BOT_API_TOKEN_HASH_ITERATIONS,
+    ).hex()
+    return f'{TG_BOT_API_TOKEN_HASH_PREFIX}{TG_BOT_API_TOKEN_HASH_ITERATIONS}${salt}${digest}'
+
+
+def _verify_tgbot_api_token_hash(token: str, stored_hash: str) -> bool:
+    if not stored_hash.startswith(TG_BOT_API_TOKEN_HASH_PREFIX):
+        return False
+    payload = stored_hash[len(TG_BOT_API_TOKEN_HASH_PREFIX):]
+    try:
+        iterations_text, salt, expected_digest = payload.split('$', 2)
+        iterations = int(iterations_text)
+    except (TypeError, ValueError):
+        return False
+    if iterations < 1 or not salt or not expected_digest:
+        return False
+    actual_digest = hashlib.pbkdf2_hmac(
+        'sha256',
+        token.encode('utf-8'),
+        salt.encode('utf-8'),
+        iterations,
+    ).hex()
+    return secrets.compare_digest(expected_digest, actual_digest)
+
+
+def _extract_bearer_token() -> str:
+    auth_header = request.headers.get('Authorization') or ''
+    scheme, _, value = auth_header.partition(' ')
+    if scheme.lower() != 'bearer' or not value.strip():
+        return ''
+    return value.strip()
+
+
+def _verify_tgbot_api_token(token: str, config: dict | None = None) -> bool:
+    if not _is_valid_tgbot_api_token_format(token):
+        return False
+    effective_config = config if isinstance(config, dict) else load_config()
+    stored_hash = str(effective_config.get('TG_BOT_API_TOKEN_HASH') or '').strip()
+    return _verify_tgbot_api_token_hash(token, stored_hash)
+
+
+def _tgbot_api_token_state(config: dict | None = None) -> dict:
+    effective_config = config if isinstance(config, dict) else load_config()
+    token_hash = str(effective_config.get('TG_BOT_API_TOKEN_HASH') or '').strip()
+    return {
+        'configured': bool(token_hash),
+        'created_at': str(effective_config.get('TG_BOT_API_TOKEN_CREATED_AT') or ''),
+        'last4': str(effective_config.get('TG_BOT_API_TOKEN_LAST4') or ''),
+    }
+
+
+def _ensure_tgbot_token_csrf_token() -> str:
+    token = session.get('tgbot_token_csrf')
+    if not isinstance(token, str) or not token:
+        token = secrets.token_urlsafe(32)
+        session['tgbot_token_csrf'] = token
+    return token
+
+
+def _validate_tgbot_token_csrf(submitted_token: str | None) -> bool:
+    expected = session.get('tgbot_token_csrf')
+    if not isinstance(expected, str) or not expected:
+        return False
+    if not secrets.compare_digest(expected, str(submitted_token or '')):
+        return False
+    session.pop('tgbot_token_csrf', None)
+    return True
+
+
+def _is_tgbot_upload_rate_limited() -> bool:
+    client_id = request.remote_addr or 'unknown'
+    now = time.time()
+    window_start = now - _TG_BOT_UPLOAD_RATE_LIMIT_WINDOW_SECONDS
+    with _TG_BOT_UPLOAD_RATE_LIMIT_LOCK:
+        for key in list(_TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS.keys()):
+            _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS[key] = [
+                timestamp for timestamp in _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS[key]
+                if timestamp >= window_start
+            ]
+            if not _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS[key]:
+                del _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS[key]
+
+        if len(_TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS) > _TG_BOT_UPLOAD_RATE_LIMIT_MAX_BUCKETS:
+            newest_buckets = sorted(
+                _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS.items(),
+                key=lambda item: item[1][-1] if item[1] else 0,
+                reverse=True,
+            )[:_TG_BOT_UPLOAD_RATE_LIMIT_MAX_BUCKETS]
+            _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS.clear()
+            _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS.update(newest_buckets)
+
+        bucket = _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS.setdefault(client_id, [])
+        if len(bucket) >= _TG_BOT_UPLOAD_RATE_LIMIT_MAX_REQUESTS:
+            return True
+        bucket.append(now)
+        if len(_TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS) > _TG_BOT_UPLOAD_RATE_LIMIT_MAX_BUCKETS:
+            newest_buckets = sorted(
+                _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS.items(),
+                key=lambda item: item[1][-1] if item[1] else 0,
+                reverse=True,
+            )[:_TG_BOT_UPLOAD_RATE_LIMIT_MAX_BUCKETS]
+            _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS.clear()
+            _TG_BOT_UPLOAD_RATE_LIMIT_BUCKETS.update(newest_buckets)
+        return False
+
+
+def tgbot_upload_token_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
+
+        if _is_tgbot_upload_rate_limited():
+            return jsonify({'success': False, 'message': '请求过于频繁，请稍后再试。'}), 429
+
+        config = load_config()
+        if not config.get('TG_BOT_API_TOKEN_HASH'):
+            return jsonify({
+                'success': False,
+                'message': 'Telegram Bot API Token 未配置，请先在设置页生成专用 Token。'
+            }), 403
+
+        token = _extract_bearer_token()
+        if not _verify_tgbot_api_token(token, config):
+            return jsonify({'success': False, 'message': 'Telegram Bot API Token 无效或缺失。'}), 401
+
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# 登录验证装饰器
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        config = load_config()
+        if config.get('password_protection_enabled'):
+            if 'logged_in' not in session:
+                flash('请先登录以访问此页面。', 'info')
+                return redirect(url_for('login', next=request.full_path))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# 配置CORS，允许来自YouTube的跨域请求
+CORS(app, resources={
+    r"/tasks/add_via_extension": {
+        "origins": [r"https?://www\.youtube\.com", r"https?://youtube\.com"],
+        "methods": ["POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
+
+# 确保日志目录存在
+log_dir = get_app_subdir('logs')
+os.makedirs(log_dir, exist_ok=True)
+
+# 配置日志
+log_file = os.path.join(log_dir, 'app.log')
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# 文件处理器
+file_handler = RotatingFileHandler(log_file, maxBytes=10485760, backupCount=10, encoding='utf-8')
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.WARNING)
+
+# 控制台处理器
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.WARNING)
+# 确保Windows控制台编码正确
+if os.name == 'nt':
+    import sys
+    import codecs
+    # 检查Python版本和reconfigure方法可用性
+    python_version = sys.version_info
+    
+    # 强制设置stdout和stderr为UTF-8编码
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')  # type: ignore
+        except Exception:
+            pass
+        
+    if hasattr(sys.stderr, 'reconfigure'):
+        try:
+            sys.stderr.reconfigure(encoding='utf-8')  # type: ignore
+        except Exception:
+            pass
+    
+    # 设置环境变量
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    # 为控制台处理器设置编码
+    try:
+        console_handler.setStream(codecs.getwriter('utf-8')(sys.stdout.buffer))  # type: ignore
+    except Exception:
+        pass
+
+# 配置根日志记录器
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.WARNING)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# 强制设置所有日志记录器的默认编码为UTF-8
+try:
+    logging.getLogger().handlers[0].encoding = 'utf-8'  # type: ignore
+except Exception:
+    pass
+
+try:
+    if len(logging.getLogger().handlers) > 1:
+        logging.getLogger().handlers[1].encoding = 'utf-8'  # type: ignore
+except Exception:
+    pass
+
+# 配置应用日志记录器
+logger = logging.getLogger('Y2A-Auto')
+logger.setLevel(logging.WARNING)
+
+def init_id_mapping():
+    """
+    初始化AcFun分区ID映射.
+    id_mapping.json 文件现在应该由 acfunid/ 目录直接提供，并包含在Docker镜像中。
+    此函数仅记录一条信息，不再执行文件生成或检查逻辑。
+    """
+    logger.info("AcFun分区ID映射 (id_mapping.json) 应由 'acfunid/' 目录提供。")
+
+# 模板辅助函数
+def task_status_display(status):
+    """将任务状态代码转换为显示文本"""
+    status_map = {
+        TASK_STATES['PENDING']: '等待处理',
+        TASK_STATES['DOWNLOADING']: '下载中',
+        TASK_STATES['DOWNLOADED']: '下载完成',
+        TASK_STATES['TRANSLATING_SUBTITLE']: '翻译字幕中',
+    TASK_STATES['ASR_TRANSCRIBING']: '语音转写中',
+        TASK_STATES['ENCODING_VIDEO']: '转码视频中',
+        TASK_STATES['TRANSLATING']: '翻译中',
+        TASK_STATES['TAGGING']: '生成标签中',
+        TASK_STATES['PARTITIONING']: '推荐分区中',
+        TASK_STATES['MODERATING']: '内容审核中',
+        TASK_STATES['AWAITING_REVIEW']: '等待人工审核',
+        TASK_STATES['READY_FOR_UPLOAD']: '准备上传',
+        TASK_STATES['UPLOADING']: '上传中',
+        TASK_STATES['COMPLETED']: '已完成',
+        TASK_STATES['FAILED']: '失败',
+        'fetching_info': '采集信息中',
+        'info_fetched': '信息已采集',
+    }
+    return status_map.get(status, status)
+
+def task_status_color(status):
+    """将任务状态代码转换为显示颜色"""
+    color_map = {
+        TASK_STATES['PENDING']: 'secondary',
+        TASK_STATES['DOWNLOADING']: 'info',
+        TASK_STATES['DOWNLOADED']: 'info',
+        TASK_STATES['TRANSLATING_SUBTITLE']: 'info',
+    TASK_STATES['ASR_TRANSCRIBING']: 'info',
+        TASK_STATES['ENCODING_VIDEO']: 'info',
+        TASK_STATES['TRANSLATING']: 'info',
+        TASK_STATES['TAGGING']: 'info',
+        TASK_STATES['PARTITIONING']: 'info',
+        TASK_STATES['MODERATING']: 'info',
+        TASK_STATES['AWAITING_REVIEW']: 'warning',
+        TASK_STATES['READY_FOR_UPLOAD']: 'primary',
+        TASK_STATES['UPLOADING']: 'primary',
+        TASK_STATES['COMPLETED']: 'success',
+        TASK_STATES['FAILED']: 'danger'
+    }
+    return color_map.get(status, 'secondary')
+
+def _get_bilibili_zone_data():
+    from modules.bilibili_zones import get_zone_list_sub
+    return get_zone_list_sub()
+
+
+def _load_acfun_partition_mapping():
+    id_mapping_path = os.path.join(get_app_subdir('acfunid'), 'id_mapping.json')
+    try:
+        with open(id_mapping_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"读取AcFun分区映射失败: {e}")
+        return []
+
+
+def _build_bilibili_partition_mapping():
+    id_mapping = []
+    zone_data = _get_bilibili_zone_data()
+    for parent in zone_data:
+        if not isinstance(parent, dict):
+            continue
+        parent_tid = parent.get('tid')
+        parent_name = parent.get('name')
+        if parent_tid in (None, 0, '0') or not parent_name:
+            continue
+        id_mapping.append({
+            'category': parent_name,
+            'partitions': [{
+                'id': str(parent_tid),
+                'name': parent_name,
+                'sub_partitions': [
+                    {
+                        'id': str(sub.get('tid')),
+                        'name': sub.get('name'),
+                    }
+                    for sub in (parent.get('sub') or [])
+                    if isinstance(sub, dict) and sub.get('tid') not in (None, 0, '0') and sub.get('name')
+                ]
+            }]
+        })
+    return id_mapping
+
+
+def get_partition_name(partition_id, upload_target='acfun'):
+    """根据分区ID和平台获取分区名称"""
+    if not partition_id:
+        return None
+
+    target = str(upload_target or 'acfun').strip().lower()
+    pid = str(partition_id)
+
+    if target == 'bilibili':
+        try:
+            zone_data = _get_bilibili_zone_data()
+            for parent in zone_data:
+                if str(parent.get('tid')) == pid:
+                    return parent.get('name')
+                for sub in parent.get('sub', []) or []:
+                    if str(sub.get('tid')) == pid:
+                        return sub.get('name')
+        except Exception as e:
+            logger.error(f"获取bilibili分区名称时出错: {str(e)}")
+        return None
+
+    # 默认 AcFun
+    id_mapping_path = os.path.join(get_app_subdir('acfunid'), 'id_mapping.json')
+    try:
+        with open(id_mapping_path, 'r', encoding='utf-8') as f:
+            id_mapping = json.load(f)
+
+        for category in id_mapping:
+            for partition in category.get('partitions', []):
+                if str(partition.get('id')) == pid:
+                    return partition.get('name')
+
+                for sub_partition in partition.get('sub_partitions', []):
+                    if str(sub_partition.get('id')) == pid:
+                        return sub_partition.get('name')
+    except Exception as e:
+        logger.error(f"获取AcFun分区名称时出错: {str(e)}")
+
+    return None
+
+def parse_json(json_str):
+    """将JSON字符串解析为Python对象"""
+    if not json_str:
+        return {}  # 返回空字典
+    
+    try:
+        return json.loads(json_str)
+    except Exception as e:
+        logger.error(f"解析JSON时出错: {str(e)}")
+        return {} # 返回空字典
+
+def parse_youtube_duration(duration_str):
+    """解析YouTube ISO 8601时长格式为秒数"""
+    import re
+    
+    if not duration_str:
+        return 0
+    
+    # PT1H30M45S -> 1小时30分45秒
+    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+    match = re.match(pattern, duration_str)
+    
+    if not match:
+        return 0
+    
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    
+    return hours * 3600 + minutes * 60 + seconds
+
+# 注册模板过滤器
+app.jinja_env.filters['parse_youtube_duration'] = parse_youtube_duration
+
+# 错误信息友好化过滤器：把底层错误映射为「原因 + 建议操作」
+from modules.error_hints import friendly_error as _friendly_error
+app.jinja_env.filters['friendly_error'] = _friendly_error
+
+ALIYUN_LABEL_MAP = {
+    "pornographic_adult": "疑似色情内容",
+    "sexual_terms": "疑似性健康内容",
+    "sexual_suggestive": "疑似低俗内容",
+    "political_figure": "疑似政治人物",
+    "political_entity": "疑似政治实体",
+    "political_n": "疑似敏感政治内容",
+    "political_p": "疑似涉政禁宣人物",
+    "political_a": "涉政专项升级保障",
+    "violent_extremist": "疑似极端组织",
+    "violent_incidents": "疑似极端主义内容",
+    "violent_weapons": "疑似武器弹药",
+    "contraband_drug": "疑似毒品相关",
+    "contraband_gambling": "疑似赌博相关",
+    "contraband_act": "疑似违禁行为",
+    "contraband_entity": "疑似违禁工具",
+    "inappropriate_discrimination": "疑似偏见歧视内容",
+    "inappropriate_ethics": "疑似不良价值观内容",
+    "inappropriate_profanity": "疑似攻击辱骂内容",
+    "inappropriate_oral": "疑似低俗口头语内容",
+    "inappropriate_superstition": "疑似封建迷信内容",
+    "inappropriate_nonsense": "疑似无意义灌水内容",
+    "pt_to_sites": "疑似站外引流",
+    "pt_by_recruitment": "疑似网赚兼职广告",
+    "pt_to_contact": "疑似引流广告号",
+    "religion_b": "疑似涉及佛教",
+    "religion_t": "疑似涉及道教",
+    "religion_c": "疑似涉及基督教",
+    "religion_i": "疑似涉及伊斯兰教",
+    "religion_h": "疑似涉及印度教",
+    "customized": "命中自定义词库",
+    "nonLabel": "内容正常", # 通常表示无风险
+    "normal": "内容正常" # 另一种表示无风险的标签
+    # 可以根据需要添加更多映射
+}
+
+def get_aliyun_label_chinese(label_value):
+    """获取阿里云审核标签的中文含义"""
+    return ALIYUN_LABEL_MAP.get(label_value, label_value) # 如果找不到映射，返回原始标签
+
+# 注册模板辅助函数
+app.jinja_env.globals.update(
+    task_status_display=task_status_display,
+    task_status_color=task_status_color,
+    get_partition_name=get_partition_name,
+    parse_json=parse_json,
+    get_aliyun_label_chinese=get_aliyun_label_chinese # 添加新的辅助函数
+)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    config = load_config()
+    # 如果密码保护未启用，或已登录，则重定向到首页
+    if not config.get('password_protection_enabled'):
+        return redirect(url_for('index'))
+    if 'logged_in' in session:
+        return redirect(url_for('index'))
+
+    # 读取登录安全状态
+    sec = _load_security_state()
+    now_ts = time.time()
+    # 检查是否处于锁定期
+    if sec.get('locked_until', 0) and now_ts < sec['locked_until']:
+        remaining = int(sec['locked_until'] - now_ts)
+        minutes = remaining // 60
+        seconds = remaining % 60
+        flash(f'登录已被临时锁定，请 {minutes} 分 {seconds} 秒后重试。', 'danger')
+        return render_template('login.html')
+
+    if request.method == 'POST':
+        password = request.form.get('password')
+        stored_password = config.get('password')
+
+        # 检查是否有设置密码
+        if not stored_password:
+            flash('系统尚未设置密码，无法登录。请在禁用密码保护的情况下，进入设置页面设置密码。', 'danger')
+            return render_template('login.html')
+
+        if password and password == stored_password:
+            session['logged_in'] = True
+            session.permanent = True  # session持久化
+            # 登录成功，重置失败计数与锁定
+            sec.update({'failed_attempts': 0, 'locked_until': 0, 'last_attempt': now_ts})
+            _save_security_state(sec)
+            _emit_login_event(
+                EVENT_LOGIN_SUCCESS,
+                {
+                    'ip_address': _get_request_ip_address(),
+                }
+            )
+            flash('登录成功', 'success')
+            return redirect(url_for('index'))
+        else:
+            # 密码错误，更新失败计数
+            max_attempts = int(config.get('LOGIN_MAX_FAILED_ATTEMPTS', 5) or 5)
+            lock_minutes = int(config.get('LOGIN_LOCKOUT_MINUTES', 15) or 15)
+            failed = int(sec.get('failed_attempts', 0) or 0) + 1
+            sec['failed_attempts'] = failed
+            sec['last_attempt'] = now_ts
+            # 达到阈值则锁定
+            if failed >= max_attempts:
+                sec['locked_until'] = now_ts + lock_minutes * 60
+                _save_security_state(sec)
+                _emit_login_event(
+                    EVENT_LOGIN_LOCKED,
+                    {
+                        'ip_address': _get_request_ip_address(),
+                        'failed_attempts': failed,
+                        'max_attempts': max_attempts,
+                        'lock_minutes': lock_minutes,
+                    }
+                )
+                flash(f'密码错误次数过多（{failed}/{max_attempts}），已锁定 {lock_minutes} 分钟。', 'danger')
+            else:
+                _save_security_state(sec)
+                remain = max_attempts - failed
+                flash(f'密码错误。还可尝试 {remain} 次后将被锁定。', 'danger')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('您已成功退出。', 'info')
+    return redirect(url_for('login'))
+
+@app.route('/')
+@login_required
+def index():
+    """首页"""
+    logger.info("访问首页")
+    # 统计信息用于仪表盘
+    try:
+        from modules.task_manager import get_db_connection
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # 本地时间的今日起止
+        now_local = datetime.now()
+        today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        fmt = "%Y-%m-%d %H:%M:%S"
+        start_str = today_start.strftime(fmt)
+        end_str = tomorrow_start.strftime(fmt)
+
+        # 各类计数
+        cur.execute("SELECT COUNT(*) FROM tasks")
+        total_tasks = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (TASK_STATES['AWAITING_REVIEW'],))
+        awaiting_review = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (TASK_STATES['FAILED'],))
+        failed_total = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (TASK_STATES['PENDING'],))
+        pending_total = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (TASK_STATES['READY_FOR_UPLOAD'],))
+        ready_total = cur.fetchone()[0] or 0
+
+        # 进行中的状态集合
+        processing_states = (
+            'fetching_info', 'info_fetched',
+            TASK_STATES['TRANSLATING'], TASK_STATES['TAGGING'], TASK_STATES['PARTITIONING'],
+            TASK_STATES['MODERATING'], TASK_STATES['DOWNLOADING'], TASK_STATES['DOWNLOADED'],
+            TASK_STATES['ASR_TRANSCRIBING'], TASK_STATES['TRANSLATING_SUBTITLE'],
+            TASK_STATES['ENCODING_VIDEO'], TASK_STATES['UPLOADING']
+        )
+        placeholders = ",".join(["?"] * len(processing_states))
+        cur.execute(f"SELECT COUNT(*) FROM tasks WHERE status IN ({placeholders})", processing_states)
+        in_progress = cur.fetchone()[0] or 0
+
+        # 今日完成/失败/新增任务
+        cur.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = ? AND updated_at >= ? AND updated_at < ?",
+            (TASK_STATES['COMPLETED'], start_str, end_str)
+        )
+        completed_today = cur.fetchone()[0] or 0
+
+        cur.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = ? AND updated_at >= ? AND updated_at < ?",
+            (TASK_STATES['FAILED'], start_str, end_str)
+        )
+        failed_today = cur.fetchone()[0] or 0
+
+        cur.execute(
+            "SELECT COUNT(*) FROM tasks WHERE created_at >= ? AND created_at < ?",
+            (start_str, end_str)
+        )
+        created_today = cur.fetchone()[0] or 0
+
+        # 最近任务（按更新时间倒序）
+        cur.execute(
+            "SELECT id, video_title_translated, video_title_original, status, updated_at, upload_target, acfun_upload_response, bilibili_upload_response FROM tasks ORDER BY updated_at DESC LIMIT 10"
+        )
+        rows = cur.fetchall()
+        recent_tasks = []
+        for r in rows:
+            upload_id = None
+            upload_target = (r[5] or 'acfun').lower()
+            try:
+                if upload_target == 'both':
+                    resp_b = json.loads(r[7]) if r[7] else None
+                    resp_a = json.loads(r[6]) if r[6] else None
+                    bv = resp_b.get('bvid') if isinstance(resp_b, dict) else None
+                    ac = resp_a.get('ac_number') if isinstance(resp_a, dict) else None
+                    if bv and ac:
+                        upload_id = f"{bv} / AC{ac}"
+                    elif bv:
+                        upload_id = bv
+                    elif ac:
+                        upload_id = f"AC{ac}"
+                elif upload_target == 'bilibili':
+                    resp = json.loads(r[7]) if r[7] else None
+                    if isinstance(resp, dict):
+                        upload_id = resp.get('bvid') or resp.get('aid')
+                else:
+                    resp = json.loads(r[6]) if r[6] else None
+                    if isinstance(resp, dict):
+                        upload_id = resp.get('ac_number')
+            except Exception:
+                upload_id = None
+            recent_tasks.append({
+                'id': r[0],
+                'title': r[1] or r[2] or '未获取标题',
+                'status': r[3],
+                'updated_at': r[4],
+                'upload_target': upload_target,
+                'upload_id': upload_id
+            })
+
+        conn.close()
+
+        # 今日失败原因汇总（TOP3，供首页一览）
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT error_message, COUNT(*) AS cnt FROM tasks "
+                "WHERE status = ? AND updated_at >= ? AND updated_at < ? "
+                "AND error_message IS NOT NULL AND error_message != '' "
+                "GROUP BY error_message ORDER BY cnt DESC LIMIT 3",
+                (TASK_STATES['FAILED'], start_str, end_str)
+            )
+            failure_summary = [
+                {'reason': (r[0] or '未知错误'), 'count': r[1]}
+                for r in cur.fetchall()
+            ]
+            conn.close()
+        except Exception:
+            failure_summary = []
+
+        attempted_today = completed_today + failed_today
+        success_rate_today = (
+            round(completed_today * 100.0 / attempted_today) if attempted_today else None
+        )
+
+        stats = {
+            'total_tasks': total_tasks,
+            'awaiting_review': awaiting_review,
+            'failed_total': failed_total,
+            'pending_total': pending_total,
+            'ready_total': ready_total,
+            'in_progress': in_progress,
+            'completed_today': completed_today,
+            'failed_today': failed_today,
+            'created_today': created_today,
+            'failure_summary': failure_summary,
+            'success_rate_today': success_rate_today
+        }
+    except Exception as e:
+        logger.warning(f"首页统计失败: {e}")
+        stats = {
+            'total_tasks': 0,
+            'awaiting_review': 0,
+            'failed_total': 0,
+            'pending_total': 0,
+            'ready_total': 0,
+            'in_progress': 0,
+            'completed_today': 0,
+            'failed_today': 0,
+            'created_today': 0,
+            'failure_summary': [],
+            'success_rate_today': None
+        }
+        recent_tasks = []
+
+    return render_template('index.html', stats=stats, recent_tasks=recent_tasks)
+
+@app.route('/tasks')
+@login_required
+def tasks():
+    """任务列表页面"""
+    logger.info("访问任务列表页面")
+    
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    
+    # 获取 URL 中的 status 参数
+    raw_status_filter = request.args.get('status', '')
+    status_filter = raw_status_filter
+    
+    # 定义"进行中"包含的所有子状态（与 task_manager.py 中的 PROCESSING_STATES 保持一致）
+    processing_states = (
+        'fetching_info,info_fetched,'
+        f"{TASK_STATES['TRANSLATING']},{TASK_STATES['TAGGING']},{TASK_STATES['PARTITIONING']},"
+        f"{TASK_STATES['MODERATING']},{TASK_STATES['DOWNLOADING']},{TASK_STATES['DOWNLOADED']},"
+        f"{TASK_STATES['ASR_TRANSCRIBING']},{TASK_STATES['TRANSLATING_SUBTITLE']},"
+        f"{TASK_STATES['ENCODING_VIDEO']},{TASK_STATES['UPLOADING']}"
+    )
+    
+    if status_filter == 'processing':
+        status_filter = processing_states
+
+    # 关键词搜索：标题/URL/任务ID/上传结果（AcFun、B站投稿响应）
+    search_keyword = (request.args.get('q') or '').strip()
+
+    # 传给分页函数
+    pagination_data = get_tasks_paginated(page=page, per_page=per_page, status=status_filter, search=search_keyword)
+    
+    # 获取分区映射
+    acfun_partition_mapping = _load_acfun_partition_mapping()
+    bilibili_partition_mapping = _build_bilibili_partition_mapping()
+    
+    # 构建筛选下拉框选项
+    # 注：不单列「上传中」——它包含在「进行中」里，避免筛选内容重复
+    status_options = [
+        {'value': '', 'label': '全部任务'},
+        {'value': TASK_STATES['PENDING'], 'label': '等待处理'},
+        {'value': TASK_STATES['READY_FOR_UPLOAD'], 'label': '准备上传'},
+        {'value': 'processing', 'label': '进行中（含上传中）'},
+        {'value': TASK_STATES['AWAITING_REVIEW'], 'label': '等待人工审核'},
+        {'value': TASK_STATES['COMPLETED'], 'label': '已完成'},
+        {'value': TASK_STATES['FAILED'], 'label': '失败'},
+    ]
+    
+    # 处理显示：如果 URL 里是一长串状态，映射回 'processing' 以便下拉框能选中
+    display_status = raw_status_filter
+    if raw_status_filter == processing_states:
+        display_status = 'processing'
+        
+    # 兼容自定义的 URL 筛选参数
+    if display_status and not any(opt['value'] == display_status for opt in status_options):
+        status_options.append({'value': display_status, 'label': f'自定义: {display_status}'})
+
+    return render_template(
+        'tasks.html', 
+        tasks=pagination_data['tasks'],
+        pagination=pagination_data,
+        config=config,
+        current_status_filter=display_status,
+        status_options=status_options,
+        current_search=search_keyword,
+        acfun_partition_mapping=acfun_partition_mapping,
+        bilibili_partition_mapping=bilibili_partition_mapping
+    )
+
+
+def _render_task_fragments(task: dict, config: dict | None = None) -> dict:
+    if config is None:
+        config = load_config()
+
+    return {
+        'task_id': task.get('id'),
+        'row_html': render_template('partials/task_row.html', task=task, config=config),
+        'card_html': render_template('partials/task_card.html', task=task, config=config),
+    }
+
+
+@app.route('/tasks/<task_id>/fragment')
+@login_required
+def task_fragment(task_id):
+    """返回单个任务的桌面/移动端片段 HTML。"""
+    task = get_task(task_id)
+    if not task:
+        return jsonify({'success': False, 'message': '任务不存在'}), 404
+
+    config = load_config()
+    return jsonify({
+        'success': True,
+        **_render_task_fragments(task, config)
+    })
+
+
+def _missing_upload_partition_labels(task, config):
+    upload_target = str(task.get('upload_target') or 'acfun').lower()
+    recommend_enabled = str(config.get('RECOMMEND_PARTITION', False)).strip().lower() in ('true', '1', 'on', 'yes')
+    missing = []
+
+    if upload_target in ('acfun', 'both'):
+        fixed_acfun_pid = str(config.get('FIXED_PARTITION_ID', '') or '').strip()
+        acfun_partition = str(
+            task.get('selected_partition_id_acfun')
+            or task.get('recommended_partition_id_acfun')
+            or task.get('selected_partition_id')
+            or task.get('recommended_partition_id')
+            or ''
+        ).strip()
+        if not fixed_acfun_pid and not acfun_partition and not recommend_enabled:
+            missing.append('AcFun 分区')
+
+    if upload_target in ('bilibili', 'both'):
+        fixed_bili_pid = str(config.get('FIXED_PARTITION_ID_BILIBILI', '') or '').strip()
+        bili_partition = str(
+            task.get('selected_partition_id_bilibili')
+            or task.get('recommended_partition_id_bilibili')
+            or task.get('selected_partition_id')
+            or task.get('recommended_partition_id')
+            or ''
+        ).strip()
+        if not fixed_bili_pid and not bili_partition and not recommend_enabled:
+            missing.append('bilibili 分区')
+
+    return missing
+
+
+# 上传重试相关：只对网络类超时/连接错误重试，避免把业务错误（比如分区非法、
+# 标题超长、Cookie 失效）也当成可重试项而反复触发。判断基于小写后的错误文本，
+# 只做字符串包含匹配，不做正则分类——以免把用户可见的错误消息格式变更（比如
+# 本地化文案）也波及到重试逻辑。
+_UPLOAD_RETRYABLE_KEYWORDS = (
+    'timeout',
+    'timed out',
+    'curl: (28)',      # Operation timed out
+    'curl: (35)',      # SSL connect error
+    'curl: (56)',      # Recv failure: Connection reset by peer
+    'connection reset',
+    'connection aborted',
+    'connection refused',
+    'broken pipe',
+    'temporarily unavailable',
+    'read timed out',
+    'connect timeout',
+    'network is unreachable',
+    'eof occurred',
+    'ssl',
+)
+
+
+def _is_retryable_upload_error(error_text) -> bool:
+    text = str(error_text or '').lower()
+    if not text:
+        return False
+    return any(k in text for k in _UPLOAD_RETRYABLE_KEYWORDS)
+
+
+def _force_upload_with_retry(task_id, config, max_retries=3, base_delay=5):
+    """带重试的强制上传。
+
+    设计取舍：
+    - 只在异常或错误消息命中网络类关键词时重试；业务失败（例如分区非法）立即返回。
+    - 每次重试前检查任务是否已被用户取消，避免"用户已停止但后台又悄悄传上去"。
+    - 指数退避（5s / 10s / 20s），总耗时上限可控；上传大文件时依赖的是外层
+      "分片重传"能力，这里只是兜底一次整体重试。
+    - 不清除任务的 error_message——保留最近一次失败原因，便于用户排查。
+    """
+    from modules.task_manager import is_task_cancel_requested
+
+    last_error_text = ''
+
+    for attempt in range(max_retries):
+        if is_task_cancel_requested(task_id):
+            logger.info(f"任务 {task_id} 已被用户取消，跳过上传（第 {attempt+1}/{max_retries} 次前检查）")
+            return False
+
+        try:
+            success = force_upload_task(task_id, config)
+            if success:
+                return True
+            # 返回 False：读一次最新 error_message 判断是否值得重试
+            latest = get_task(task_id) or {}
+            last_error_text = str(latest.get('error_message') or '')
+            if not _is_retryable_upload_error(last_error_text) or attempt >= max_retries - 1:
+                if last_error_text:
+                    logger.error(f"任务 {task_id} 上传失败（不可重试或已达上限，第 {attempt+1}/{max_retries} 次）: {last_error_text}")
+                return False
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                f"任务 {task_id} 上传失败（第 {attempt+1}/{max_retries} 次，可重试），"
+                f"{delay}s 后重试: {last_error_text}"
+            )
+            time.sleep(delay)
+        except Exception as exc:
+            last_error_text = str(exc)
+            if not _is_retryable_upload_error(last_error_text) or attempt >= max_retries - 1:
+                logger.error(f"任务 {task_id} 上传异常（不可重试或已达上限，第 {attempt+1}/{max_retries} 次）: {exc}")
+                return False
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                f"任务 {task_id} 上传异常（第 {attempt+1}/{max_retries} 次，可重试），"
+                f"{delay}s 后重试: {exc}"
+            )
+            time.sleep(delay)
+
+    return False
+
+
+def _start_background_force_upload(task_id, config, platform_name):
+    logger.info(f"开始后台强制上传任务 {task_id} 到{platform_name}")
+
+    def background_force_upload():
+        try:
+            success = _force_upload_with_retry(task_id, config)
+            if success:
+                logger.info(f"任务 {task_id} 后台强制上传成功")
+            else:
+                logger.error(f"任务 {task_id} 后台强制上传失败（已包含重试）")
+        except Exception as e:
+            logger.error(f"任务 {task_id} 后台强制上传出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    upload_thread = threading.Thread(target=background_force_upload, daemon=True)
+    upload_thread.start()
+    
+@app.route('/tasks/stream')
+@login_required
+def tasks_event_stream():
+    """Server-Sent Events stream for realtime task updates."""
+
+    def generate():
+        listener = register_task_updates_listener()
+        try:
+            yield 'data: {"type":"welcome"}\n\n'
+            while True:
+                try:
+                    event = listener.get(timeout=10)  # 减少心跳间隔到 10 秒
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                except Empty:
+                    yield 'data: {"type":"heartbeat"}\n\n'
+        except GeneratorExit:
+            pass
+        finally:
+            unregister_task_updates_listener(listener)
+
+    response = Response(stream_with_context(generate()), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['Connection'] = 'keep-alive'
+    response.headers['Transfer-Encoding'] = 'chunked'
+    return response
+
+@app.route('/manual_review')
+@login_required
+def manual_review():
+    """人工审核列表页面"""
+    logger.info("访问人工审核列表页面")
+    review_tasks = get_tasks_by_status(TASK_STATES['AWAITING_REVIEW'])
+    for task in review_tasks:
+        task['can_retry_translation'] = is_metadata_translation_retryable(task)
+    
+    # 封面图片现在直接从downloads目录提供
+    
+    return render_template('manual_review.html', tasks=review_tasks)
+
+def _resolve_edit_task_action(form):
+    """从多值同名 action 表单中解析实际要执行的动作。
+
+    优先级：force_upload > 其它显式提交的 action > default_action（save_metadata）。
+    升级前已打开/被缓存的旧页面会同时提交 action=save_metadata 与 action=force_upload，
+    二者按 DOM 顺序提交后 Werkzeug 仍保留两个值；这里显式优先识别 force_upload，
+    避免点击「上传到 Bilibili」却只走保存。
+    """
+    _submitted = [a.strip().lower() for a in form.getlist('action') if a and a.strip()]
+    if 'force_upload' in _submitted:
+        return 'force_upload'
+    if _submitted:
+        return _submitted[0]
+    _default = form.get('default_action') or 'save_metadata'
+    return (_default or 'save_metadata').strip().lower()
+
+
+@app.route('/tasks/<task_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_task(task_id):
+    """任务编辑页面"""
+    task = get_task(task_id)
+    
+    if not task:
+        flash('任务不存在', 'danger')
+        return redirect(url_for('tasks'))
+    
+    if request.method == 'POST':
+        # 主表单的隐藏字段已改名 default_action（避免与上传按钮的同名 action 冲突）。
+        # 多值同名 action 时显式优先匹配 force_upload（而非取 DOM 顺序第一个）。
+        action = _resolve_edit_task_action(request.form)
+        redirect_target = url_for('edit_task', task_id=task_id)
+
+        if action == 'replace_cover':
+            try:
+                cover_file = request.files.get('cover_file')
+                _replace_task_cover(task, cover_file)
+                flash('任务封面已更新。', 'success')
+            except Exception as e:
+                logger.warning(f"替换任务 {task_id} 封面失败: {e}")
+                flash(f'更换封面失败: {e}', 'danger')
+            return redirect(redirect_target)
+
+        if action == 'restore_cover':
+            try:
+                _restore_task_cover(task)
+                flash('已恢复原始封面。', 'success')
+            except Exception as e:
+                logger.warning(f"恢复任务 {task_id} 原始封面失败: {e}")
+                flash(f'恢复原封面失败: {e}', 'danger')
+            return redirect(redirect_target)
+
+        upload_target = str(task.get('upload_target') or 'acfun').lower()
+        # 处理表单提交
+        video_title = request.form.get('video_title_translated', '')
+        description = request.form.get('description_translated', '')
+        legacy_partition_id = request.form.get('selected_partition_id', '')
+        partition_id_acfun = request.form.get('selected_partition_id_acfun', '')
+        partition_id_bilibili = request.form.get('selected_partition_id_bilibili', '')
+        tags_json = request.form.get('tags_json', '[]')
+
+        if upload_target == 'both':
+            partition_id_acfun = partition_id_acfun or legacy_partition_id
+            partition_id_bilibili = partition_id_bilibili or legacy_partition_id
+        elif upload_target == 'bilibili':
+            partition_id_bilibili = partition_id_bilibili or legacy_partition_id
+        else:
+            partition_id_acfun = partition_id_acfun or legacy_partition_id
+        # 更新任务信息
+        update_data = {
+            'video_title_translated': video_title,
+            'description_translated': description,
+            'selected_partition_id_acfun': partition_id_acfun,
+            'selected_partition_id_bilibili': partition_id_bilibili,
+            'tags_generated': tags_json,
+            'error_message': None,
+            'error_category': None,
+        }
+
+        # 只有在安全状态下才允许设置为可上传状态，避免与正在处理的任务产生竞态条件
+        safe_states_to_make_uploadable = [
+            TASK_STATES['DOWNLOADED'],        # 已下载，可以上传
+            TASK_STATES['MODERATING'],        # 审核中，可以手动干预
+            TASK_STATES['AWAITING_REVIEW'],   # 等待人工审核
+            TASK_STATES['FAILED'],            # 失败状态，可以重试
+            TASK_STATES['UPLOADING']          # 允许重置卡住的上传状态
+        ]
+        
+        if task['status'] in safe_states_to_make_uploadable:
+            update_data['status'] = TASK_STATES['READY_FOR_UPLOAD']
+        
+        try:
+            # 确保silent参数是布尔类型
+            final_update_data = update_data.copy()
+            silent_param = False  # 默认值
+            
+            if 'silent' in final_update_data:
+                if isinstance(final_update_data['silent'], str):
+                    silent_param = final_update_data['silent'].lower() in ('true', 'yes', '1', 'on')
+                elif isinstance(final_update_data['silent'], bool):
+                    silent_param = final_update_data['silent']
+                # 从final_update_data中移除silent，避免重复传递
+                final_update_data.pop('silent')
+            
+            update_task(task_id, silent=silent_param, **final_update_data)
+        except Exception as e:
+            logger.warning(f"update_task调用失败: {e}")
+        logger.info(f"任务 {task_id} 信息已更新")
+        updated_task = get_task(task_id)
+        if action == 'force_upload':
+            config = load_config()
+            upload_target = str((updated_task or task).get('upload_target') or 'acfun').lower()
+            platform_name = '双平台' if upload_target == 'both' else ('bilibili' if upload_target == 'bilibili' else 'AcFun')
+            missing_partitions = _missing_upload_partition_labels(updated_task or task, config)
+            if missing_partitions:
+                flash(f'请先选择{ "、".join(missing_partitions) }，或开启分区推荐后再继续上传。', 'danger')
+                return redirect(redirect_target)
+
+            _start_background_force_upload(task_id, config, platform_name)
+            flash(f'已保存当前修改，并启动强制上传到{platform_name}，正在后台处理...', 'info')
+            return redirect(url_for('manual_review'))
+
+        if updated_task and updated_task['status'] == TASK_STATES['READY_FOR_UPLOAD']:
+            flash('任务已保存，当前可单独执行上传。', 'success')
+        else:
+            flash('任务已保存。', 'success')
+
+        return redirect(redirect_target)
+    
+    # GET请求，显示编辑页面
+    # 封面图片现在直接从downloads目录提供
+    upload_target = str(task.get('upload_target') or 'acfun').lower()
+    acfun_id_mapping = _load_acfun_partition_mapping()
+    bilibili_id_mapping = _build_bilibili_partition_mapping()
+    id_mapping = bilibili_id_mapping if upload_target == 'bilibili' else acfun_id_mapping
+    
+    # 准备标签字符串
+    tags_string = ""
+    if task.get('tags_generated'):
+        try:
+            tags = json.loads(task['tags_generated'])
+            tags_string = ", ".join(tags)
+        except Exception as e:
+            logger.error(f"解析标签JSON失败: {str(e)}")
+    
+    # 获取当前配置
+    config = load_config()
+    can_upload = task['status'] in [
+        TASK_STATES['COMPLETED'],
+        TASK_STATES['PENDING'],
+        TASK_STATES['READY_FOR_UPLOAD'],
+        TASK_STATES['AWAITING_REVIEW']
+    ]
+    has_original_cover_backup = False
+    has_cover_preview = False
+    is_custom_cover_active = False
+    current_cover_filename = ''
+    try:
+        task_dir_real = _get_task_dir_real(task_id)
+        has_original_cover_backup = bool(os.path.isdir(task_dir_real) and _find_original_cover_backup(task_dir_real))
+        active_cover_path = _get_current_cover_path(task, task_dir_real) if os.path.isdir(task_dir_real) else ''
+        has_cover_preview = bool(active_cover_path)
+        current_cover_filename = os.path.basename(active_cover_path) if active_cover_path else ''
+        is_custom_cover_active = current_cover_filename.startswith('custom_cover.')
+    except Exception:
+        has_original_cover_backup = False
+        has_cover_preview = bool(task.get('cover_path_local'))
+        is_custom_cover_active = False
+        current_cover_filename = os.path.basename(str(task.get('cover_path_local') or ''))
+    
+    return render_template(
+        'edit_task.html', 
+        task=task, 
+        id_mapping=id_mapping, 
+        acfun_id_mapping=acfun_id_mapping,
+        bilibili_id_mapping=bilibili_id_mapping,
+        tags_string=tags_string,
+        config=config,
+        upload_target=upload_target,
+        can_upload=can_upload,
+        has_cover_preview=has_cover_preview,
+        has_original_cover_backup=has_original_cover_backup,
+        is_custom_cover_active=is_custom_cover_active,
+        current_cover_filename=current_cover_filename
+    )
+
+@app.route('/tasks/<task_id>/cover')
+@login_required
+def get_task_cover(task_id):
+    """获取任务封面图片"""
+    task = get_task(task_id)
+    
+    if not task:
+        # 返回默认图片或404
+        return '', 404
+    
+    try:
+        task_dir_real = _get_task_dir_real(task_id)
+    except (ValueError, OSError):
+        return '', 404
+
+    cover_path = _get_current_cover_path(task, task_dir_real)
+    if cover_path and os.path.exists(cover_path):
+        mime_type, _ = mimetypes.guess_type(cover_path)
+        return send_file(cover_path, mimetype=mime_type)
+    
+    # 没有找到封面
+    return '', 404
+
+@app.route('/tasks/<task_id>/review')
+@login_required
+def review_task(task_id):
+    """重定向到任务编辑页面"""
+    return redirect(url_for('edit_task', task_id=task_id))
+
+@app.route('/tasks/add_via_extension', methods=['POST', 'OPTIONS'])
+@tgbot_upload_token_required
+def add_task_via_extension():
+    """
+    通过浏览器扩展或API添加任务 (JSON格式)
+    支持Telegram Bot、浏览器扩展等外部服务调用
+    """
+    # 处理CORS预检请求
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        # 优先从JSON获取，兼容form表单
+        if request.is_json:
+            data = request.get_json()
+            youtube_url = data.get('youtube_url') if data else None
+            upload_target = data.get('upload_target') if data else None
+        else:
+            youtube_url = request.form.get('youtube_url')
+            upload_target = request.form.get('upload_target')
+
+        if not youtube_url:
+            return jsonify({'success': False, 'message': 'YouTube URL不能为空'}), 400
+
+        config = load_config()
+        if not upload_target:
+            upload_target = config.get('UPLOAD_TARGET_DEFAULT', 'acfun')
+        else:
+            upload_target = str(upload_target).strip().lower()
+
+        if upload_target not in ('acfun', 'bilibili', 'both'):
+            return jsonify({'success': False, 'message': '无效的投稿平台参数'}), 400
+        
+        # 判断是否为播放列表URL
+        if 'youtube.com/playlist' in youtube_url or 'youtu.be/playlist' in youtube_url:
+            # 提取所有视频URL
+            cookies_path = config.get('YOUTUBE_COOKIES_PATH')
+            video_urls = extract_video_urls_from_playlist(youtube_url, cookies_path)
+            if not video_urls:
+                return jsonify({'success': False, 'message': '未能提取到播放列表中的视频'}), 400
+            
+            added_count = 0
+            task_ids = []
+            for url in video_urls:
+                task_id = add_task(url, upload_target=upload_target)
+                if task_id:
+                    added_count += 1
+                    task_ids.append(task_id)
+                    # 自动模式下启动任务
+                    if config.get('AUTO_MODE_ENABLED', False):
+                        start_task(task_id, config)
+            
+            return jsonify({
+                'success': True,
+                'message': f'已批量添加 {added_count} 个视频任务（来自播放列表）',
+                'task_ids': task_ids,
+                'count': added_count
+            }), 200
+        else:
+            # 单个视频
+            task_id = add_task(youtube_url, upload_target=upload_target)
+            if task_id:
+                if config.get('AUTO_MODE_ENABLED', False):
+                    logger.info(f"自动模式已启用，立即开始处理任务 {task_id}")
+                    start_task(task_id, config)
+                    return jsonify({
+                        'success': True,
+                        'message': f'任务已添加并开始处理',
+                        'task_id': task_id
+                    }), 200
+                else:
+                    return jsonify({
+                        'success': True,
+                        'message': '任务已添加',
+                        'task_id': task_id
+                    }), 200
+            else:
+                return jsonify({'success': False, 'message': '添加任务失败'}), 500
+                
+    except Exception as e:
+        logger.error(f"通过扩展添加任务失败: {str(e)}")
+        return jsonify({'success': False, 'message': '服务器内部错误，请稍后重试'}), 500
+
+@app.route('/tasks/add', methods=['POST'])
+@login_required
+def add_task_route():
+    """添加新任务，支持播放列表批量添加"""
+    youtube_url = request.form.get('youtube_url')
+    upload_target = request.form.get('upload_target')
+    
+    if not youtube_url:
+        flash('YouTube URL不能为空', 'danger')
+        return redirect(url_for('tasks'))
+
+    config = load_config()
+    if not upload_target:
+        upload_target = config.get('UPLOAD_TARGET_DEFAULT', 'acfun')
+
+    # 判断是否为播放列表URL
+    if 'youtube.com/playlist' in youtube_url or 'youtu.be/playlist' in youtube_url:
+        # 提取所有视频URL
+        cookies_path = config.get('YOUTUBE_COOKIES_PATH')
+        video_urls = extract_video_urls_from_playlist(youtube_url, cookies_path)
+        if not video_urls:
+            flash('未能提取到播放列表中的视频', 'danger')
+            return redirect(url_for('tasks'))
+        added_count = 0
+        for url in video_urls:
+            task_id = add_task(url, upload_target=upload_target)
+            if task_id:
+                added_count += 1
+        flash(f'已批量添加 {added_count} 个视频任务（来自播放列表）', 'success')
+        return redirect(url_for('tasks'))
+    else:
+        task_id = add_task(youtube_url, upload_target=upload_target)
+        if task_id:
+            if config.get('AUTO_MODE_ENABLED', False):
+                logger.info(f"自动模式已启用，立即开始处理任务 {task_id}")
+                start_task(task_id, config)
+                flash(f'任务已添加并开始处理: {youtube_url}', 'success')
+            else:
+                flash(f'任务已添加: {youtube_url}', 'success')
+        else:
+            flash(f'添加任务失败: {youtube_url}', 'danger')
+        return redirect(url_for('tasks'))
+
+def _back_to_tasks():
+    """操作后回到来源页：保留任务列表当前的筛选/搜索/页码（status、q、page）。"""
+    ref = request.referrer
+    if ref and '/tasks' in ref:
+        return redirect(ref)
+    return redirect(url_for('tasks'))
+
+
+@app.route('/tasks/<task_id>/start', methods=['POST'])
+@login_required
+def start_task_route(task_id):
+    """开始处理任务"""
+    task = get_task(task_id)
+    
+    if not task:
+        flash('任务不存在', 'danger')
+        return _back_to_tasks()
+    
+    if task['status'] not in [TASK_STATES['PENDING'], TASK_STATES['FAILED']]:
+        flash(f'当前任务状态为 {task_status_display(task["status"])}，不能启动', 'warning')
+        return _back_to_tasks()
+    
+    # 已有活动线程（可能在排队等待上传配额）时直接提示，避免重复点击被静默忽略
+    if is_task_active(task_id):
+        flash('该任务已在处理中（可能正在排队等待上传配额），请勿重复点击，稍候刷新页面查看进度', 'warning')
+        return _back_to_tasks()
+    
+    # 清除历史上可能残留的取消标记，避免刚点“开始”又被立刻取消
+    try:
+        from modules.task_manager import clear_task_cancel
+        clear_task_cancel(task_id)
+    except Exception as exc:
+        logger.debug(f"清除任务 {task_id} 的取消标记失败: {exc}")
+
+    # 获取当前配置
+    config = load_config()
+    
+    # 启动任务处理
+    success = start_task(task_id, config)
+    
+    if success:
+        # 检查是否是自动模式
+        if config.get('AUTO_MODE_ENABLED', False):
+            flash('任务已启动，自动模式将会自动完成下载、处理和上传', 'info')
+            
+            # 使用传统页面刷新方式
+        else:
+            flash('任务处理已启动', 'success')
+    else:
+        flash('启动任务处理失败', 'danger')
+    
+    return _back_to_tasks()
+
+@app.route('/tasks/<task_id>/delete', methods=['POST'])
+@login_required
+def delete_task_route(task_id):
+    """删除任务"""
+    delete_files = request.form.get('delete_files', 'true').lower() in ('true', 'yes', '1', 'on')
+    
+    success = delete_task(task_id, delete_files)
+    
+    if success:
+        flash('任务已删除', 'success')
+    else:
+        flash('删除任务失败', 'danger')
+    
+    return redirect(url_for('tasks'))
+
+# ==================== 批量上传队列（并发数 = 设置里的「最大并发上传数」） ====================
+_BATCH_UPLOAD_QUEUE = Queue()
+_BATCH_UPLOAD_WORKERS = 0
+_BATCH_UPLOAD_LOCK = threading.Lock()
+_BATCH_UPLOAD_MAX_WORKERS = 10  # 兜底上限，防止设置被填成离谱的大数
+
+
+def _resolve_upload_concurrency_limit(config=None):
+    """读取「最大并发上传数」。
+
+    设置位置：设置 → 运维与安全 → 资源控制 → 最大并发上传数（MAX_CONCURRENT_UPLOADS）。
+    优先用本次保存后的配置，取不到再回落到 config.json。
+    """
+    value = None
+    try:
+        if isinstance(config, dict):
+            value = config.get('MAX_CONCURRENT_UPLOADS')
+        if value in (None, ''):
+            value = load_config().get('MAX_CONCURRENT_UPLOADS')
+    except Exception:
+        value = None
+    try:
+        return min(_BATCH_UPLOAD_MAX_WORKERS, max(1, int(value)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _batch_upload_worker():
+    """批量上传工作线程：取一个任务 → 占一个上传配额 → 全流程执行。"""
+    from modules.task_manager import upload_slot
+    while True:
+        tid = _BATCH_UPLOAD_QUEUE.get()
+        if tid is None:
+            _BATCH_UPLOAD_QUEUE.task_done()
+            return
+        try:
+            with upload_slot(f"批量任务 {str(tid)[:8]}"):
+                logger.info(f"批量上传: 开始处理任务 {tid}")
+                _force_upload_with_retry(tid, load_config())
+        except Exception as e:
+            logger.error(f"批量上传: 任务 {tid} 失败: {e}")
+        finally:
+            _BATCH_UPLOAD_QUEUE.task_done()
+
+
+def _ensure_batch_upload_workers(count):
+    """按当前「最大并发上传数」补足工作线程数量。"""
+    global _BATCH_UPLOAD_WORKERS
+    with _BATCH_UPLOAD_LOCK:
+        need = min(_BATCH_UPLOAD_MAX_WORKERS, max(1, int(count or 1)))
+        while _BATCH_UPLOAD_WORKERS < need:
+            _BATCH_UPLOAD_WORKERS += 1
+            worker = threading.Thread(
+                target=_batch_upload_worker,
+                daemon=True,
+                name=f'batch-upload-worker-{_BATCH_UPLOAD_WORKERS}',
+            )
+            worker.start()
+        logger.info(
+            f"批量上传队列就绪：工作线程 {_BATCH_UPLOAD_WORKERS} 个，"
+            f"当前并发上限 {need}，队列长度 {_BATCH_UPLOAD_QUEUE.qsize()}"
+        )
+        return _BATCH_UPLOAD_WORKERS
+
+
+@app.route('/tasks/batch_upload', methods=['POST'])
+@login_required
+def batch_upload_tasks_route():
+    """批量上传任务（在后台队列中依次执行）。
+
+    可选参数 upload_target: 'bilibili' / 'acfun' / 'both'，
+    提供时会先把每个任务的投稿目标覆盖为该值，再校验分区并入队。
+    """
+    data = request.get_json() or {}
+    task_ids = data.get('task_ids', [])
+    upload_target = str(data.get('upload_target') or '').strip().lower()
+    if upload_target and upload_target not in ('acfun', 'bilibili', 'both'):
+        return jsonify({'success': False, 'message': f'无效的上传目标: {upload_target}'}), 400
+
+    if not task_ids:
+        return jsonify({'success': False, 'message': '未选择任何任务'}), 400
+
+    config = load_config()
+    valid_tasks = []
+
+    # 校验哪些任务处于可上传状态
+    for task_id in task_ids:
+        task = get_task(task_id)
+        if not task:
+            continue
+        if task['status'] not in [TASK_STATES['READY_FOR_UPLOAD'], TASK_STATES['AWAITING_REVIEW'], TASK_STATES['COMPLETED'], TASK_STATES['FAILED']]:
+            continue
+        # 指定了目标平台时，先覆盖投稿目标，再按新目标校验分区
+        if upload_target:
+            update_task(task_id, upload_target=upload_target, silent=True)
+            task = get_task(task_id)
+        # 检查是否有未设置的分区
+        missing = _missing_upload_partition_labels(task, config)
+        if not missing:
+            valid_tasks.append(task_id)
+
+    if not valid_tasks:
+        return jsonify({'success': False, 'message': '选中的任务中没有可上传的任务（或缺少分区设置）'}), 400
+
+    # 读取设置 → 运维与安全 → 资源控制 → 最大并发上传数
+    concurrency_limit = _resolve_upload_concurrency_limit(config)
+
+    # 入队（由后台工作线程按并发上限逐个取出执行）
+    for tid in valid_tasks:
+        _BATCH_UPLOAD_QUEUE.put(tid)
+    _ensure_batch_upload_workers(concurrency_limit)
+
+    msg = f'已将 {len(valid_tasks)} 个任务加入后台上传队列（并发上限 {concurrency_limit}）'
+    if upload_target:
+        msg += f'（投稿目标已改为 {upload_target}）'
+    return jsonify({
+        'success': True,
+        'message': msg
+    })
+
+
+@app.route('/tasks/batch_update', methods=['POST'])
+@login_required
+def batch_update_tasks_route():
+    """批量修改任务信息（标题/简介/标签），仅覆盖请求中提供的非空字段。"""
+    import json as _json
+
+    data = request.get_json() or {}
+    task_ids = data.get('task_ids', [])
+    if not task_ids:
+        return jsonify({'success': False, 'message': '未选择任何任务'}), 400
+
+    update_data = {}
+    title = str(data.get('title') or '').strip()
+    description = str(data.get('description') or '').strip()
+    tags_raw = str(data.get('tags') or '').strip()
+
+    if title:
+        update_data['video_title_translated'] = title
+    if description:
+        update_data['description_translated'] = description
+    if tags_raw:
+        tags = [t.strip() for t in tags_raw.replace('，', ',').replace('、', ',').split(',') if t.strip()]
+        if not tags:
+            return jsonify({'success': False, 'message': '标签格式不正确'}), 400
+        if len(tags) > 10:
+            return jsonify({'success': False, 'message': '标签最多 10 个'}), 400
+        if any(len(t) > 20 for t in tags):
+            return jsonify({'success': False, 'message': '存在超过 20 字符的标签'}), 400
+        update_data['tags_generated'] = _json.dumps(tags, ensure_ascii=False)
+
+    if not update_data:
+        return jsonify({'success': False, 'message': '没有需要修改的字段'}), 400
+
+    success_count = 0
+    for task_id in task_ids:
+        if get_task(task_id):
+            update_task(task_id, silent=True, **update_data)
+            success_count += 1
+
+    return jsonify({
+        'success': True,
+        'message': f'成功修改 {success_count} 个任务（字段: {", ".join(update_data.keys())}）'
+    })
+
+
+@app.route('/tasks/batch_approve', methods=['POST'])
+@login_required
+def batch_approve_tasks_route():
+    """批量审核任务（将待审核改为准备上传）"""
+    data = request.get_json() or {}
+    task_ids = data.get('task_ids', [])
+    if not task_ids:
+        return jsonify({'success': False, 'message': '未选择任何任务'}), 400
+
+    success_count = 0
+    for task_id in task_ids:
+        task = get_task(task_id)
+        # 仅对待审核状态的任务进行操作
+        if task and task['status'] == TASK_STATES['AWAITING_REVIEW']:
+            update_task(task_id, status=TASK_STATES['READY_FOR_UPLOAD'], silent=True)
+            success_count += 1
+
+    return jsonify({'success': True, 'message': f'成功审核 {success_count} 个任务'})
+
+@app.route('/tasks/batch_partition', methods=['POST'])
+@login_required
+def batch_partition_tasks_route():
+    """批量设置分区"""
+    data = request.get_json() or {}
+    task_ids = data.get('task_ids', [])
+    acfun_pid = data.get('acfun_pid', '')
+    bilibili_pid = data.get('bilibili_pid', '')
+    
+    if not task_ids:
+        return jsonify({'success': False, 'message': '未选择任何任务'}), 400
+        
+    success_count = 0
+    for task_id in task_ids:
+        task = get_task(task_id)
+        if not task:
+            continue
+            
+        upload_target = str(task.get('upload_target') or 'acfun').lower()
+        update_data = {}
+        
+        if upload_target in ('acfun', 'both') and acfun_pid:
+            update_data['selected_partition_id_acfun'] = acfun_pid
+            update_data['selected_partition_id'] = acfun_pid # 兼容旧字段
+            
+        if upload_target in ('bilibili', 'both') and bilibili_pid:
+            update_data['selected_partition_id_bilibili'] = bilibili_pid
+            if upload_target == 'bilibili':
+                update_data['selected_partition_id'] = bilibili_pid # 兼容旧字段
+                
+        if update_data:
+            update_task(task_id, silent=True, **update_data)
+            success_count += 1
+            
+    return jsonify({'success': True, 'message': f'成功为 {success_count} 个任务设置了分区'})
+
+
+@app.route('/tasks/batch_stop', methods=['POST'])
+@login_required
+def batch_stop_tasks_route():
+    """批量停止“准备上传/上传中”任务。
+
+    与单任务 /tasks/<id>/stop 一致的语义：请求取消 + 尝试 terminate 正在跑的
+    subprocess + 把状态置为 FAILED。只对白名单内的状态生效，避免误伤已完成/
+    待审核/下载中等任务。具体能否真正中断取决于 task_manager 是否在关键循环
+    里调用了 raise_if_cancelled——详见 modules/task_manager.py 的改动建议。
+    """
+    data = request.get_json() or {}
+    task_ids = data.get('task_ids', [])
+    if not task_ids:
+        return jsonify({'success': False, 'message': '未选择任何任务'}), 400
+
+    from modules.task_manager import request_task_cancel, terminate_active_process
+
+    stoppable_states = {
+        TASK_STATES['READY_FOR_UPLOAD'],
+        TASK_STATES['UPLOADING'],
+    }
+
+    stopped_count = 0
+    skipped_count = 0
+    missing_count = 0
+    terminated_count = 0
+
+    for task_id in task_ids:
+        task = get_task(task_id)
+        if not task:
+            missing_count += 1
+            continue
+        if task['status'] not in stoppable_states:
+            skipped_count += 1
+            continue
+
+        # 1) 打取消标记——后台循环在下一个检查点会读到并退出
+        request_task_cancel(task_id)
+        # 2) 若 subprocess（yt-dlp/ffmpeg）正在跑，直接 terminate
+        if terminate_active_process(task_id):
+            terminated_count += 1
+        # 3) 更新数据库状态，让 UI 立刻反映
+        update_task(
+            task_id,
+            status=TASK_STATES['FAILED'],
+            error_message="用户主动停止任务"
+        )
+        stopped_count += 1
+        logger.info(f"批量停止：任务 {task_id} 已请求取消（原状态 {task['status']}）")
+
+    if stopped_count == 0:
+        detail = []
+        if skipped_count:
+            detail.append(f'{skipped_count} 个状态不符合')
+        if missing_count:
+            detail.append(f'{missing_count} 个任务不存在')
+        suffix = f'（{"，".join(detail)}）' if detail else ''
+        return jsonify({
+            'success': False,
+            'message': f'选中的任务中没有“准备上传/上传中”状态的任务{suffix}'
+        }), 400
+
+    msg = f'已停止 {stopped_count} 个任务'
+    if terminated_count:
+        msg += f'，其中 {terminated_count} 个 subprocess 已终止'
+    extras = []
+    if skipped_count:
+        extras.append(f'跳过 {skipped_count} 个非目标状态')
+    if missing_count:
+        extras.append(f'{missing_count} 个任务不存在')
+    if extras:
+        msg += f'（{"，".join(extras)}）'
+
+    return jsonify({
+        'success': True,
+        'message': msg,
+        'stopped_count': stopped_count,
+        'terminated_count': terminated_count,
+        'skipped_count': skipped_count,
+    })
+
+
+
+@app.route('/tasks/clear_all', methods=['POST'])
+@login_required
+def clear_all_tasks_route():
+    """清空所有任务（可选择同时删除任务文件）"""
+    try:
+        delete_files = request.form.get('delete_files', 'true').lower() in ['true', '1', 'on']
+        success = clear_all_tasks(delete_files=delete_files)
+        if success:
+            flash('所有任务已清空', 'success')
+        else:
+            flash('清空任务失败，请查看日志', 'danger')
+    except Exception as e:
+        logger.error(f"清空所有任务失败: {e}")
+        flash(f'清空任务失败: {e}', 'danger')
+    return redirect(url_for('tasks'))
+
+
+@app.route('/tasks/retry_failed', methods=['POST'])
+@login_required
+def retry_failed_tasks_route():
+    """重新调度所有失败的任务（从任务管理器调用）"""
+    try:
+        # 加载最新配置
+        cfg = load_config()
+        # 清除所有失败任务可能残留的取消标记——否则重新调度后立刻又被取消
+        try:
+            from modules.task_manager import clear_task_cancel
+            failed_tasks = get_tasks_by_status(TASK_STATES['FAILED']) or []
+            for ft in failed_tasks:
+                clear_task_cancel(ft.get('id'))
+        except Exception as exc:
+            logger.debug(f"批量清除失败任务的取消标记失败: {exc}")
+
+        result = retry_failed_tasks(cfg)
+        if isinstance(result, dict):
+            scheduled = result.get('scheduled', 0)
+            total = result.get('total', 0)
+            flash(f'已重新调度 {scheduled}/{total} 个失败任务', 'success')
+        else:
+            flash('重新调度失败，请查看日志', 'danger')
+    except Exception as e:
+        logger.error(f"重试失败任务失败: {e}")
+        flash(f'重试失败任务失败: {e}', 'danger')
+    return redirect(url_for('tasks'))
+
+
+@app.route('/tasks/<task_id>/retry_translation', methods=['POST'])
+@login_required
+def retry_metadata_translation_route(task_id):
+    """重新执行因自动翻译失败而暂停的任务。"""
+    task = get_task(task_id)
+    if not task:
+        flash('任务不存在', 'danger')
+        return redirect(url_for('manual_review'))
+
+    if not is_metadata_translation_retryable(task):
+        flash('当前任务不是可重试的自动翻译失败任务', 'warning')
+        return redirect(url_for('manual_review'))
+
+    config = load_config()
+    retry_block_reason = get_metadata_translation_retry_block_reason(task, config)
+    if retry_block_reason:
+        flash(retry_block_reason, 'warning')
+        return redirect(url_for('manual_review'))
+
+    # 重新启动执行前先清除取消标记，避免历史标记毒化新一次执行
+    try:
+        from modules.task_manager import clear_task_cancel
+        clear_task_cancel(task_id)
+    except Exception as exc:
+        logger.debug(f"清除任务 {task_id} 的取消标记失败: {exc}")
+
+    try:
+        if retry_metadata_translation_task(task_id, config):
+            flash('已重新启动自动翻译，任务将在后台继续处理', 'success')
+        else:
+            flash('重新启动自动翻译失败，请稍后重试', 'danger')
+    except Exception as exc:
+        logger.error(f"重试任务 {task_id} 的自动翻译失败: {exc}")
+        flash('重新启动自动翻译失败，请查看日志', 'danger')
+
+    return redirect(url_for('manual_review'))
+
+@app.route('/tasks/<task_id>/force_upload', methods=['POST'])
+@login_required
+def force_upload_task_route(task_id):
+    """强制上传任务"""
+    task = get_task(task_id)
+    
+    if not task:
+        flash('任务不存在', 'danger')
+        return redirect(url_for('manual_review'))
+    
+    # 获取当前配置
+    config = load_config()
+    upload_target = str(task.get('upload_target') or 'acfun').lower()
+    platform_name = '双平台' if upload_target == 'both' else ('bilibili' if upload_target == 'bilibili' else 'AcFun')
+    missing_partitions = _missing_upload_partition_labels(task, config)
+    if missing_partitions:
+        flash(f'请先选择{ "、".join(missing_partitions) }，或开启分区推荐后再继续上传。', 'danger')
+        return redirect(url_for('edit_task', task_id=task_id))
+
+    # 清除历史取消标记
+    try:
+        from modules.task_manager import clear_task_cancel
+        clear_task_cancel(task_id)
+    except Exception as exc:
+        logger.debug(f"清除任务 {task_id} 的取消标记失败: {exc}")
+
+    # 启动后台强制上传（内部已带网络类错误重试）
+    flash(f'已启动强制上传到{platform_name}，正在后台处理...', 'info')
+
+    _start_background_force_upload(task_id, config, platform_name)
+
+    return redirect(url_for('manual_review'))
+
+@app.route('/tasks/reset_stuck', methods=['POST'])
+@login_required
+def reset_stuck_tasks_route():
+    """重置卡住的任务"""
+    from modules.task_manager import reset_stuck_tasks
+    
+    try:
+        reset_count = reset_stuck_tasks()
+        if reset_count > 0:
+            flash(f'已重置 {reset_count} 个卡住的任务', 'success')
+        else:
+            flash('没有发现卡住的任务', 'info')
+    except Exception as e:
+        logger.error(f"重置卡住任务失败: {str(e)}")
+        flash('重置卡住任务失败', 'danger')
+    
+    return redirect(url_for('tasks'))
+
+@app.route('/tasks/<task_id>/abandon', methods=['POST'])
+@login_required
+def abandon_task_route(task_id):
+    """放弃任务"""
+    delete_files = request.form.get('delete_files', 'true').lower() in ('true', 'yes', '1', 'on')
+    
+    # 更新任务状态为失败
+    update_task(task_id, status=TASK_STATES['FAILED'], error_message="用户主动放弃任务")
+    
+    if delete_files:
+        # 删除任务文件
+        from modules.task_manager import delete_task_files
+        delete_task_files(task_id)
+    
+    flash('任务已废弃', 'success')
+    return redirect(url_for('tasks'))
+
+# 系统健康检查辅助函数
+
+def check_docker_volumes():
+    """检查Docker挂载卷状态"""
+    volumes = {}
+    app_root = os.path.dirname(os.path.abspath(__file__))
+    
+    volume_paths = [
+        ('config', 'config'),
+        ('db', 'db'),
+        ('downloads', 'downloads'),
+        ('logs', 'logs'),
+        ('cookies', 'cookies'),
+        ('temp', 'temp')
+    ]
+    
+    for name, path in volume_paths:
+        full_path = os.path.join(app_root, path)
+        volumes[name] = {
+            'path': full_path,
+            'exists': os.path.exists(full_path),
+            'is_mount': os.path.ismount(full_path),
+            'writable': os.access(full_path, os.W_OK) if os.path.exists(full_path) else False,
+            'size_mb': get_directory_size(full_path) if os.path.exists(full_path) else 0
+        }
+    
+    return volumes
+
+def get_directory_size(path):
+    """获取目录大小(MB)"""
+    try:
+        total_size = 0
+        for dirpath, dirnames, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                if os.path.exists(fp):
+                    total_size += os.path.getsize(fp)
+        return round(total_size / 1024 / 1024, 2)
+    except Exception as e:
+        logger.warning(f"获取目录大小失败 {path}: {e}")
+        return 0
+
+def _public_health_check_error_message(component: str = '检查项') -> str:
+    return f'{component}检查失败，请查看服务日志。'
+
+def get_database_info():
+    """获取数据库文件信息"""
+    try:
+        from modules.task_manager import get_db_path
+        db_path = get_db_path()
+        
+        if os.path.exists(db_path):
+            stat_info = os.stat(db_path)
+            return {
+                'path': db_path,
+                'size': stat_info.st_size,
+                'writable': os.access(db_path, os.W_OK),
+                'last_modified': stat_info.st_mtime
+            }
+        else:
+            return {
+                'path': db_path,
+                'size': 0,
+                'writable': False,
+                'last_modified': None
+            }
+    except Exception as e:
+        logger.warning("获取数据库文件信息失败: %s", e)
+        return {
+            'path': 'unknown',
+            'size': 0,
+            'writable': False,
+            'error': _public_health_check_error_message('数据库')
+        }
+
+def get_database_debug_info():
+    """获取数据库调试信息"""
+    try:
+        from modules.task_manager import get_db_path
+        db_path = get_db_path()
+        
+        debug_info = {
+            'db_path': db_path,
+            'db_exists': os.path.exists(db_path),
+            'db_dir': os.path.dirname(db_path),
+            'db_dir_exists': os.path.exists(os.path.dirname(db_path)),
+            'db_dir_writable': os.access(os.path.dirname(db_path), os.W_OK) if os.path.exists(os.path.dirname(db_path)) else False,
+            'current_user': os.environ.get('USER', 'unknown'),
+            'current_uid': os.getuid() if hasattr(os, 'getuid') else 'unknown',  # type: ignore
+            'current_gid': os.getgid() if hasattr(os, 'getgid') else 'unknown'   # type: ignore
+        }
+        
+        if os.path.exists(db_path):
+            stat_info = os.stat(db_path)
+            debug_info.update({
+                'db_size': stat_info.st_size,
+                'db_mode': oct(stat_info.st_mode)[-3:],
+                'db_uid': stat_info.st_uid,
+                'db_gid': stat_info.st_gid
+            })
+        
+        return debug_info
+    except Exception as e:
+        logger.warning("获取数据库调试信息失败: %s", e)
+        return {'error': _public_health_check_error_message('数据库')}
+
+def get_file_info(file_path):
+    """获取文件详细信息"""
+    try:
+        info = {
+            'exists': os.path.exists(file_path),
+            'size': 0,
+            'readable': False,
+            'last_modified': None
+        }
+        
+        if info['exists']:
+            stat_info = os.stat(file_path)
+            info.update({
+                'size': stat_info.st_size,
+                'readable': os.access(file_path, os.R_OK),
+                'last_modified': stat_info.st_mtime
+            })
+        
+        return info
+    except Exception as e:
+        logger.warning("获取文件信息失败: %s", e)
+        return {
+            'exists': False,
+            'size': 0,
+            'readable': False,
+            'last_modified': None,
+            'error': _public_health_check_error_message('文件')
+        }
+
+def get_path_debug_info(file_path):
+    """获取路径调试信息"""
+    try:
+        debug_info = {
+            'path': file_path,
+            'dirname': os.path.dirname(file_path),
+            'basename': os.path.basename(file_path),
+            'dirname_exists': os.path.exists(os.path.dirname(file_path)),
+            'dirname_readable': os.access(os.path.dirname(file_path), os.R_OK) if os.path.exists(os.path.dirname(file_path)) else False,
+            'dirname_writable': os.access(os.path.dirname(file_path), os.W_OK) if os.path.exists(os.path.dirname(file_path)) else False
+        }
+        
+        # 列出目录内容
+        if debug_info['dirname_exists'] and debug_info['dirname_readable']:
+            try:
+                debug_info['directory_contents'] = os.listdir(os.path.dirname(file_path))
+            except OSError:
+                debug_info['directory_contents'] = 'permission_denied'
+        
+        return debug_info
+    except Exception as e:
+        logger.warning("获取路径调试信息失败: %s", e)
+        return {'error': _public_health_check_error_message('路径')}
+
+@app.route('/tasks/<task_id>/stop', methods=['POST'])
+@login_required
+def stop_task_route(task_id):
+    """停止/取消正在运行的任务。
+
+    与之前的实现相比，这里会：
+    1. 打取消标记（协作式），后台循环在下一个检查点读到后退出；
+    2. 若 yt-dlp/ffmpeg 的 subprocess 正在跑，直接 terminate；
+    3. 更新数据库状态，让 UI 立刻反映。
+    注意：正在飞的单个 HTTP 上传请求无法被中断，只能等它返回/超时；之后不再推进。
+    """
+    task = get_task(task_id)
+    if not task:
+        flash('任务不存在', 'danger')
+        return redirect(url_for('tasks'))
+
+    from modules.task_manager import request_task_cancel, terminate_active_process
+    request_task_cancel(task_id)
+    terminated = terminate_active_process(task_id)
+
+    update_task(
+        task_id,
+        status=TASK_STATES['FAILED'],
+        error_message="用户主动停止任务"
+    )
+
+    logger.info(f"用户主动停止了任务 {task_id}（subprocess terminated={terminated}）")
+    flash('任务已停止，如需继续请点击“开始”', 'info')
+    return redirect(url_for('tasks'))
+
+
+@app.route('/system_health')
+def system_health():
+    """系统健康检查 - 增强Docker环境兼容性"""
+    from modules.task_manager import get_db_connection, validate_cookies, resolve_cookie_file_path
+    import sqlite3
+    import os
+    import platform
+    import sys
+    
+    # 检测运行环境
+    is_docker = os.path.exists('/.dockerenv') or os.environ.get('CONTAINER') == 'docker'
+    
+    health_status = {
+        'environment': {
+            'platform': platform.system(),
+            'python_version': sys.version.split()[0],
+            'is_docker': is_docker,
+            'user': os.environ.get('USER', 'unknown'),
+            'working_directory': os.getcwd()
+        },
+        'database': {'status': 'unknown', 'message': ''},
+        'youtube_cookies': {'status': 'unknown', 'message': ''},
+        'acfun_cookies': {'status': 'unknown', 'message': ''},
+        'bilibili_cookies': {'status': 'unknown', 'message': ''},
+        'stuck_tasks': {'count': 0, 'tasks': []},
+        'recent_errors': [],
+        'docker_volumes': {}
+    }
+    
+    # Docker环境特殊检查
+    if is_docker:
+        health_status['docker_volumes'] = check_docker_volumes()
+    
+    # 检查数据库
+    try:
+        logger.info("开始数据库健康检查...")
+        conn = get_db_connection()
+        
+        # 测试基本连接
+        cursor = conn.execute('SELECT COUNT(*) FROM tasks')
+        task_count = cursor.fetchone()[0]
+        
+        # 检查数据库文件权限和位置
+        db_info = get_database_info()
+        
+        health_status['database'] = {
+            'status': 'ok',
+            'message': f'数据库正常，共有 {task_count} 个任务',
+            'location': db_info['path'],
+            'size_mb': round(db_info['size'] / 1024 / 1024, 2),
+            'writable': db_info['writable']
+        }
+        
+        # 检查卡住的任务
+        stuck_cursor = conn.execute('''
+            SELECT id, status, created_at, updated_at, error_message
+            FROM tasks 
+            WHERE status IN ('processing', 'downloading', 'uploading', 'fetching_info', 'translating')
+            AND datetime(updated_at) < datetime('now', '-30 minutes')
+        ''')
+        stuck_tasks = stuck_cursor.fetchall()
+        health_status['stuck_tasks'] = {
+            'count': len(stuck_tasks),
+            'tasks': [{'id': t[0][:8] + '...', 'status': t[1], 'updated': t[3]} for t in stuck_tasks]
+        }
+        
+        # 检查最近的错误
+        error_cursor = conn.execute('''
+            SELECT id, error_message, updated_at
+            FROM tasks 
+            WHERE status = 'failed' AND error_message IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT 5
+        ''')
+        error_tasks = error_cursor.fetchall()
+        health_status['recent_errors'] = [
+            {'id': t[0][:8] + '...', 'error': t[1][:100] + '...' if len(t[1]) > 100 else t[1], 'time': t[2]}
+            for t in error_tasks
+        ]
+        
+        conn.close()
+        logger.info("数据库健康检查完成")
+    except Exception:
+        logger.exception("数据库健康检查失败")
+        health_status['database'] = {
+            'status': 'error',
+            'message': _public_health_check_error_message('数据库'),
+            'details': get_database_debug_info()
+        }
+    
+
+    # 检查cookies - 使用更健壮的路径处理
+    try:
+        logger.info("开始cookies健康检查...")
+        config = load_config()
+        
+        # YouTube cookies
+        yt_cookies_path = config.get('YOUTUBE_COOKIES_PATH', 'cookies/yt_cookies.txt')
+        if yt_cookies_path:
+            # 如果是相对路径，转换为绝对路径
+            yt_cookies_path = resolve_cookie_file_path(
+                path_value=yt_cookies_path,
+                default_relative_path='cookies/yt_cookies.txt',
+                service_name='YouTube',
+                logger_obj=logger,
+                allow_json_txt_fallback=False
+            )
+            
+            try:
+                logger.debug(f"检查YouTube cookies文件: {yt_cookies_path}")
+                is_valid, message = validate_cookies(yt_cookies_path, "YouTube")
+                
+                # 获取文件详细信息
+                file_info = get_file_info(yt_cookies_path)
+                
+                health_status['youtube_cookies'] = {
+                    'status': 'ok' if is_valid else 'error',
+                    'message': message,
+                    'path': yt_cookies_path,
+                    'exists': file_info['exists'],
+                    'size': file_info['size'],
+                    'readable': file_info['readable'],
+                    'last_modified': file_info['last_modified']
+                }
+            except Exception:
+                logger.exception("YouTube cookies检查异常")
+                health_status['youtube_cookies'] = {
+                    'status': 'error',
+                    'message': _public_health_check_error_message('YouTube Cookies'),
+                    'path': yt_cookies_path,
+                    'debug_info': get_path_debug_info(yt_cookies_path)
+                }
+        else:
+            health_status['youtube_cookies'] = {
+                'status': 'warning',
+                'message': '未配置YouTube cookies路径'
+            }
+        
+        # AcFun cookies
+        ac_cookies_path = resolve_cookie_file_path(
+            path_value=config.get('ACFUN_COOKIES_PATH', 'cookies/ac_cookies.json'),
+            default_relative_path='cookies/ac_cookies.json',
+            service_name='AcFun',
+            logger_obj=logger,
+            allow_json_txt_fallback=True
+        )
+        if ac_cookies_path:
+            try:
+                logger.debug(f"检查AcFun cookies文件: {ac_cookies_path}")
+                is_valid, message = validate_cookies(ac_cookies_path, "AcFun")
+                
+                # 获取文件详细信息
+                file_info = get_file_info(ac_cookies_path)
+                
+                health_status['acfun_cookies'] = {
+                    'status': 'ok' if is_valid else 'error',
+                    'message': message,
+                    'path': ac_cookies_path,
+                    'exists': file_info['exists'],
+                    'size': file_info['size'],
+                    'readable': file_info['readable'],
+                    'last_modified': file_info['last_modified']
+                }
+            except Exception:
+                logger.exception("AcFun cookies检查异常")
+                health_status['acfun_cookies'] = {
+                    'status': 'error',
+                    'message': _public_health_check_error_message('AcFun Cookies'),
+                    'path': ac_cookies_path,
+                    'debug_info': get_path_debug_info(ac_cookies_path)
+                }
+        else:
+            health_status['acfun_cookies'] = {
+                'status': 'warning',
+                'message': '未配置AcFun cookies路径'
+            }
+
+        # Bilibili cookies
+        bili_cookies_path = config.get('BILIBILI_COOKIES_PATH', 'cookies/bili_cookies.json')
+        if bili_cookies_path:
+            bili_cookies_path = resolve_cookie_file_path(
+                path_value=bili_cookies_path,
+                default_relative_path='cookies/bili_cookies.json',
+                service_name='Bilibili',
+                logger_obj=logger,
+                allow_json_txt_fallback=False
+            )
+
+            try:
+                logger.debug(f"检查Bilibili cookies文件: {bili_cookies_path}")
+                is_valid, message = validate_cookies(bili_cookies_path, "Bilibili")
+                file_info = get_file_info(bili_cookies_path)
+                health_status['bilibili_cookies'] = {
+                    'status': 'ok' if is_valid else 'error',
+                    'message': message,
+                    'path': bili_cookies_path,
+                    'exists': file_info['exists'],
+                    'size': file_info['size'],
+                    'readable': file_info['readable'],
+                    'last_modified': file_info['last_modified']
+                }
+            except Exception:
+                logger.exception("Bilibili cookies检查异常")
+                health_status['bilibili_cookies'] = {
+                    'status': 'error',
+                    'message': _public_health_check_error_message('Bilibili Cookies'),
+                    'path': bili_cookies_path,
+                    'debug_info': get_path_debug_info(bili_cookies_path)
+                }
+        else:
+            health_status['bilibili_cookies'] = {
+                'status': 'warning',
+                'message': '未配置Bilibili cookies路径'
+            }
+        
+        logger.info("cookies健康检查完成")
+            
+    except Exception:
+        logger.exception("检查cookies时发生错误")
+        health_status['youtube_cookies'] = {
+            'status': 'error',
+            'message': _public_health_check_error_message('YouTube Cookies'),
+            'debug_info': _public_health_check_error_message('Cookies')
+        }
+        health_status['acfun_cookies'] = {
+            'status': 'error',
+            'message': _public_health_check_error_message('AcFun Cookies'),
+            'debug_info': _public_health_check_error_message('Cookies')
+        }
+        health_status['bilibili_cookies'] = {
+            'status': 'error',
+            'message': _public_health_check_error_message('Bilibili Cookies'),
+            'debug_info': _public_health_check_error_message('Cookies')
+        }
+    
+    return jsonify(health_status)
+
+@app.route('/settings', methods=['GET', 'POST'])
+@login_required
+def settings():
+    """设置页面，用于管理配置"""
+    if request.method == 'POST':
+        config = load_config()
+        form_data = request.form.to_dict()
+        uploads = _extract_settings_uploads(request.files)
+        operation_id = str(form_data.get('save_operation_id') or uuid.uuid4())
+        enable_password_protection = str(form_data.get('password_protection_enabled', '')).lower() in ['true', '1', 'on']
+        submitted_new_password = str(form_data.get('new_password') or '')
+        submitted_confirm_password = str(form_data.get('confirm_password') or '')
+        has_effective_password = (
+            (submitted_new_password and submitted_new_password == submitted_confirm_password)
+            or bool(config.get('password'))
+        )
+
+        # 当用户在未开启保护的情况下保存“启用密码保护”时，需要立即把当前会话标记为已登录，
+        # 否则前端接下来轮询 /settings/save-progress/... 会被 login_required 重定向到登录页，
+        # 导致保存进度卡住或请求解析失败。
+        if enable_password_protection and has_effective_password:
+            session['logged_in'] = True
+            session.permanent = True
+        # 关闭密码保护时不立即清除会话，避免中断当前保存流程的进度轮询。
+        # 会话将在用户主动退出或session过期时自然失效。
+
+        if _is_ajax_request():
+            _update_settings_save_progress(
+                operation_id,
+                stage='saving_config',
+                message='正在准备保存设置',
+                detail='保存任务已创建，正在后台执行。',
+                percent=None,
+                done=False,
+                level='info',
+                success=None,
+                messages=[]
+            )
+            save_thread = threading.Thread(
+                target=_run_settings_save_operation,
+                args=(operation_id, form_data, uploads),
+                daemon=True,
+                name=f'settings-save-{operation_id[:8]}'
+            )
+            save_thread.start()
+            return jsonify({
+                'success': True,
+                'messages': [],
+                'operation_id': operation_id
+            })
+
+        result = _perform_settings_save(form_data, uploads)
+        for item in result.get('messages', []):
+            flash(item.get('text', ''), item.get('category', 'info'))
+        return redirect(url_for('settings'))
+    
+    # GET请求，显示设置页面
+    config = load_config()
+    acfun_partition_mapping = _load_acfun_partition_mapping()
+    bilibili_partition_mapping = _build_bilibili_partition_mapping()
+    try:
+        from modules.prompt_manager import get_builtin_prompt_previews
+        builtin_prompts = get_builtin_prompt_previews()
+    except Exception as exc:
+        logger.debug("获取内置 Prompt 预览失败，将不显示预览: %s", exc)
+        builtin_prompts = {}
+    return render_template(
+        'settings.html',
+        config=config,
+        tgbot_token_state=_tgbot_api_token_state(config),
+        tgbot_token_csrf_token=_ensure_tgbot_token_csrf_token(),
+        whisper_languages=WHISPER_LANGUAGE_LIST,
+        acfun_partition_mapping=acfun_partition_mapping,
+        bilibili_partition_mapping=bilibili_partition_mapping,
+        builtin_prompts=builtin_prompts,
+    )
+
+
+@app.route('/settings/update_cover_mode', methods=['POST'])
+@login_required
+def update_cover_mode():
+    """Persist the cover processing mode used by subsequent uploads."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({
+            'success': False,
+            'message': '请求体必须是 JSON 对象。',
+        }), 400
+
+    mode = payload.get('mode')
+    if not isinstance(mode, str) or mode not in ('crop', 'pad'):
+        return jsonify({
+            'success': False,
+            'message': '封面处理模式必须是 crop 或 pad。',
+        }), 400
+
+    try:
+        updated_config = update_config({'COVER_PROCESSING_MODE': mode})
+    except Exception as exc:
+        logger.error('保存封面处理模式失败: %s', exc)
+        return jsonify({
+            'success': False,
+            'message': '保存封面处理模式失败，请稍后重试。',
+        }), 500
+
+    # Keep the running application and task processor in sync with the
+    # persisted value; a restart should not be required for the next upload.
+    try:
+        configure_app(app, updated_config)
+        from modules.task_manager import get_global_task_processor
+        get_global_task_processor(updated_config)
+    except Exception as exc:
+        # Persistence already succeeded.  Log a runtime-refresh failure but
+        # still report success so the caller does not incorrectly retry a
+        # setting that is already stored on disk.
+        logger.warning('封面处理模式已保存，但刷新运行时配置失败: %s', exc)
+
+    return jsonify({
+        'success': True,
+        'mode': mode,
+        'cover_processing_mode': mode,
+        'message': '封面处理模式已更新。',
+    })
+
+
+@app.route('/settings/tgbot-token', methods=['POST'])
+@login_required
+def settings_tgbot_token():
+    payload = request.get_json(silent=True) if request.is_json else request.form
+    payload = payload or {}
+    csrf_token = payload.get('csrf_token') or request.headers.get('X-CSRF-Token')
+    if not _validate_tgbot_token_csrf(csrf_token):
+        return jsonify({'success': False, 'message': '安全校验失败，请刷新设置页后重试。'}), 403
+
+    action = str(payload.get('action') or '').strip().lower()
+    if action in ('generate', 'reset'):
+        token = _generate_tgbot_api_token()
+        updated_config = update_config({
+            'TG_BOT_API_TOKEN_HASH': _hash_tgbot_api_token(token),
+            'TG_BOT_API_TOKEN_CREATED_AT': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'TG_BOT_API_TOKEN_LAST4': token[-4:],
+        })
+        return jsonify({
+            'success': True,
+            'message': 'Telegram Bot API Token 已生成，旧 Token 已失效。请立即复制保存。',
+            'token': token,
+            'state': _tgbot_api_token_state(updated_config),
+            'csrf_token': _ensure_tgbot_token_csrf_token(),
+        })
+
+    if action == 'revoke':
+        updated_config = update_config({
+            'TG_BOT_API_TOKEN_HASH': '',
+            'TG_BOT_API_TOKEN_CREATED_AT': '',
+            'TG_BOT_API_TOKEN_LAST4': '',
+        })
+        return jsonify({
+            'success': True,
+            'message': 'Telegram Bot API Token 已撤销。',
+            'state': _tgbot_api_token_state(updated_config),
+            'csrf_token': _ensure_tgbot_token_csrf_token(),
+        })
+
+    return jsonify({
+        'success': False,
+        'message': '未知的 Token 操作。',
+        'csrf_token': _ensure_tgbot_token_csrf_token(),
+    }), 400
+
+
+@app.route('/settings/save-progress/<operation_id>', methods=['GET'])
+@login_required
+def settings_save_progress(operation_id):
+    progress = _get_settings_save_progress(operation_id)
+    if not progress:
+        return jsonify({
+            'found': False,
+            'stage': None,
+            'message': '',
+            'detail': '',
+            'percent': None,
+            'downloaded_bytes': None,
+            'total_bytes': None,
+            'done': True,
+            'level': 'error',
+            'success': False,
+            'messages': []
+        })
+
+    return jsonify({
+        'found': True,
+        'stage': progress.get('stage'),
+        'message': progress.get('message'),
+        'detail': progress.get('detail'),
+        'percent': progress.get('percent'),
+        'downloaded_bytes': progress.get('downloaded_bytes'),
+        'total_bytes': progress.get('total_bytes'),
+        'done': progress.get('done', False),
+        'level': progress.get('level', 'info'),
+        'success': progress.get('success'),
+        'messages': progress.get('messages', [])
+    })
+
+
+@app.route('/settings/notifications/test', methods=['POST'])
+@login_required
+def settings_test_notification():
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        channel = str(data.get('channel') or '').strip()
+    else:
+        channel = str(request.form.get('channel') or '').strip()
+
+    if channel not in (CHANNEL_WECOM, CHANNEL_SERVERCHAN, CHANNEL_MESSAGE_PUSHER):
+        return jsonify({'success': False, 'message': '不支持的通知渠道'}), 400
+
+    try:
+        config = load_config()
+        _sync_notification_service(config)
+        service = get_global_notification_service(config)
+        service.send_test_message(channel)
+        return jsonify({
+            'success': True,
+            'message': f'{CHANNEL_LABELS.get(channel, channel)} 测试消息已发送'
+        })
+    except ValueError:
+        logger.warning("测试通知发送失败，渠道=%s", channel, exc_info=True)
+        return jsonify({
+            'success': False,
+            'message': f'{CHANNEL_LABELS.get(channel, channel)} 配置不完整，请检查后重试'
+        }), 400
+    except Exception:
+        logger.exception("测试通知发送失败，渠道=%s", channel)
+        return jsonify({'success': False, 'message': '测试通知发送失败，请稍后重试'}), 500
+
+
+@app.route('/settings/cookiecloud/test', methods=['POST'])
+@login_required
+def settings_test_cookiecloud():
+    payload = request.get_json(silent=True) or {}
+    effective_config = _merge_cookiecloud_runtime_settings(payload)
+
+    try:
+        result = test_cookiecloud_youtube_sync(effective_config)
+        message = (
+            f"CookieCloud 连接成功，已解析 {result['cookie_count']} 条 YouTube/Google Cookies，"
+            f"当前使用 {result['crypto_type_used']} 算法。"
+        )
+        updated_at = _remember_cookiecloud_sync_result(True, message)
+        return jsonify({
+            'success': True,
+            'message': message,
+            'cookie_count': result['cookie_count'],
+            'crypto_type_used': result['crypto_type_used'],
+            'updated_at': updated_at,
+            'status': 'success',
+        })
+    except CookieCloudError as exc:
+        message = _cookiecloud_operation_error_message('test')
+        updated_at = _remember_cookiecloud_sync_result(False, message)
+        logger.warning('CookieCloud 连接测试失败（%s）: %s', type(exc).__name__, exc)
+        return jsonify({
+            'success': False,
+            'message': message,
+            'updated_at': updated_at,
+            'status': 'error',
+        }), 400
+    except Exception:
+        message = _cookiecloud_operation_error_message('test', retry_later=True)
+        updated_at = _remember_cookiecloud_sync_result(False, message)
+        logger.exception('CookieCloud 连接测试失败')
+        return jsonify({
+            'success': False,
+            'message': message,
+            'updated_at': updated_at,
+            'status': 'error',
+        }), 500
+
+
+@app.route('/settings/cookiecloud/sync', methods=['POST'])
+@login_required
+def settings_sync_cookiecloud():
+    payload = request.get_json(silent=True) or {}
+    effective_config = _merge_cookiecloud_runtime_settings(payload)
+
+    try:
+        result = sync_cookiecloud_to_youtube_file(effective_config)
+        message = (
+            f"CookieCloud 已成功写入 {result['cookie_count']} 条 YouTube/Google Cookies 到 "
+            f"{result['output_path_display']}。"
+        )
+        updated_at = _remember_cookiecloud_sync_result(True, message)
+        return jsonify({
+            'success': True,
+            'message': message,
+            'cookie_count': result['cookie_count'],
+            'crypto_type_used': result['crypto_type_used'],
+            'output_path_display': result['output_path_display'],
+            'updated_at': updated_at,
+            'status': 'success',
+        })
+    except CookieCloudError as exc:
+        message = _cookiecloud_operation_error_message('sync')
+        updated_at = _remember_cookiecloud_sync_result(False, message)
+        logger.warning('CookieCloud 立即拉取失败（%s）: %s', type(exc).__name__, exc)
+        return jsonify({
+            'success': False,
+            'message': message,
+            'updated_at': updated_at,
+            'status': 'error',
+        }), 400
+    except Exception:
+        message = _cookiecloud_operation_error_message('sync', retry_later=True)
+        updated_at = _remember_cookiecloud_sync_result(False, message)
+        logger.exception('CookieCloud 立即拉取失败')
+        return jsonify({
+            'success': False,
+            'message': message,
+            'updated_at': updated_at,
+            'status': 'error',
+        }), 500
+
+
+@app.route('/settings/acfun/qrcode/start', methods=['POST'])
+@login_required
+def acfun_qrcode_start():
+    """发起 AcFun 二维码登录并返回二维码图片。"""
+    config = load_config()
+    cookie_path = resolve_cookie_file_path(
+        path_value=config.get('ACFUN_COOKIES_PATH', 'cookies/ac_cookies.json'),
+        default_relative_path='cookies/ac_cookies.json',
+        service_name='AcFun',
+        logger_obj=logger,
+        allow_json_txt_fallback=True
+    )
+
+    try:
+        session_id, qr_session = _create_acfun_qr_session()
+        qr_data = qr_session.generate()
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'image_base64': qr_data.get('image_base64', ''),
+            'mime_type': qr_data.get('mime_type', 'image/png'),
+            'expires_in': _ACFUN_QR_SESSION_TTL_SECONDS,
+            'qr_expires_in_ms': qr_data.get('expires_in_ms', 120000),
+            'cookie_path': cookie_path,
+        })
+    except Exception as e:
+        logger.error(f"发起 AcFun 二维码登录失败: {e}")
+        return jsonify({'success': False, 'message': '二维码登录失败，请稍后重试'}), 500
+
+@app.route('/settings/acfun/qrcode/status/<session_id>', methods=['GET'])
+@login_required
+def acfun_qrcode_status(session_id):
+    """轮询 AcFun 二维码登录状态。"""
+    qr_session = _get_acfun_qr_session(session_id)
+    if not qr_session:
+        return jsonify({'success': False, 'message': '二维码会话不存在或已过期'}), 404
+
+    config = load_config()
+    cookie_path = resolve_cookie_file_path(
+        path_value=config.get('ACFUN_COOKIES_PATH', 'cookies/ac_cookies.json'),
+        default_relative_path='cookies/ac_cookies.json',
+        service_name='AcFun',
+        logger_obj=logger,
+        allow_json_txt_fallback=True
+    )
+
+    try:
+        status_data = qr_session.check_status(cookie_file=cookie_path)
+        _emit_qr_login_event_once(
+            _ACFUN_QR_SESSIONS,
+            _ACFUN_QR_SESSION_LOCK,
+            session_id,
+            'AcFun',
+            status_data,
+        )
+        status = status_data.get('status')
+        # done/failed 状态保留到 TTL 自动清理，避免前端再次检查时立刻报“会话过期”
+        # 仅 timeout（QR码确实过期）时立即移除
+        if status == 'timeout':
+            with _ACFUN_QR_SESSION_LOCK:
+                _ACFUN_QR_SESSIONS.pop(session_id, None)
+        return jsonify({'success': True, **status_data})
+    except Exception as e:
+        logger.error(f"查询 AcFun 二维码登录状态失败: {e}")
+        return jsonify({'success': False, 'message': '查询登录状态失败，请稍后重试'}), 500
+
+@app.route('/settings/bilibili/qrcode/start', methods=['POST'])
+@login_required
+def bilibili_qrcode_start():
+    """发起 bilibili 二维码登录并返回二维码图片。"""
+    config = load_config()
+    cookie_path = resolve_cookie_file_path(
+        path_value=config.get('BILIBILI_COOKIES_PATH', 'cookies/bili_cookies.json'),
+        default_relative_path='cookies/bili_cookies.json',
+        service_name='Bilibili',
+        logger_obj=logger,
+        allow_json_txt_fallback=False
+    )
+
+    try:
+        session_id, qr_session = _create_bilibili_qr_session()
+        qr_data = qr_session.generate()
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'image_base64': qr_data.get('image_base64', ''),
+            'mime_type': qr_data.get('mime_type', 'image/png'),
+            'expires_in': _BILIBILI_QR_SESSION_TTL_SECONDS,
+            'cookie_path': cookie_path,
+        })
+    except Exception as e:
+        logger.error(f"发起 bilibili 二维码登录失败: {e}")
+        return jsonify({'success': False, 'message': '二维码登录失败，请稍后重试'}), 500
+
+@app.route('/settings/bilibili/qrcode/status/<session_id>', methods=['GET'])
+@login_required
+def bilibili_qrcode_status(session_id):
+    """轮询 bilibili 二维码登录状态。"""
+    qr_session = _get_bilibili_qr_session(session_id)
+    if not qr_session:
+        return jsonify({'success': False, 'message': '二维码会话不存在或已过期'}), 404
+
+    config = load_config()
+    cookie_path = resolve_cookie_file_path(
+        path_value=config.get('BILIBILI_COOKIES_PATH', 'cookies/bili_cookies.json'),
+        default_relative_path='cookies/bili_cookies.json',
+        service_name='Bilibili',
+        logger_obj=logger,
+        allow_json_txt_fallback=False
+    )
+
+    try:
+        status_data = qr_session.check_status(cookie_file=cookie_path)
+        _emit_qr_login_event_once(
+            _BILIBILI_QR_SESSIONS,
+            _BILIBILI_QR_SESSION_LOCK,
+            session_id,
+            'bilibili',
+            status_data,
+        )
+        status = status_data.get('status')
+        if status in ('done', 'timeout', 'failed'):
+            with _BILIBILI_QR_SESSION_LOCK:
+                _BILIBILI_QR_SESSIONS.pop(session_id, None)
+        return jsonify({'success': True, **status_data})
+    except Exception as e:
+        logger.error(f"查询 bilibili 二维码登录状态失败: {e}")
+        return jsonify({'success': False, 'message': '查询登录状态失败，请稍后重试'}), 500
+
+@app.route('/settings/reset', methods=['POST'])
+@login_required
+def reset_settings():
+    """重置设置"""
+    try:
+        data = request.get_json() or {}
+        keys = data.get('keys', [])
+        
+        if keys:
+            # 重置指定项
+            reset_specific_config(keys)
+            flash('当前页面的设置已重置为默认值。', 'success')
+        else:
+            # 如果未指定keys，则不执行任何操作或返回错误
+            # 为了防止误操作全重置，这里要求必须指定keys
+            return jsonify({'status': 'error', 'message': '未指定要重置的配置项'}), 400
+            
+        return jsonify({'status': 'success', 'message': '设置已重置'})
+    except Exception as e:
+        logger.error(f"重置设置失败: {str(e)}")
+        return jsonify({'status': 'error', 'message': '重置设置失败，请稍后重试'}), 500
+
+@app.route('/logs/cleanup', methods=['POST'])
+@login_required
+def cleanup_logs_route():
+    """手动触发日志清理"""
+    config = load_config()
+    hours = int(request.form.get('hours', config.get('LOG_CLEANUP_HOURS', DEFAULT_CONFIG['LOG_CLEANUP_HOURS'])))
+    
+    result = cleanup_logs(hours)
+    
+    if result.get('success'):
+        flash(f"日志清理成功，删除了{result['files_removed']}个文件，释放了{result['bytes_freed_readable']}空间", 'success')
+    else:
+        flash(f"日志清理失败: {result.get('error', '未知错误')}", 'danger')
+    
+    return redirect(url_for('settings'))
+
+@app.route('/maintenance/clear_logs', methods=['POST'])
+@login_required
+def clear_logs_route():
+    """立即清空特定日志文件"""
+    result = clear_specific_logs()
+    
+    if result.get('success'):
+        processed_files_str = "、".join(result['processed_files'])
+        flash(f"日志清理成功，已处理{result['files_processed']}个文件（{processed_files_str}），释放了{result['bytes_freed_readable']}空间", 'success')
+    else:
+        flash(f"日志清理失败: {result.get('error', '未知错误')}", 'danger')
+    
+    return redirect(url_for('settings'))
+
+@app.route('/maintenance/cleanup_downloads', methods=['POST'])
+@login_required
+def cleanup_downloads_route():
+    """手动触发下载内容清理"""
+    config = load_config()
+    hours = int(request.form.get('hours', config.get('DOWNLOAD_CLEANUP_HOURS', 72)))
+    
+    result = cleanup_downloads(hours)
+    
+    if result.get('success'):
+        flash(f"下载内容清理成功，删除了{result['dirs_removed']}个目录、{result['files_removed']}个文件，释放了{result['bytes_freed_readable']}空间", 'success')
+    else:
+        flash(f"下载内容清理失败: {result.get('error', '未知错误')}", 'danger')
+    
+    return redirect(url_for('settings'))
+
+
+def _human_readable_size(num_bytes: float) -> str:
+    # Simple helper for human readable file sizes
+    if num_bytes is None:
+        return '0B'
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if num_bytes < 1024.0:
+            return f"{num_bytes:.2f}{unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.2f}PB"
+
+
+def cleanup_logs(hours: int):
+    """删除logs目录下指定小时之前的日志文件（不包括当前运行日志）"""
+    try:
+        logs_dir = get_app_subdir('logs')
+        if not os.path.exists(logs_dir):
+            return {'success': True, 'files_removed': 0, 'bytes_freed': 0, 'bytes_freed_readable': '0B'}
+
+        cutoff = time.time() - float(hours) * 3600
+        files_removed = 0
+        bytes_freed = 0
+
+        for filename in os.listdir(logs_dir):
+            path = os.path.join(logs_dir, filename)
+            # skip current top-level app and manager logs when present
+            if filename in ('app.log', 'task_manager.log'):
+                continue
+            try:
+                stat = os.stat(path)
+                if stat.st_mtime < cutoff:
+                    bytes_freed += stat.st_size if stat.st_size else 0
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        files_removed += 1
+                    elif os.path.isdir(path):
+                        # 统计目录内实际文件数和大小
+                        for dirpath, dirnames, dir_filenames in os.walk(path):
+                            for df in dir_filenames:
+                                try:
+                                    bytes_freed += os.path.getsize(os.path.join(dirpath, df))
+                                except Exception:
+                                    pass
+                                files_removed += 1
+                        shutil.rmtree(path)
+            except Exception:
+                continue
+
+        return {'success': True, 'files_removed': files_removed, 'bytes_freed': bytes_freed, 'bytes_freed_readable': _human_readable_size(bytes_freed)}
+    except Exception as e:
+        logger.warning(f"日志清理失败: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+def clear_specific_logs():
+    """清空特定日志文件并删除 task_xxx.log 文件"""
+    try:
+        logs_dir = get_app_subdir('logs')
+        processed_files = []
+        bytes_freed = 0
+
+        # 清空 app.log 和 task_manager.log
+        for fname in ('app.log', 'task_manager.log'):
+            fpath = os.path.join(logs_dir, fname)
+            if os.path.exists(fpath):
+                try:
+                    bytes_freed += os.path.getsize(fpath)
+                    open(fpath, 'w', encoding='utf-8').close()
+                    processed_files.append(fname)
+                except Exception:
+                    pass
+
+        # 删除所有task_xxx.log文件
+        for filename in os.listdir(logs_dir):
+            if filename.startswith('task_') and filename.endswith('.log'):
+                path = os.path.join(logs_dir, filename)
+                try:
+                    bytes_freed += os.path.getsize(path) if os.path.exists(path) else 0
+                    os.remove(path)
+                    processed_files.append(filename)
+                except Exception:
+                    pass
+
+        return {'success': True, 'files_processed': len(processed_files), 'processed_files': processed_files, 'bytes_freed': bytes_freed, 'bytes_freed_readable': _human_readable_size(bytes_freed)}
+    except Exception as e:
+        logger.warning(f"清空日志失败: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+def cleanup_downloads(hours: int):
+    """清理下载目录中指定hours之前的任务目录"""
+    try:
+        downloads_dir = get_app_subdir('downloads')
+        if not os.path.exists(downloads_dir):
+            return {'success': True, 'dirs_removed': 0, 'files_removed': 0, 'bytes_freed': 0, 'bytes_freed_readable': '0B'}
+
+        cutoff = time.time() - float(hours) * 3600
+        dirs_removed = 0
+        files_removed = 0
+        bytes_freed = 0
+
+        for entry in os.listdir(downloads_dir):
+            path = os.path.join(downloads_dir, entry)
+            try:
+                if os.path.isdir(path):
+                    # check last modification
+                    mtime = os.path.getmtime(path)
+                    if mtime < cutoff:
+                        # accumulate size
+                        for root, dirs, files in os.walk(path):
+                            for f in files:
+                                fp = os.path.join(root, f)
+                                if os.path.exists(fp):
+                                    bytes_freed += os.path.getsize(fp)
+                                    files_removed += 1
+                        shutil.rmtree(path)
+                        dirs_removed += 1
+            except Exception:
+                continue
+
+        return {'success': True, 'dirs_removed': dirs_removed, 'files_removed': files_removed, 'bytes_freed': bytes_freed, 'bytes_freed_readable': _human_readable_size(bytes_freed)}
+    except Exception as e:
+        logger.warning(f"下载内容清理失败: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+def configure_app(app, config):
+    """为Flask app应用一些基础配置值（如 secret_key、上传限制等）"""
+    try:
+        # 使用配置中的SECRET_KEY提高会话安全，首次运行时自动生成并持久化
+        secret = config.get('SECRET_KEY') if isinstance(config, dict) else None
+        if secret:
+            app.secret_key = secret
+        elif isinstance(config, dict):
+            # 若新配置中无 SECRET_KEY 但 app 已有，则复用，避免 session 全部失效
+            if app.secret_key:
+                config['SECRET_KEY'] = app.secret_key
+            else:
+                import secrets
+                new_secret = secrets.token_hex(32)
+                config['SECRET_KEY'] = new_secret
+                app.secret_key = new_secret
+                try:
+                    update_config({'SECRET_KEY': new_secret})
+                    logger.info("已自动生成并保存SECRET_KEY")
+                except Exception as e:
+                    logger.warning(f"保存自动生成的SECRET_KEY失败: {e}")
+
+        max_content = config.get('MAX_CONTENT_LENGTH_MB', None) if isinstance(config, dict) else None
+        if max_content:
+            try:
+                app.config['MAX_CONTENT_LENGTH'] = int(max_content) * 1024 * 1024
+            except Exception:
+                pass
+
+        timeout_minutes = 30
+        if isinstance(config, dict):
+            timeout_value = config.get('LOGIN_SESSION_TIMEOUT_MINUTES', 30)
+            try:
+                timeout_minutes = int(timeout_value)
+            except (TypeError, ValueError):
+                timeout_minutes = 30
+        app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=max(1, timeout_minutes))
+        app.config['SESSION_REFRESH_EACH_REQUEST'] = True
+
+        # 允许覆盖的内容
+        app.config['Y2A_SETTINGS'] = config
+    except Exception as e:
+        logger.warning(f"应用配置失败: {e}")
+
+
+def auto_start_pending_tasks(config):
+    """在启动时尝试自动启动pending状态的任务"""
+    try:
+        from modules.task_manager import get_global_task_processor, get_tasks_by_status, TASK_STATES
+        processor = get_global_task_processor(config)
+        if not processor:
+            return
+
+        # 循环尝试启动下一个pending任务，直到并发数或没有更多pending
+        # 我们设置一个上限避免无限循环
+        attempts = 0
+        while attempts < 200:
+            attempts += 1
+            try:
+                processor._check_and_start_next_pending_task()
+            except Exception:
+                break
+            # 如果没有pending则退出
+            pending = get_tasks_by_status(TASK_STATES['PENDING'])
+            if not pending:
+                break
+            time.sleep(0.05)
+    except Exception as e:
+        logger.warning(f"自动启动pending任务失败: {e}")
+
+
+def schedule_log_cleanup():
+    """为日志清理创建并启动一个BackgroundScheduler, 返回调度器对象"""
+    try:
+        config = load_config()
+        interval_hours = int(config.get('LOG_CLEANUP_INTERVAL', 12))
+        if not config.get('LOG_CLEANUP_ENABLED', False):
+            return None
+
+        scheduler = BackgroundScheduler()
+        def _job():
+            cleanup_logs(int(config.get('LOG_CLEANUP_HOURS', DEFAULT_CONFIG['LOG_CLEANUP_HOURS'])))
+        scheduler.add_job(_job, 'interval', hours=interval_hours, id='log_cleanup', replace_existing=True)
+        scheduler.start()
+        return scheduler
+    except Exception as e:
+        logger.warning(f"启动日志清理定时任务失败: {e}")
+        return None
+
+
+def schedule_download_cleanup():
+    try:
+        config = load_config()
+        interval_hours = int(config.get('DOWNLOAD_CLEANUP_INTERVAL', 24))
+        if not config.get('DOWNLOAD_CLEANUP_ENABLED', False):
+            return None
+
+        scheduler = BackgroundScheduler()
+        def _job():
+            cleanup_downloads(int(config.get('DOWNLOAD_CLEANUP_HOURS', 72)))
+        scheduler.add_job(_job, 'interval', hours=interval_hours, id='download_cleanup', replace_existing=True)
+        scheduler.start()
+        return scheduler
+    except Exception as e:
+        logger.warning(f"启动下载内容清理定时任务失败: {e}")
+        return None
+
+
+# 全局清理调度器：设置页保存时通过 _reschedule_cleanup_jobs() 重建，
+# 使日志清理/下载清理开关、间隔、保留时长无需重启即可生效。
+_cleanup_scheduler_lock = threading.Lock()
+_log_cleanup_scheduler = None
+_download_cleanup_scheduler = None
+
+
+def _reschedule_cleanup_jobs():
+    """根据当前配置重建日志清理 / 下载清理定时任务，使设置修改立即生效。"""
+    global _log_cleanup_scheduler, _download_cleanup_scheduler
+
+    with _cleanup_scheduler_lock:
+        for _name, _scheduler in (
+            ('日志清理', _log_cleanup_scheduler),
+            ('下载清理', _download_cleanup_scheduler),
+        ):
+            if _scheduler:
+                try:
+                    _scheduler.shutdown(wait=False)
+                except Exception as exc:
+                    logger.debug(f"关闭旧{_name}调度器失败: {exc}")
+
+        _log_cleanup_scheduler = schedule_log_cleanup()
+        _download_cleanup_scheduler = schedule_download_cleanup()
+
+        logger.info(
+            "定时清理任务已应用最新配置 (log=%s, download=%s)",
+            bool(_log_cleanup_scheduler),
+            bool(_download_cleanup_scheduler),
+        )
+
+
+# YouTube监控系统路由
+@app.route('/youtube_monitor')
+@login_required
+def youtube_monitor_index():
+    """YouTube监控主页"""
+    configs = youtube_monitor.get_monitor_configs()
+    history = youtube_monitor.get_monitor_history(limit=50)
+    return render_template('youtube_monitor.html', configs=configs, history=history)
+
+@app.route('/youtube_monitor/config', methods=['GET', 'POST'])
+@login_required
+def youtube_monitor_config():
+    """监控配置页面"""
+    if request.method == 'POST':
+        try:
+            # 安全的整数转换函数
+            def safe_int(value, default=0):
+                if not value or value.strip() == '':
+                    return default
+                try:
+                    return int(value)
+                except (ValueError, TypeError):
+                    return default
+            
+            # 获取监控类型和模式
+            monitor_type = request.form.get('monitor_type', 'youtube_search')
+            channel_mode = request.form.get('channel_mode', 'latest')
+            
+            config_data = {
+                'name': request.form.get('name', '').strip(),
+                'enabled': 'enabled' in request.form,
+                'monitor_type': monitor_type,
+                'channel_mode': channel_mode,
+                'region_code': request.form.get('region_code', 'US'),
+                'category_id': request.form.get('category_id', '0'),
+                'time_period': safe_int(request.form.get('time_period'), 7),
+                'max_results': safe_int(request.form.get('max_results'), 10),
+                'min_view_count': safe_int(request.form.get('min_view_count'), 0),
+                'min_like_count': safe_int(request.form.get('min_like_count'), 0),
+                'min_comment_count': safe_int(request.form.get('min_comment_count'), 0),
+                'keywords': request.form.get('keywords', ''),
+                'exclude_keywords': request.form.get('exclude_keywords', ''),
+                'channel_ids': request.form.get('channel_ids', ''),
+                'channel_keywords': request.form.get('channel_keywords', ''),
+                'exclude_channel_ids': request.form.get('exclude_channel_ids', ''),
+                'min_duration': safe_int(request.form.get('min_duration'), 0),
+                'max_duration': safe_int(request.form.get('max_duration'), 0),
+                'schedule_type': request.form.get('schedule_type', 'manual'),
+                'schedule_interval': safe_int(request.form.get('schedule_interval'), 120),
+                'order_by': request.form.get('order_by', 'viewCount'),
+                'start_date': request.form.get('start_date', ''),
+                'end_date': request.form.get('end_date', ''),
+                'latest_days': safe_int(request.form.get('latest_days'), 7),
+                'latest_max_results': safe_int(request.form.get('latest_max_results'), 20),
+                'rate_limit_requests': safe_int(request.form.get('rate_limit_requests'), 20),
+                'rate_limit_window': safe_int(request.form.get('rate_limit_window'), 60),
+                'auto_add_to_tasks': 'auto_add_to_tasks' in request.form,
+                'video_types': ','.join(request.form.getlist('video_types') or ['video','short','live'])
+            }
+            
+            # 验证必填项
+            if not config_data['name']:
+                flash('配置名称不能为空', 'danger')
+                return render_template('youtube_monitor_config.html')
+            
+            config_id = youtube_monitor.create_monitor_config(config_data)
+            flash(f'监控配置 "{config_data["name"]}" 创建成功！', 'success')
+            return redirect(url_for('youtube_monitor_index'))
+            
+        except Exception as e:
+            flash(f'创建监控配置失败: {str(e)}', 'danger')
+    
+    return render_template('youtube_monitor_config.html')
+
+@app.route('/youtube_monitor/config/<int:config_id>/edit', methods=['GET', 'POST'])
+@login_required
+def youtube_monitor_config_edit(config_id):
+    """编辑监控配置"""
+    config = youtube_monitor.get_monitor_config(config_id)
+    if not config:
+        flash('监控配置不存在', 'danger')
+        return redirect(url_for('youtube_monitor_index'))
+    
+    if request.method == 'POST':
+        try:
+            # 安全的整数转换函数
+            def safe_int(value, default=0):
+                if not value or value.strip() == '':
+                    return default
+                try:
+                    return int(value)
+                except (ValueError, TypeError):
+                    return default
+            
+            # 获取监控类型和模式
+            monitor_type = request.form.get('monitor_type', 'youtube_search')
+            channel_mode = request.form.get('channel_mode', 'latest')
+            
+            config_data = {
+                'name': request.form.get('name', '').strip(),
+                'enabled': 'enabled' in request.form,
+                'monitor_type': monitor_type,
+                'channel_mode': channel_mode,
+                'region_code': request.form.get('region_code', 'US'),
+                'category_id': request.form.get('category_id', '0'),
+                'time_period': safe_int(request.form.get('time_period'), 7),
+                'max_results': safe_int(request.form.get('max_results'), 10),
+                'min_view_count': safe_int(request.form.get('min_view_count'), 0),
+                'min_like_count': safe_int(request.form.get('min_like_count'), 0),
+                'min_comment_count': safe_int(request.form.get('min_comment_count'), 0),
+                'keywords': request.form.get('keywords', ''),
+                'exclude_keywords': request.form.get('exclude_keywords', ''),
+                'channel_ids': request.form.get('channel_ids', ''),
+                'channel_keywords': request.form.get('channel_keywords', ''),
+                'exclude_channel_ids': request.form.get('exclude_channel_ids', ''),
+                'min_duration': safe_int(request.form.get('min_duration'), 0),
+                'max_duration': safe_int(request.form.get('max_duration'), 0),
+                'schedule_type': request.form.get('schedule_type', 'manual'),
+                'schedule_interval': safe_int(request.form.get('schedule_interval'), 120),
+                'order_by': request.form.get('order_by', 'viewCount'),
+                'start_date': request.form.get('start_date', ''),
+                'end_date': request.form.get('end_date', ''),
+                'latest_days': safe_int(request.form.get('latest_days'), 7),
+                'latest_max_results': safe_int(request.form.get('latest_max_results'), 20),
+                'rate_limit_requests': safe_int(request.form.get('rate_limit_requests'), 20),
+                'rate_limit_window': safe_int(request.form.get('rate_limit_window'), 60),
+                'auto_add_to_tasks': 'auto_add_to_tasks' in request.form,
+                'video_types': ','.join(request.form.getlist('video_types') or ['video','short','live'])
+            }
+            
+            # 验证必填项
+            if not config_data['name']:
+                flash('配置名称不能为空', 'danger')
+                return render_template('youtube_monitor_config.html', config=config, is_edit=True)
+            
+            youtube_monitor.update_monitor_config(config_id, config_data)
+            flash(f'监控配置更新成功！', 'success')
+            return redirect(url_for('youtube_monitor_index'))
+            
+        except Exception as e:
+            flash(f'更新监控配置失败: {str(e)}', 'danger')
+    
+    return render_template('youtube_monitor_config.html', config=config, is_edit=True)
+
+@app.route('/youtube_monitor/config/<int:config_id>/delete', methods=['POST'])
+@login_required
+def youtube_monitor_config_delete(config_id):
+    """删除监控配置"""
+    try:
+        config = youtube_monitor.get_monitor_config(config_id)
+        if config:
+            youtube_monitor.delete_monitor_config(config_id)
+            flash(f'监控配置 "{config["name"]}" 删除成功！', 'success')
+        else:
+            flash('监控配置不存在', 'danger')
+    except Exception as e:
+        flash(f'删除监控配置失败: {str(e)}', 'danger')
+    
+    return redirect(url_for('youtube_monitor_index'))
+
+@app.route('/youtube_monitor/config/<int:config_id>/run', methods=['POST'])
+@login_required
+def youtube_monitor_run(config_id):
+    """立即执行一次监控任务"""
+    operation_id, config, error_message = _start_monitor_run_operation(config_id)
+    if error_message:
+        if _is_ajax_request():
+            return jsonify({'success': False, 'message': error_message}), 404
+        flash(error_message, 'danger')
+        return redirect(url_for('youtube_monitor_index'))
+
+    if not config:
+        fallback_message = '监控配置不存在'
+        if _is_ajax_request():
+            return jsonify({'success': False, 'message': fallback_message}), 404
+        flash(fallback_message, 'danger')
+        return redirect(url_for('youtube_monitor_index'))
+
+    started_message = f"监控已在后台开始执行：{config['name']}"
+    if _is_ajax_request():
+        return jsonify({
+            'success': True,
+            'message': started_message,
+            'operation_id': operation_id,
+            'config_id': config_id,
+        })
+
+    flash(f'{started_message}，请稍后刷新查看结果。', 'info')
+    return redirect(url_for('youtube_monitor_history', config_id=config_id))
+
+
+@app.route('/youtube_monitor/run-status/<operation_id>', methods=['GET'])
+@login_required
+def youtube_monitor_run_status(operation_id):
+    """查询后台监控任务的执行状态"""
+    progress = _get_monitor_run_progress(operation_id)
+    if not progress:
+        return jsonify({
+            'found': False,
+            'config_id': None,
+            'message': '',
+            'detail': '',
+            'done': True,
+            'level': 'error',
+            'success': False,
+        })
+
+    return jsonify({
+        'found': True,
+        'config_id': progress.get('config_id'),
+        'message': progress.get('message', ''),
+        'detail': progress.get('detail', ''),
+        'done': progress.get('done', False),
+        'level': progress.get('level', 'info'),
+        'success': progress.get('success'),
+    })
+
+@app.route('/youtube_monitor/history/<int:config_id>')
+@login_required
+def youtube_monitor_history(config_id):
+    """查看指定监控配置的发现历史"""
+    config = youtube_monitor.get_monitor_config(config_id)
+    if not config:
+        flash('监控配置不存在', 'danger')
+        return redirect(url_for('youtube_monitor_index'))
+    
+    history = youtube_monitor.get_monitor_history(config_id, limit=200)
+    
+    # 计算统计数据
+    stats = {
+        'total_records': len(history),
+        'added_to_tasks': 0,
+        'avg_views': 0,
+        'avg_likes': 0
+    }
+    
+    if history:
+        total_views = 0
+        total_likes = 0
+        
+        for record in history:
+            if record.get('added_to_tasks'):
+                stats['added_to_tasks'] += 1
+            total_views += record.get('view_count', 0)
+            total_likes += record.get('like_count', 0)
+        
+        stats['avg_views'] = int(total_views / len(history))
+        stats['avg_likes'] = int(total_likes / len(history))
+    
+    return render_template('youtube_monitor_history.html', history=history, config=config, stats=stats)
+
+@app.route('/youtube_monitor/add_to_tasks', methods=['POST'])
+@login_required
+def youtube_monitor_add_to_tasks():
+    """从监控历史中添加视频到任务列表"""
+    data = request.get_json(silent=True) or {}
+    video_id = data.get('video_id')
+    config_id = data.get('config_id')
+    if not video_id or not config_id:
+        return jsonify({'success': False, 'message': '参数不完整'}), 400
+    try:
+        config_id_int = int(config_id)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': 'config_id 无效'}), 400
+
+    success, message = youtube_monitor.add_video_to_tasks_manually(video_id, config_id_int)
+
+    if success:
+        return jsonify({'success': True, 'message': message})
+    else:
+        return jsonify({'success': False, 'message': message}), 400
+
+@app.route('/youtube_monitor/history/<int:config_id>/clear', methods=['POST'])
+@login_required
+def youtube_monitor_clear_history(config_id):
+    """清空指定监控任务的历史记录"""
+    youtube_monitor.clear_monitor_history(config_id)
+    
+    return redirect(url_for('youtube_monitor_index'))
+
+@app.route('/youtube_monitor/history/clear_all', methods=['POST'])
+@login_required
+def youtube_monitor_clear_all_history():
+    """清空所有历史记录"""
+    youtube_monitor.clear_all_monitor_history()
+    
+    return redirect(url_for('youtube_monitor_index'))
+
+@app.route('/youtube_monitor/restore_configs', methods=['POST'])
+@login_required
+def youtube_monitor_restore_configs():
+    """恢复默认监控配置"""
+    youtube_monitor.restore_configs_from_files_manually()
+    
+    return redirect(url_for('youtube_monitor_index'))
+
+@app.route('/youtube_monitor/config/<int:config_id>/reset_offset', methods=['POST'])
+@login_required
+def youtube_monitor_reset_offset(config_id):
+    """重置频道监控的视频偏移量"""
+    youtube_monitor.reset_historical_offset(config_id)
+    
+    return redirect(url_for('youtube_monitor_index'))
+
+@app.route('/api/cookies/sync', methods=['POST'])
+@login_required
+def sync_cookies():
+    """
+    接收从浏览器扩展同步过来的Cookie
+    """
+    try:
+        if not request.is_json:
+            return jsonify({'error': '请求必须是JSON格式'}), 400
+        
+        data = request.get_json()
+        
+        # 验证必要字段
+        required_fields = ['source', 'timestamp', 'cookies', 'cookieCount']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'缺少必要字段: {field}'}), 400
+        
+        # 验证来源
+        if data['source'] not in ['userscript', 'extension']:
+            return jsonify({'error': '不支持的cookie来源'}), 400
+        
+        # 验证cookie数据
+        cookies_content = data['cookies']
+        if not cookies_content or not isinstance(cookies_content, str):
+            return jsonify({'error': 'cookie数据无效'}), 400
+        
+        # 保存cookie到文件
+        cookies_dir = get_app_subdir('cookies')
+        os.makedirs(cookies_dir, exist_ok=True)
+        
+        youtube_cookies_path = os.path.join(cookies_dir, 'yt_cookies.txt')
+        
+        # 写入新的cookie文件
+        try:
+            with open(youtube_cookies_path, 'w', encoding='utf-8') as f:
+                f.write(cookies_content)
+            
+            # 记录同步信息
+            sync_info = {
+                'timestamp': data['timestamp'],
+                'sync_time': time.time(),
+                'cookie_count': data['cookieCount'],
+                'user_agent': data.get('userAgent', ''),
+                'source_url': data.get('url', ''),
+                'file_size': len(cookies_content)
+            }
+            
+            source_name = '浏览器扩展' if data['source'] == 'extension' else '油猴脚本'
+            logger.info(f"Cookie同步成功 - 来源: {source_name}, 数量: {data['cookieCount']}, 大小: {len(cookies_content)} bytes")
+
+            return jsonify({
+                'success': True,
+                'message': 'Cookie同步成功',
+                'sync_info': sync_info
+            }), 200
+            
+        except Exception as e:
+            logger.error(f"写入cookie文件失败: {str(e)}")
+            return jsonify({'error': '保存cookie失败，请稍后重试'}), 500
+
+    except Exception as e:
+        logger.error(f"Cookie同步API异常: {str(e)}")
+        return jsonify({'error': '服务器内部错误，请稍后重试'}), 500
+
+@app.route('/api/cookies/status', methods=['GET'])
+@login_required
+def get_cookie_status():
+    """
+    提供Cookie状态给浏览器扩展
+    """
+    try:
+        cookies_dir = get_app_subdir('cookies')
+        youtube_cookies_path = os.path.join(cookies_dir, 'yt_cookies.txt')
+        
+        status = {
+            'youtube_cookies_exists': os.path.exists(youtube_cookies_path),
+            'last_modified': None,
+            'file_size': 0,
+            'line_count': 0
+        }
+        
+        if status['youtube_cookies_exists']:
+            stat_info = os.stat(youtube_cookies_path)
+            status['last_modified'] = stat_info.st_mtime
+            status['file_size'] = stat_info.st_size
+            
+            # 统计行数
+            try:
+                with open(youtube_cookies_path, 'r', encoding='utf-8') as f:
+                    status['line_count'] = sum(1 for line in f if line.strip() and not line.startswith('#'))
+            except Exception as e:
+                logger.warning(f"读取cookie文件失败: {str(e)}")
+                status['line_count'] = -1
+        
+        return jsonify(status), 200
+        
+    except Exception as e:
+        logger.error(f"获取cookie状态失败: {str(e)}")
+        return jsonify({'error': '获取状态失败，请稍后重试'}), 500
+
+@app.route('/api/cookies/refresh-needed', methods=['POST'])
+@login_required
+def cookie_refresh_needed():
+    """
+    接收浏览器扩展的通知，标记某个网站的Cookie需要刷新
+    """
+    try:
+        data = request.get_json()
+        reason = data.get('reason', 'unknown')
+        video_url = data.get('video_url', '')
+        
+        logger.warning(f"收到Cookie刷新需求 - 原因: {reason}, 视频: {video_url}")
+        
+        # 这里可以实现通知机制，比如：
+        # 1. 发送到浏览器扩展
+        # 2. 在Web界面显示提示
+        # 3. 发送邮件通知等
+        
+        return jsonify({
+            'success': True,
+            'message': 'Cookie刷新需求已记录',
+            'suggestion': '请使用浏览器扩展重新同步Cookie'
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"处理Cookie刷新需求失败: {str(e)}")
+        return jsonify({'error': '处理失败，请稍后重试'}), 500
+
+def _startup_listener_pids(port):
+    """返回占用指定端口且处于监听状态的进程 PID 集合。"""
+    pids = set()
+    try:
+        output = subprocess.run(['netstat', '-ano'], capture_output=True, text=True,
+                                encoding='utf-8', errors='ignore', timeout=20).stdout or ''
+    except Exception as exc:
+        logger.warning(f"检测旧实例失败（netstat 不可用）: {exc}")
+        return pids
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto, local, state, pid = parts[0].upper(), parts[1], parts[3].upper(), parts[4]
+        if proto != 'TCP' or state != 'LISTENING':
+            continue
+        if not local.endswith(f':{port}'):
+            continue
+        if pid.isdigit() and int(pid) != os.getpid():
+            pids.add(int(pid))
+    return pids
+
+
+def _is_y2a_process(pid):
+    """粗判 PID 是否为 Y2A-Auto（python 解释器或打包后的 y2a 程序），避免误杀其他软件。"""
+    try:
+        result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/FO', 'CSV', '/NH'],
+                                capture_output=True, text=True, encoding='utf-8',
+                                errors='ignore', timeout=15)
+        name = (result.stdout or '').strip().strip('"').split('","')[0].strip('"').lower()
+        if not name or name.startswith('info:'):
+            return True
+        return ('python' in name) or ('y2a' in name)
+    except Exception:
+        return True
+
+
+def _terminate_previous_instances(port, wait_seconds=10.0):
+    """单实例守卫：启动前结束占用本端口的旧 Y2A-Auto 实例。
+
+    同一个端口只允许一个实例：重复双击 start.bat 时，新实例自动结束上一个实例，
+    避免两个实例同时监听同一端口，导致页面请求随机落到旧实例、任务状态错乱。
+    只处理监听本端口的进程，不影响 DB_Sync(5000)、PLC 采集器(5100) 等其他服务。
+    """
+    if os.name != 'nt':
+        return []
+
+    killed = []
+    for pid in _startup_listener_pids(port):
+        if not _is_y2a_process(pid):
+            logger.warning(f"端口 {port} 被其他程序占用（PID {pid}），已跳过；如无法启动请手动释放该端口")
+            continue
+        try:
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], capture_output=True, timeout=20)
+            killed.append(pid)
+            logger.warning(f"检测到旧实例占用端口 {port}（PID {pid}），已自动结束，仅保留当前实例")
+        except Exception as exc:
+            logger.warning(f"结束旧实例 PID {pid} 失败: {exc}")
+
+    # 等旧实例释放端口，最多等 wait_seconds 秒
+    deadline = time.time() + wait_seconds
+    while killed and time.time() < deadline:
+        if not _startup_listener_pids(port):
+            logger.info(f"端口 {port} 已释放，新实例继续启动")
+            return killed
+        time.sleep(0.5)
+    if killed:
+        logger.warning(f"端口 {port} 在 {wait_seconds:.0f} 秒内仍被占用，继续尝试启动")
+    return killed
+
+
+if __name__ == '__main__':
+    logger.info("Y2A-Auto 启动中...")
+
+    # 单实例守卫：先结束占用同一端口的旧实例，保证同一时间只有一个 Y2A-Auto 在运行
+    _startup_port = int(os.environ.get('PORT', 5500))
+    _terminate_previous_instances(_startup_port)
+
+    # 初始化AcFun分区ID映射
+    init_id_mapping()
+
+    # 加载配置
+    config = load_config()
+    app.config['Y2A_SETTINGS'] = config
+    logger.info(
+        "配置已加载（摘要）: %s",
+        json.dumps(_build_startup_config_log_summary(config), ensure_ascii=False)
+    )
+    _sync_notification_service(config)
+
+    # 初始化全局任务处理器，确保并发控制生效
+    from modules.task_manager import get_global_task_processor, shutdown_global_task_processor
+    get_global_task_processor(config)
+    logger.info("全局任务处理器已初始化")
+
+    # 自动启动所有pending任务（如果启用了自动模式）
+    if config.get('AUTO_MODE_ENABLED', False):
+        logger.info("自动模式已启用，正在启动所有pending任务...")
+        auto_start_pending_tasks(config)
+
+    # 初始化YouTube监控API
+    if config.get('YOUTUBE_API_KEY'):
+        api_ready, api_status = youtube_monitor.reload_api_client(config)
+        if api_ready:
+            youtube_monitor.start_all_schedules()
+            if api_status == 'proxy_ready':
+                logger.info("YouTube监控系统已初始化，独立代理已启用")
+            else:
+                logger.info("YouTube监控系统已初始化，当前为直连模式")
+        else:
+            if api_status == 'missing_api_key':
+                logger.warning('YouTube API 密钥未配置，请先在设置页完成接入。')
+            else:
+                logger.warning('YouTube监控 API 初始化失败，请检查 API 密钥、代理配置与网络连通性。')
+
+    # 配置应用
+    configure_app(app, config)
+
+    # 设置日志清理与下载清理定时任务（使用全局调度器，支持设置页热更新）
+    _reschedule_cleanup_jobs()
+
+    try:
+        port = int(os.environ.get('PORT', 5500))
+        logger.info(f"服务启动，监听地址: http://127.0.0.1:{port}")
+
+        # 延迟 1.5 秒打开浏览器，确保 Flask 已经完成端口绑定并开始监听
+        import webbrowser
+        import threading
+        
+        def _open_browser_delayed():
+            webbrowser.open(f"http://127.0.0.1:{port}")
+
+        threading.Timer(1.5, _open_browser_delayed).start()
+
+        # 使用标准Flask运行
+        app.run(host='0.0.0.0', port=port, debug=False)
+    except KeyboardInterrupt:
+        logger.info("接收到退出信号，服务正在关闭...")
+    except Exception as e:
+        logger.error(f"服务启动失败: {str(e)}")
+    finally:
+        # 关闭全局任务处理器
+        shutdown_global_task_processor()
+
+        with _cleanup_scheduler_lock:
+            for _scheduler in (_log_cleanup_scheduler, _download_cleanup_scheduler):
+                if _scheduler:
+                    try:
+                        _scheduler.shutdown()
+                    except Exception:
+                        pass
+        logger.info("服务已关闭")

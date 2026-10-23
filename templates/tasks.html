@@ -1,0 +1,1478 @@
+{% extends 'base.html' %}
+
+{% block title %}Y2A-Auto - 任务列表{% endblock %}
+
+{% block content %}
+<div class="tasks-container"
+     data-tasks-stream="{{ url_for('tasks_event_stream') }}"
+     data-task-fragment-template="{{ url_for('task_fragment', task_id='__TASK_ID__') }}">
+    {% set failed_tasks = tasks|selectattr('status', 'equalto', 'failed')|list if tasks else [] %}
+    
+    <!-- 顶部工具栏 -->
+    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-4">
+        <div class="d-flex align-items-center gap-3">
+            <h2 class="mb-0">任务列表</h2>
+            <!-- 下拉筛选框 -->
+            <div style="min-width: 140px;">
+                <select class="form-select form-select-sm" id="statusFilterSelect" onchange="applyStatusFilter(this.value)">
+                    {% for opt in status_options %}
+                    <option value="{{ opt.value }}" {% if current_status_filter == opt.value %}selected{% endif %}>{{ opt.label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <!-- 关键词搜索：标题 / URL / 任务ID / 上传结果（BV号、投稿链接等） -->
+            <div class="input-group input-group-sm" style="width: 260px;">
+                <input type="text" class="form-control" id="taskSearchInput" placeholder="搜索标题/URL/上传结果…" value="{{ current_search or '' }}"
+                       onkeydown="if(event.key==='Enter'){applyTaskSearch();}">
+                <button type="button" class="btn btn-outline-secondary" onclick="applyTaskSearch()" title="搜索">
+                    <i class="bi bi-search"></i>
+                </button>
+                {% if current_search %}
+                <button type="button" class="btn btn-outline-secondary" onclick="clearTaskSearch()" title="清除搜索">
+                    <i class="bi bi-x-lg"></i>
+                </button>
+                {% endif %}
+            </div>
+            <div id="tasksRefreshIndicator" class="d-none" aria-hidden="true">
+                <span class="spinner-border spinner-border-sm text-primary" role="status" aria-label="正在刷新"></span>
+            </div>
+        </div>
+        <div class="d-flex gap-2 flex-wrap align-items-center">
+            <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addTaskModal">
+                <i class="bi bi-plus-circle"></i> 新建任务
+            </button>
+            {% if failed_tasks %}
+            <button type="button" class="btn btn-outline-danger" id="retryFailedTasksBtn" onclick="confirmRetryFailed()">
+                <i class="bi bi-arrow-repeat"></i> 重试失败任务
+                <span class="badge bg-danger ms-1">{{ failed_tasks|length }}</span>
+            </button>
+            {% endif %}
+
+            {% if tasks %}
+            <!-- 批量操作组 -->
+            <div class="btn-group me-2">
+                <button type="button" class="btn btn-outline-primary" id="batchPartitionBtn" onclick="openBatchPartitionModal()">
+                    <i class="bi bi-diagram-3"></i> 批量分区
+                </button>
+                <button type="button" class="btn btn-outline-success" id="batchApproveBtn" onclick="confirmBatchApprove()">
+                    <i class="bi bi-check2-circle"></i> 批量审核
+                </button>
+                <button type="button" class="btn btn-outline-warning" id="batchUploadBtn" onclick="confirmBatchUpload()">
+                    <i class="bi bi-cloud-arrow-up"></i> 批量上传
+                </button>
+                <button type="button" class="btn btn-outline-info" id="batchUploadBiliBtn" onclick="confirmBatchUploadBilibili()">
+                    <i class="bi bi-cloud-arrow-up-fill"></i> 上传到B站
+                </button>
+                <button type="button" class="btn btn-outline-secondary" id="batchEditBtn" onclick="openBatchEditModal()">
+                    <i class="bi bi-pencil"></i> 批量修改
+                </button>
+                <button type="button" class="btn btn-outline-danger" id="batchDeleteBtn" onclick="confirmBatchDelete()">
+                    <i class="bi bi-trash3"></i> 删除选中 <span id="selectedCount" class="badge bg-danger ms-1 d-none">0</span>
+                </button>
+            </div>
+            <button type="button" class="btn btn-danger" onclick="confirmClearAll()">
+                <i class="bi bi-trash"></i> 清除所有任务
+            </button>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- 任务列表主体 -->
+    <div id="tasksContent">
+    {% if tasks %}
+    <div class="modern-list">
+        <!-- 桌面端表格 -->
+        <div class="table-responsive modern-table d-none d-md-block">
+            <table class="table table-striped table-hover table-borderless table-sm align-middle mb-0 tasks-table no-min-width" id="mainTasksTable">
+                <colgroup id="tasksColgroup">
+                    <col class="col-check">
+                    <col class="col-title">
+                    <col class="col-status">
+                    <col class="col-time">
+                    <col class="col-platform">
+                    <col class="col-partition">
+                    <col class="col-tags">
+                    <col class="col-result">
+                    <col class="col-actions">
+                    <col class="col-failreason">
+                </colgroup>
+                <thead class="table-light">
+                    <tr>
+                        <th class="col-check">
+                            <input type="checkbox" class="form-check-input" id="selectAllTasks" onclick="toggleAllTasks(this)">
+                        </th>
+                        <th class="col-title">视频标题</th>
+                        <th class="col-status text-center">状态</th>
+                        <th class="col-time text-center">更新时间</th>
+                        <th class="col-platform text-center">平台</th>
+                        <th class="col-partition text-center">分区</th>
+                        <th class="col-tags">标签</th>
+                        <th class="col-result">上传结果</th>
+                        <th class="col-actions text-end">操作</th>
+                        <th class="col-failreason">失败原因</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for task in tasks %}
+                        {% include 'partials/task_row.html' %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- 移动端卡片 -->
+        <div class="d-block d-md-none">
+            <div class="task-cards">
+                {% for task in tasks %}
+                    {% include 'partials/task_card.html' %}
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+    {% else %}
+    <div class="alert alert-info">
+        <i class="bi bi-info-circle"></i> 暂无任务，请点击"新建任务"按钮添加任务。
+    </div>
+    {% endif %}
+    
+    <!-- 分页导航 -->
+    {% if pagination and pagination.total > 0 %}
+    <nav aria-label="任务列表分页" class="mt-4">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <span class="text-muted small">
+                显示第 {{ (pagination.page - 1) * pagination.per_page + 1 }} - {{ (pagination.page - 1) * pagination.per_page + pagination.tasks|length }} 条，共 {{ pagination.total }} 条任务
+            </span>
+            {% if pagination.total_pages > 1 %}
+            {%- set start_page = pagination.page - 2 if pagination.page > 2 else 1 -%}
+            {%- set end_page = pagination.page + 2 if pagination.page + 2 < pagination.total_pages else pagination.total_pages -%}
+            {%- set status_suffix = '&status=' ~ current_status_filter if current_status_filter else '' -%}
+            {%- set search_suffix = '&q=' ~ (current_search | urlencode) if current_search else '' -%}
+            {%- set filter_suffix = status_suffix ~ search_suffix -%}
+
+            <div class="pagination pagination-sm mb-0" role="list">
+            {%- if pagination.has_prev -%}
+                <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.prev_page }}{{ filter_suffix }}" aria-label="上一页"><span aria-hidden="true">&laquo;</span></a></div>
+            {%- else -%}
+                <div class="page-item disabled" role="listitem"><span class="page-link" aria-label="上一页"><span aria-hidden="true">&laquo;</span></span></div>
+            {%- endif -%}
+            {%- if start_page > 1 -%}
+                <div class="page-item" role="listitem"><a class="page-link" href="?page=1{{ filter_suffix }}">1</a></div>
+                {%- if start_page > 2 -%}
+                    <div class="page-item disabled" role="listitem"><span class="page-link">...</span></div>
+                {%- endif -%}
+            {%- endif -%}
+            {%- for page_num in range(start_page, end_page + 1) -%}
+                {%- if page_num == pagination.page -%}
+                    <div class="page-item active" role="listitem" aria-current="page"><span class="page-link">{{ page_num }}</span></div>
+                {%- else -%}
+                    <div class="page-item" role="listitem"><a class="page-link" href="?page={{ page_num }}{{ filter_suffix }}">{{ page_num }}</a></div>
+                {%- endif -%}
+            {%- endfor -%}
+            {%- if end_page < pagination.total_pages -%}
+                {%- if end_page < pagination.total_pages - 1 -%}
+                    <div class="page-item disabled" role="listitem"><span class="page-link">...</span></div>
+                {%- endif -%}
+                <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.total_pages }}{{ filter_suffix }}">{{ pagination.total_pages }}</a></div>
+            {%- endif -%}
+            {%- if pagination.has_next -%}
+                <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.next_page }}{{ filter_suffix }}" aria-label="下一页"><span aria-hidden="true">&raquo;</span></a></div>
+            {%- else -%}
+                <div class="page-item disabled" role="listitem"><span class="page-link" aria-label="下一页"><span aria-hidden="true">&raquo;</span></span></div>
+            {%- endif -%}
+            </div>
+            {% endif %}
+        </div>
+    </nav>
+    {% endif %}
+    </div>
+</div>
+
+<!-- ==================== 所有模态框保持不变 ==================== -->
+<!-- 新建任务对话框 -->
+<div class="modal fade" id="addTaskModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-plus-circle"></i> 新建任务</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <form method="post" action="{{ url_for('add_task_route') }}">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="youtube_url" class="form-label">YouTube视频URL</label>
+                        <input type="text" class="form-control" id="youtube_url" name="youtube_url" required placeholder="https://www.youtube.com/watch?v=...">
+                        <div class="form-text">支持标准YouTube视频链接</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="upload_target" class="form-label">目标平台</label>
+                        {% set default_target = (config.get('UPLOAD_TARGET_DEFAULT', 'acfun'))|lower %}
+                        <select class="form-select" id="upload_target" name="upload_target">
+                            <option value="acfun" {% if default_target == 'acfun' %}selected{% endif %}>AcFun</option>
+                            <option value="bilibili" {% if default_target == 'bilibili' %}selected{% endif %}>bilibili</option>
+                            <option value="both" {% if default_target == 'both' %}selected{% endif %}>双平台（AcFun + bilibili）</option>
+                        </select>
+                        <div class="form-text">不选择时将使用系统默认平台</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-circle"></i> 取消</button>
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-plus-circle"></i> 添加任务</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- ==================== 操作确认模态框 ==================== -->
+
+<!-- 重试所有失败任务 -->
+<div class="modal fade" id="retryFailedTasksModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-arrow-repeat"></i> 重试所有失败任务</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p>确定要重新调度所有失败的任务吗？</p>
+                <p class="mb-0 text-muted small">将按失败时间从早到晚依次重新调度；若失败原因是 B 站限频（137022），建议等待 10 分钟以上再执行。</p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="bi bi-x-circle"></i> 取消
+                </button>
+                <form method="post" action="{{ url_for('retry_failed_tasks_route') }}">
+                    <button type="submit" class="btn btn-outline-danger">
+                        <i class="bi bi-arrow-repeat"></i> 确认重试
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 批量设置分区 -->
+<div class="modal fade" id="batchPartitionModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-diagram-3"></i> 批量设置分区</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p>将为选中的 <span class="badge bg-primary" id="batchPartitionCount">0</span> 个任务覆盖分区设置。</p>
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label for="batchAcfunPartition" class="form-label">AcFun 分区（留空则不修改）</label>
+                        <select id="batchAcfunPartition" class="form-select">
+                            <option value="">— 不修改 —</option>
+                            {% for category in acfun_partition_mapping or [] %}
+                                <optgroup label="{{ category.category }}">
+                                    {% for partition in category.partitions %}
+                                        <option value="{{ partition.id }}">{{ partition.name }} ({{ partition.id }})</option>
+                                        {% for sub_partition in partition.sub_partitions %}
+                                            <option value="{{ sub_partition.id }}">&nbsp;&nbsp;└ {{ sub_partition.name }} ({{ sub_partition.id }})</option>
+                                        {% endfor %}
+                                    {% endfor %}
+                                </optgroup>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-6">
+                        <label for="batchBilibiliPartition" class="form-label">bilibili 分区（留空则不修改）</label>
+                        <select id="batchBilibiliPartition" class="form-select">
+                            <option value="">— 不修改 —</option>
+                            {% for category in bilibili_partition_mapping or [] %}
+                                <optgroup label="{{ category.category }}">
+                                    {% for partition in category.partitions %}
+                                        <option value="{{ partition.id }}">{{ partition.name }} ({{ partition.id }})</option>
+                                        {% for sub_partition in partition.sub_partitions %}
+                                            <option value="{{ sub_partition.id }}">&nbsp;&nbsp;└ {{ sub_partition.name }} ({{ sub_partition.id }})</option>
+                                        {% endfor %}
+                                    {% endfor %}
+                                </optgroup>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="bi bi-x-circle"></i> 取消
+                </button>
+                <button type="button" class="btn btn-primary" onclick="executeBatchPartition(this)">
+                    <i class="bi bi-check2-square"></i> 应用到选中任务
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 批量删除 -->
+<div class="modal fade" id="batchDeleteModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-trash3"></i> 批量删除任务</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-danger fw-bold">即将删除选中的 <span class="badge bg-danger" id="batchDeleteCount">0</span> 个任务，此操作无法恢复！</p>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="batchDeleteFiles" checked>
+                    <label class="form-check-label" for="batchDeleteFiles">
+                        同时删除已下载的视频文件
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="bi bi-x-circle"></i> 取消
+                </button>
+                <button type="button" class="btn btn-danger" id="batchDeleteConfirmBtn" onclick="executeBatchDelete()">
+                    <i class="bi bi-trash"></i> 确认删除
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 批量修改 -->
+<div class="modal fade" id="batchEditModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-pencil"></i> 批量修改任务信息</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p>将为选中的 <span class="badge bg-primary" id="batchEditCount">0</span> 个任务统一保存信息，<strong>留空的字段不会被修改</strong>。</p>
+                <div class="mb-3">
+                    <label for="batchEditTitle" class="form-label">视频标题（留空则不修改）</label>
+                    <input type="text" class="form-control" id="batchEditTitle" maxlength="250" placeholder="留空保持原值">
+                    <div class="form-text">bilibili 标题上限 80 字符，超出部分可能被截断或导致上传失败。</div>
+                </div>
+                <div class="mb-3">
+                    <label for="batchEditDescription" class="form-label">视频简介（留空则不修改）</label>
+                    <textarea class="form-control" id="batchEditDescription" rows="4" maxlength="2000" placeholder="留空保持原值"></textarea>
+                </div>
+                <div class="mb-3">
+                    <label for="batchEditTags" class="form-label">标签（留空则不修改）</label>
+                    <input type="text" class="form-control" id="batchEditTags" placeholder="多个标签用逗号分隔，例如：科技,数码,评测">
+                    <div class="form-text">最多 10 个标签，bilibili 单标签上限 20 字符。</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="bi bi-x-circle"></i> 取消
+                </button>
+                <button type="button" class="btn btn-primary" id="batchEditConfirmBtn" onclick="executeBatchEdit(this)">
+                    <i class="bi bi-check2-square"></i> 保存修改
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 任务错误详情 -->
+<div class="modal fade" id="taskErrorModal" tabindex="-1" aria-labelledby="taskErrorModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div>
+                    <h5 class="modal-title" id="taskErrorModalLabel">错误详情</h5>
+                    <div class="small text-muted mt-1" id="taskErrorMeta"></div>
+                </div>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <pre class="task-error-content mb-0" id="taskErrorMessage"></pre>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 清除所有任务 -->
+<div class="modal fade" id="clearAllTasksModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-exclamation-triangle"></i> 确认清除所有任务</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-danger fw-bold">此操作将清除所有任务，且无法恢复！</p>
+                <p>确定要清除所有任务吗？</p>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="clearAllFiles" checked>
+                    <label class="form-check-label" for="clearAllFiles">
+                        同时删除所有任务文件
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="bi bi-x-circle"></i> 取消
+                </button>
+                <form id="clearAllTasksForm" method="post" action="{{ url_for('clear_all_tasks_route') }}">
+                    <input type="hidden" name="delete_files" id="clearAllFilesInput" value="true">
+                    <button type="submit" class="btn btn-danger">
+                        <i class="bi bi-trash"></i> 确认清除
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- 请确保将您之前的 <div class="modal fade" id="deleteTaskModal"> 等一整块代码粘贴在这里 -->
+<!-- ==================== 模态框结束 ==================== -->
+{% endblock %}
+
+{% block extra_css %}
+<style>
+/* 一般单元格：垂直居中，避免内容溢出 */
+.tasks-table td, .tasks-table th {
+    vertical-align: middle;
+    padding: 0.5rem;
+    overflow: hidden; 
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tasks-table {
+    table-layout: fixed;
+    width: 100%;
+}
+
+/* 强制锁定复选框列的固定大小，不参与百分比拉伸 */
+.tasks-table th.col-check,
+.tasks-table td.col-check {
+    width: 40px;
+    text-align: center;
+    padding: 0 8px;
+}
+
+.tasks-table th.col-check input,
+.tasks-table td.col-check input {
+    margin: 0 !important;
+    display: inline-block !important;
+}
+
+/* 状态列：进度说明文字（如「排队等待上传配额（第 N 位）…」）允许在列宽内换行，避免被截断 */
+.tasks-table td.col-status [data-task-progress] {
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.3;
+}
+
+/* 操作列按钮不换行 */
+.col-actions .d-flex {
+    flex-wrap: nowrap !important;
+    justify-content: flex-end;
+}
+
+/* 失败原因列：宽度由 adjustTableColumns 按分辨率分配，这里只管内容截断 */
+.tasks-table td.col-failreason {
+    white-space: normal;           /* 覆盖通用单元格的 nowrap，允许按列宽换行 */
+}
+.fail-reason-cell {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0;
+}
+.fail-reason-badge {
+    display: flex !important;      /* 覆盖 bootstrap .badge 的 inline-block */
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box;
+    align-items: flex-start;
+    gap: 5px;
+    text-align: left;
+    cursor: pointer;
+    overflow: hidden;
+    white-space: normal;           /* 覆盖 bootstrap .badge 的 nowrap */
+}
+.fail-reason-badge > i {
+    flex: 0 0 auto;                /* 警告图标固定不缩，与文本同排 */
+    margin-top: 1px;
+}
+.fail-reason-badge .fail-reason-text {
+    flex: 1 1 0;
+    min-width: 0;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    white-space: normal;
+    word-break: break-all;
+    font-weight: 500;
+    line-height: 1.3;
+}
+
+/* 响应式列隐藏：由 JS 按容器宽度切换 cw-1500 / cw-1200 class */
+.tasks-table.cw-1500 th.col-tags,
+.tasks-table.cw-1500 td.col-tags {
+    display: none;
+}
+.tasks-table.cw-1200 th.col-tags,
+.tasks-table.cw-1200 td.col-tags,
+.tasks-table.cw-1200 th.col-result,
+.tasks-table.cw-1200 td.col-result {
+    display: none;
+}
+
+.task-card { position: relative; }
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.upload-result-container {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    max-width: 180px;
+    overflow: hidden;
+}
+
+.error-message-badge {
+    max-width: 300px;
+    cursor: pointer;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+    display: inline-block;
+    text-align: left;
+}
+
+.error-message-trigger { padding: 0.35em 0.65em; }
+.error-message-trigger:focus-visible { outline: 2px solid rgba(13, 110, 253, 0.45); outline-offset: 2px; }
+
+.task-error-content {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 0.92rem;
+    line-height: 1.55;
+    color: #212529;
+    background: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 0.5rem;
+    padding: 1rem;
+}
+
+.tasks-table .col-status { text-align: center; }
+.tasks-table .col-time { text-align: center; }
+.tasks-table .col-platform { text-align: center; }
+.tasks-table .col-partition { text-align: center; }
+.tasks-table .col-actions { text-align: right; }
+
+.task-datetime {
+    cursor: help; border-bottom: 1px dotted #6c757d;
+    display: inline-block; white-space: nowrap;
+}
+
+.table-responsive { overflow-x: auto; }
+.tasks-table.no-min-width { min-width: 0; }
+.tasks-table .text-monospace { font-size: 0.875rem; }
+.tags-container { max-width: 100%; overflow: hidden; }
+
+.tasks-table .badge {
+    max-width: 120px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+}
+.tasks-table .col-result .badge { max-width: 160px; }
+.tasks-table .btn-sm { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
+
+.title-clamp {
+    display: -webkit-box; -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical; overflow: hidden;
+    line-clamp: 2; white-space: normal; word-break: break-word; overflow-wrap: anywhere;
+}
+
+.title-clamp-3 {
+    -webkit-line-clamp: 3; line-clamp: 3;
+    max-height: 4.2em; line-height: 1.4;
+}
+
+.progress.progress-thin { height: 4px; }
+.progress.progress-thin .progress-bar { background-color: #0d6efd; }
+
+tr.status-downloading td { background-color: rgba(13,110,253,0.03); }
+tr.status-uploading td { background-color: rgba(25,135,84,0.03); }
+tr.status-failed td { background-color: rgba(220,53,69,0.03); }
+tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
+
+.modern-list { border: none; box-shadow: none; }
+.modern-table table { border-collapse: separate; border-spacing: 0 4px; }
+.modern-table table tbody tr { background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+.modern-table table thead th { border-bottom: 1px solid #e9ecef; }
+.modern-table table tbody tr td { border-top: none; }
+.modern-table .table-hover tbody tr:hover { background: rgba(13,110,253,0.04); }
+.modern-table .table { background: transparent; }
+.table-borderless>:not(caption)>*>* { border-bottom-width: 0; }
+</style>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // 筛选状态并刷新页面
+    function applyStatusFilter(status) {
+        const url = new URL(window.location.href);
+        if (status) {
+            url.searchParams.set('status', status);
+        } else {
+            url.searchParams.delete('status');
+        }
+        url.searchParams.delete('page');
+        window.location.href = url.toString();
+    }
+
+    // 关键词搜索（标题/URL/任务ID/上传结果）
+    function applyTaskSearch() {
+        const keyword = (document.getElementById('taskSearchInput')?.value || '').trim();
+        const url = new URL(window.location.href);
+        if (keyword) {
+            url.searchParams.set('q', keyword);
+        } else {
+            url.searchParams.delete('q');
+        }
+        url.searchParams.delete('page');
+        window.location.href = url.toString();
+    }
+
+    function clearTaskSearch() {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('q');
+        url.searchParams.delete('page');
+        window.location.href = url.toString();
+    }
+
+    // --- 动态计算并分配表格列宽 (基于当前页面分辨率) ---
+    // 列序: check/title/status/time/platform/partition/tags/result/actions/failreason
+    // 标题列不设固定宽度，自动占据剩余空间；次要列在窄屏下由 CSS 媒体查询隐藏
+    function adjustTableColumns() {
+        const table = document.getElementById('mainTasksTable');
+        const colgroup = document.getElementById('tasksColgroup');
+        if (!table || !colgroup) return;
+
+        const cols = colgroup.querySelectorAll('col');
+        if (cols.length < 10) return;
+
+        const containerWidth = table.parentElement.clientWidth;
+
+        // 分辨率分档：>=1500 全列展示；1200-1499 隐藏标签列；<1200 再隐藏上传结果列
+        const wide = containerWidth >= 1500;
+        const compact = containerWidth < 1200;
+
+        // 各固定宽度列的取值（0 表示该列被隐藏，仅兜底）
+        const w = wide
+            ? { check: 40, status: 130, time: 120, platform: 80, partition: 120, tags: 160, result: 70,  actions: 110, fail: 300 }
+            : (compact
+                ? { check: 40, status: 110, time: 106, platform: 72, partition: 96,  tags: 0,   result: 0,   actions: 100, fail: 190 }
+                : { check: 40, status: 120, time: 112, platform: 76, partition: 104, tags: 0,   result: 66,  actions: 106, fail: 240 });
+
+        // 切换表格上的响应式 class（配合 CSS 隐藏对应的 th/td 单元格）
+        table.classList.toggle('cw-1500', !wide);
+        table.classList.toggle('cw-1200', compact);
+
+        cols.forEach((col, i) => {
+            if (i === 1) { col.style.width = 'auto'; return; } // 标题列自适应剩余宽度
+            const map = ['check', null, 'status', 'time', 'platform', 'partition', 'tags', 'result', 'actions', 'fail'];
+            const key = map[i];
+            col.style.width = (key && w[key]) ? w[key] + 'px' : 'auto';
+        });
+    }
+
+    // --- 基础辅助函数 ---
+    function copyToClipboard(text) {
+        if (!text) return;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(() => {});
+        } else {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+        }
+    }
+
+    function confirmDelete(taskId, taskTitle) {
+        document.getElementById('deleteTaskTitle').textContent = taskTitle;
+        document.getElementById('deleteTaskForm').action = "{{ url_for('delete_task_route', task_id='TASK_ID') }}".replace('TASK_ID', taskId);
+        const deleteFilesCheckbox = document.getElementById('deleteFiles');
+        const deleteFilesInput = document.getElementById('deleteFilesInput');
+        if (deleteFilesCheckbox && deleteFilesInput) {
+            deleteFilesCheckbox.onchange = function() { deleteFilesInput.value = this.checked ? 'true' : 'false'; };
+        }
+        new bootstrap.Modal(document.getElementById('deleteTaskModal')).show();
+    }
+
+    function confirmStopTask(taskId, taskTitle) {
+        if (!confirm(`确定要停止任务 "${taskTitle}" 吗？\n(已下载的部分文件会被保留，下次点开始可尝试续传)`)) return;
+        const formData = new FormData();
+        fetch(`/tasks/${taskId}/stop`, { method: 'POST', body: formData }).then(res => {
+            if (res.ok) setTimeout(() => window.location.reload(), 500);
+            else alert('停止任务失败');
+        }).catch(() => alert('网络错误'));
+    }
+
+    function confirmClearAll() {
+        const clearAllFilesCheckbox = document.getElementById('clearAllFiles');
+        const clearAllFilesInput = document.getElementById('clearAllFilesInput');
+        if (clearAllFilesCheckbox && clearAllFilesInput) {
+            clearAllFilesCheckbox.onchange = function() { clearAllFilesInput.value = this.checked ? 'true' : 'false'; };
+        }
+        new bootstrap.Modal(document.getElementById('clearAllTasksModal')).show();
+    }
+
+    function confirmRetryFailed() {
+        const modalEl = document.getElementById('retryFailedTasksModal');
+        if (modalEl) { new bootstrap.Modal(modalEl).show(); }
+    }
+
+    // 错误提示友好化：与 modules/error_hints.py 的映射保持一致
+    const ERROR_HINT_PATTERNS = [
+        [/137022|投稿过于频繁/i, 'B站投稿频率限制', 'B站对投稿间隔有限制：建议等待 10~30 分钟后再重试；新账号或低等级账号每日投稿配额较低，可隔天发布。'],
+        [/curl:?\s*\(60\)|SSL certificate|certificate has expired/i, '网络证书校验失败', '通常是代理/VPN 对 HTTPS 拦截或系统时间不对：关闭代理重试、校准系统时间、或更换网络。'],
+        [/curl:?\s*\(92\)|HTTP\/2 stream|PROTOCOL_ERROR/i, '网络连接不稳定', '网络传输中断，系统会自动重试；若反复出现请检查网络/代理稳定性。'],
+        [/curl:?\s*\(28\)|timed? ?out|Timeout/i, '网络请求超时', '系统会自动指数退避重试；若持续失败请检查网络带宽与代理。'],
+        [/登录|未登录|login|cookie.{0,6}(失效|过期|invalid)/i, '平台登录凭据失效', '请到「设置」页对对应平台重新扫码登录，或通过 CookieCloud 同步新 Cookie。'],
+        [/分区|partition.{0,10}(invalid|illegal)|不合法/i, '投稿分区不合法', '请到「设置」页调整默认分区，或在人工审核页修改后重新上传。'],
+        [/标题.{0,6}(长|超过)|title.{0,10}(too long|exceed)/i, '标题超长', '请缩短标题后重试。'],
+        [/风控|审核不通过|违规|敏感/i, '内容未通过平台审核', '请检查标题/简介/标签是否含敏感词，或更换视频后重试。'],
+        [/磁盘|空间不足|No space left/i, '磁盘空间不足', '请清理下载目录/临时目录空间，或在「设置」开启自动清理。'],
+    ];
+    function friendlyErrorText(msg) {
+        if (!msg) return msg;
+        for (const [re, reason, advice] of ERROR_HINT_PATTERNS) {
+            if (re.test(msg)) return msg + '\n💡 ' + reason + '：' + advice;
+        }
+        return msg;
+    }
+
+    function showTaskErrorMessage(taskId, taskTitle, errorMessage) {
+        const modalEl = document.getElementById('taskErrorModal');
+        const metaEl = document.getElementById('taskErrorMeta');
+        const messageEl = document.getElementById('taskErrorMessage');
+        if (!modalEl || !metaEl || !messageEl) return;
+        const metaParts = [];
+        if (taskTitle) metaParts.push(taskTitle);
+        if (taskId) metaParts.push('任务ID: ' + taskId);
+        metaEl.textContent = metaParts.join(' | ');
+        messageEl.textContent = friendlyErrorText(errorMessage || '未知错误');
+        new bootstrap.Modal(modalEl).show();
+    }
+
+    // --- SSE 实时刷新逻辑 ---
+    const REFRESH_INTERVAL_ACTIVE = 2000;
+    const REFRESH_INTERVAL_IDLE = 8000;
+    const REFRESH_INTERVAL_EMPTY = 15000;
+
+    let refreshTimer = null;
+    let refreshInProgress = false;
+    let fallbackMode = false;
+    let tasksEventSource = null;
+    let reconnectTimer = null;
+
+    let pendingTasksContentHtml = null;
+    let pendingTasksApplyTimer = null;
+    let interactionHoldUntil = 0;
+    let pointerIsDown = false;
+
+    function markTasksInteracting(holdMs) {
+        interactionHoldUntil = Math.max(interactionHoldUntil, Date.now() + (typeof holdMs === 'number' ? holdMs : 800));
+    }
+
+    function isTasksInteracting() {
+        const root = document.querySelector('#tasksContent');
+        if (!root) return false;
+        if (pointerIsDown || Date.now() < interactionHoldUntil) return true;
+        const activeEl = document.activeElement;
+        if (activeEl && root.contains(activeEl)) {
+            const tagName = (activeEl.tagName || '').toLowerCase();
+            if (['input', 'textarea', 'select'].includes(tagName) || activeEl.isContentEditable) return true;
+        }
+        return false;
+    }
+
+    const taskFragmentRefreshes = new Map();
+
+    function queryAllWithin(root, selector) {
+        if (!root || !selector) return [];
+        const base = root === document ? document.documentElement : root;
+        const matches = [];
+        if (base.matches && base.matches(selector)) matches.push(base);
+        if (base.querySelectorAll) matches.push(...base.querySelectorAll(selector));
+        return matches;
+    }
+
+    function escapeTaskIdForSelector(taskId) {
+        const value = String(taskId || '');
+        return window.CSS && window.CSS.escape ? window.CSS.escape(value) : value.replace(/["\\]/g, '\\$&');
+    }
+
+    function getTaskFragmentUrl(taskId) {
+        const container = document.querySelector('.tasks-container[data-task-fragment-template]');
+        return container ? container.getAttribute('data-task-fragment-template').replace('__TASK_ID__', encodeURIComponent(taskId)) : `/tasks/${encodeURIComponent(taskId)}/fragment`;
+    }
+
+    function createTaskRowFromHtml(html) {
+        return new DOMParser().parseFromString(`<table><tbody>${html}</tbody></table>`, 'text/html').querySelector('tr[data-task-id]');
+    }
+
+    function createTaskCardFromHtml(html) {
+        return new DOMParser().parseFromString(html, 'text/html').querySelector('.task-card[data-task-id]');
+    }
+
+    function replaceTaskElement(oldElement, newElement) {
+        if (!oldElement || !newElement) return;
+        disposeTooltips(oldElement);
+        oldElement.replaceWith(newElement);
+        bindTasksEvents(newElement);
+        initTooltips(newElement);
+        updateTaskDateTimes(newElement);
+        updateProgressBars(newElement);
+    }
+
+    function replaceTaskFragments(taskId, fragments) {
+        if (!taskId || !fragments) return;
+        const escapedTaskId = escapeTaskIdForSelector(taskId);
+        const currentRow = document.querySelector(`tr[data-task-id="${escapedTaskId}"]`);
+        const currentCard = document.querySelector(`.task-card[data-task-id="${escapedTaskId}"]`);
+        let replaced = false;
+
+        if (currentRow && typeof fragments.row_html === 'string') {
+            const newRow = createTaskRowFromHtml(fragments.row_html);
+            if (newRow) { replaceTaskElement(currentRow, newRow); replaced = true; }
+        }
+        if (currentCard && typeof fragments.card_html === 'string') {
+            const newCard = createTaskCardFromHtml(fragments.card_html);
+            if (newCard) { replaceTaskElement(currentCard, newCard); replaced = true; }
+        }
+        return replaced;
+    }
+
+    function applyTaskProgressUpdate(taskId, payload) {
+        if (!taskId || !payload) return;
+        const escapedTaskId = escapeTaskIdForSelector(taskId);
+        const progressText = typeof payload.upload_progress === 'string' ? payload.upload_progress : '';
+        const dateTimeValue = payload.updated_at;
+
+        document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-progress]`).forEach(el => {
+            el.textContent = progressText;
+            el.classList.toggle('d-none', !progressText.trim());
+        });
+
+        if (dateTimeValue) {
+            document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-datetime]`).forEach(el => {
+                el.setAttribute('data-datetime', dateTimeValue);
+                updateTaskDateTimes(el);
+            });
+        }
+    }
+
+    async function refreshTaskFragment(taskId) {
+        if (!taskId) return;
+        const escapedTaskId = escapeTaskIdForSelector(taskId);
+        if (!document.querySelector(`tr[data-task-id="${escapedTaskId}"]`) && !document.querySelector(`.task-card[data-task-id="${escapedTaskId}"]`)) return;
+        if (taskFragmentRefreshes.has(taskId)) return taskFragmentRefreshes.get(taskId);
+
+        const requestPromise = (async () => {
+            try {
+                const response = await fetch(getTaskFragmentUrl(taskId), { cache: 'no-store', headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }});
+                if (!response.ok) throw new Error(`状态码 ${response.status}`);
+                const payload = await response.json();
+               if (!payload?.success) throw new Error('响应无效');
+               replaceTaskFragments(taskId, payload);
+               checkReloadOnCompleted(taskId);
+            } catch (error) {
+                console.error('刷新失败:', taskId, error);
+                refreshTasksData(true);
+            } finally {
+                taskFragmentRefreshes.delete(taskId);
+            }
+        })();
+        taskFragmentRefreshes.set(taskId, requestPromise);
+        return requestPromise;
+    }
+
+    function applyTasksContentHtml(html) {
+        const currentContent = document.querySelector('#tasksContent');
+        if (!currentContent || typeof html !== 'string' || html === currentContent.innerHTML) return;
+
+        disposeTooltips();
+        currentContent.innerHTML = html;
+        bindTasksEvents();
+        initTooltips();
+        updateTaskDateTimes();
+        updateProgressBars();
+        restoreSelectionState();
+        
+        // 局部刷新后，重新计算列宽
+        adjustTableColumns(); 
+    }
+
+    function scheduleApplyPendingTasksContent() {
+        if (pendingTasksApplyTimer) return;
+        pendingTasksApplyTimer = setTimeout(() => {
+            pendingTasksApplyTimer = null;
+            if (!pendingTasksContentHtml) return;
+            if (isTasksInteracting()) {
+                pendingTasksApplyTimer = setTimeout(arguments.callee, 300);
+                return;
+            }
+            const htmlToApply = pendingTasksContentHtml;
+            pendingTasksContentHtml = null;
+            applyTasksContentHtml(htmlToApply);
+        }, 300);
+    }
+
+    function showRefreshIndicator(isVisible) {
+        const indicator = document.getElementById('tasksRefreshIndicator');
+        if (indicator) {
+            indicator.classList.toggle('d-none', !isVisible);
+            indicator.setAttribute('aria-hidden', String(!isVisible));
+        }
+    }
+
+    function clearScheduledRefresh() { if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; } }
+
+    function enableFallbackPolling(initialDelay) {
+        if (fallbackMode) { if (typeof initialDelay === 'number' && !refreshTimer) scheduleNextRefresh(initialDelay); return; }
+        fallbackMode = true;
+        scheduleNextRefresh(typeof initialDelay === 'number' ? initialDelay : undefined);
+    }
+
+    function disableFallbackPolling() { const wasFallback = fallbackMode; fallbackMode = false; clearScheduledRefresh(); return wasFallback; }
+
+    function updateProgressBars(root = document) {
+        queryAllWithin(root, '.progress-bar[data-pct]').forEach(el => {
+            let v = parseInt(el.getAttribute('data-pct') || '0', 10);
+            v = isNaN(v) ? 0 : Math.max(0, Math.min(100, v));
+            el.style.width = v + '%';
+            el.setAttribute('aria-valuenow', String(v));
+        });
+    }
+
+    function updateTasksTable(newContent) {
+        const newDoc = new DOMParser().parseFromString(newContent, 'text/html');
+        const newTasksContent = newDoc.querySelector('#tasksContent');
+        if (!newTasksContent) return;
+
+        if (isTasksInteracting()) {
+            pendingTasksContentHtml = newTasksContent.innerHTML;
+            scheduleApplyPendingTasksContent();
+        } else {
+            applyTasksContentHtml(newTasksContent.innerHTML);
+        }
+    }
+
+    function closeTasksEventSource() { if (tasksEventSource) { tasksEventSource.close(); tasksEventSource = null; } }
+
+    let eventSourceReconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 5;
+    const RECONNECT_DELAY_BASE = 1000;
+    
+    const COMPLETED_RELOAD_DELAY_MS = 800;
+    let completedReloadScheduled = false;
+
+    function scheduleReloadForCompleted() {
+        if (completedReloadScheduled) return;
+        completedReloadScheduled = true;
+        setTimeout(function () {
+            try { closeTasksEventSource(); } catch (e) { /* ignore */ }
+            window.location.reload();
+        }, COMPLETED_RELOAD_DELAY_MS);
+    }
+
+    function extractEventStatus(payload, eventData) {
+        const sources = [
+            eventData && eventData.status,
+            eventData && eventData.task_status,
+            eventData && eventData.task && eventData.task.status,
+            payload && payload.status,
+            payload && payload.task_status,
+            payload && payload.task && payload.task.status,
+        ];
+        for (let i = 0; i < sources.length; i++) {
+            const v = sources[i];
+            if (typeof v === 'string' && v.trim()) return v.trim().toLowerCase();
+        }
+        return '';
+    }
+
+    function isElementCompleted(el) {
+        if (!el) return false;
+        if (el.dataset && String(el.dataset.status || '').toLowerCase() === 'completed') return true;
+        if (el.classList && el.classList.contains('status-completed')) return true;
+        const badge = el.querySelector ? el.querySelector('.task-status-badge') : null;
+        if (badge && badge.textContent.trim() === '已完成') return true;
+        return false;
+    }
+
+    function checkReloadOnCompleted(taskId) {
+        if (!taskId) return false;
+        const escaped = escapeTaskIdForSelector(taskId);
+        const row = document.querySelector(`tr[data-task-id="${escaped}"]`);
+        const card = document.querySelector(`.task-card[data-task-id="${escaped}"]`);
+        if (isElementCompleted(row) || isElementCompleted(card)) {
+            scheduleReloadForCompleted();
+            return true;
+        }
+        return false;
+    }
+
+    function initTasksEventStream() {
+        const container = document.querySelector('.tasks-container[data-tasks-stream]');
+        if (!container || typeof window.EventSource === 'undefined') { enableFallbackPolling(hasProcessingTasks() ? REFRESH_INTERVAL_ACTIVE : REFRESH_INTERVAL_IDLE); return; }
+        const streamUrl = container.getAttribute('data-tasks-stream');
+        if (!streamUrl) { enableFallbackPolling(REFRESH_INTERVAL_IDLE); return; }
+
+        tasksEventSource = new EventSource(streamUrl, { withCredentials: true });
+
+        tasksEventSource.onopen = function() {
+            eventSourceReconnectAttempts = 0;
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            if (disableFallbackPolling()) refreshTasksData(true);
+        };
+
+        tasksEventSource.onmessage = function(event) {
+            if (!event?.data) return;
+            try {
+                const payload = JSON.parse(event.data);
+                if (['heartbeat', 'welcome'].includes(payload.type)) return;
+                const eventData = payload.data || {};
+                const taskId = eventData.task_id;
+
+                const status = extractEventStatus(payload, eventData);
+                if (status === 'completed') {
+                    scheduleReloadForCompleted();
+                    return;
+                }
+
+                if (payload.type === 'task_progress') {
+                    applyTaskProgressUpdate(taskId, eventData);
+                    checkReloadOnCompleted(taskId);
+                    return;
+                }
+
+                if (payload.type === 'task_updated') {
+                    refreshTaskFragment(taskId);
+                    return;
+                }
+
+                refreshTasksData(true);
+            } catch (err) { console.error('解析事件失败:', err); }
+        };
+
+        tasksEventSource.onerror = function() {
+            const readyState = tasksEventSource ? tasksEventSource.readyState : EventSource.CLOSED;
+            if (readyState === EventSource.CLOSED) {
+                closeTasksEventSource();
+                if (!reconnectTimer && eventSourceReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    eventSourceReconnectAttempts++;
+                    reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!tasksEventSource) initTasksEventStream(); }, RECONNECT_DELAY_BASE * Math.pow(1.5, eventSourceReconnectAttempts - 1));
+                }
+            }
+            enableFallbackPolling(hasProcessingTasks() ? REFRESH_INTERVAL_ACTIVE : REFRESH_INTERVAL_IDLE);
+        };
+
+        window.addEventListener('beforeunload', function cleanup() { closeTasksEventSource(); window.removeEventListener('beforeunload', cleanup); });
+    }
+
+    function bindTasksEvents(root = document) {
+        queryAllWithin(root, '[onclick*="confirmDelete"]').forEach(btn => {
+            btn.onclick = function() { confirmDelete(this.dataset.taskId, this.dataset.taskTitle); };
+        });
+        queryAllWithin(root, '[onclick*="confirmClearAll"]').forEach(btn => { btn.onclick = confirmClearAll; });
+        queryAllWithin(root, '[onclick*="confirmRetryFailed"]').forEach(btn => { btn.onclick = confirmRetryFailed; });
+        queryAllWithin(root, '[onclick*="confirmStopTask"]').forEach(btn => {
+            btn.onclick = function() { confirmStopTask(this.dataset.taskId, this.dataset.taskTitle); };
+        });
+
+        const bindCopy = (cls, prefix, dataKey) => {
+            queryAllWithin(root, cls).forEach(btn => {
+                if (btn.dataset.bindCopy === '1') return;
+                btn.dataset.bindCopy = '1';
+                btn.addEventListener('click', () => copyToClipboard(prefix + (btn.dataset[dataKey] || '')));
+            });
+        };
+        
+        bindCopy('.copy-ac-btn', 'AC', 'acNumber');
+        bindCopy('.copy-bv-btn', '', 'bvNumber');
+
+        queryAllWithin(root, '.error-message-trigger').forEach(btn => {
+            if (btn.dataset.bindErrorMessage === '1') return;
+            btn.dataset.bindErrorMessage = '1';
+            btn.addEventListener('click', function() { showTaskErrorMessage(this.dataset.taskId || '', this.dataset.taskTitle || '', this.dataset.errorMessage || ''); });
+        });
+    }
+
+    function disposeTooltips(root = document) {
+        queryAllWithin(root, '[data-bs-toggle="tooltip"]').forEach(el => { const t = bootstrap.Tooltip.getInstance(el); if (t) { t.hide(); t.dispose(); } });
+        if (root === document) document.querySelectorAll('.tooltip').forEach(el => el.remove());
+    }
+
+    function initTooltips(root = document) {
+        queryAllWithin(root, '[data-bs-toggle="tooltip"]').forEach(el => { if (!bootstrap.Tooltip.getInstance(el)) new bootstrap.Tooltip(el); });
+    }
+
+    function formatLocalDateTime(str) {
+        try {
+            const normalizedStr = String(str).replace(/-/g, '/');
+            const date = new Date(normalizedStr);
+            if (isNaN(date.getTime())) return str;
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            const hours = String(date.getHours()).padStart(2, '0');
+            const minutes = String(date.getMinutes()).padStart(2, '0');
+            return `${month}-${day} ${hours}:${minutes}`;
+        } catch { return str; }
+    }
+
+    function updateTaskDateTimes(root = document) {
+        queryAllWithin(root, '.task-datetime').forEach(el => {
+            const dt = el.getAttribute('data-datetime');
+            if (!dt) return;
+            el.textContent = formatLocalDateTime(dt);
+            const d = new Date(dt);
+            el.title = isNaN(d.getTime()) ? dt : d.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'long' });
+        });
+    }
+
+    async function refreshTasksData(forceImmediate = false) {
+        if (refreshInProgress) return;
+        if (document.hidden && !forceImmediate) { scheduleNextRefresh(); return; }
+        refreshInProgress = true;
+        showRefreshIndicator(true);
+        try {
+            const url = new URL(window.location.href); url.searchParams.set('_ts', String(Date.now()));
+            const res = await fetch(url.toString(), { cache: 'no-store', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+            if (res.ok) updateTasksTable(await res.text());
+        } catch (e) { console.error(e); } finally {
+            refreshInProgress = false;
+            showRefreshIndicator(false);
+            if (fallbackMode) scheduleNextRefresh();
+        }
+    }
+
+    function hasProcessingTasks() {
+        return [...document.querySelectorAll('.task-status-badge')].some(b => ['下载中', '上传中', '翻译中', '生成标签中', '推荐分区中', '内容审核中', '翻译字幕中', '语音转写中', '转码视频中', '处理中', '等待', '队列中'].some(s => b.textContent.includes(s))) ||
+               [...document.querySelectorAll('.tasks-table tbody tr')].some(tr => ['pending', 'downloading', 'uploading', 'translating', 'translating_subtitle', 'asr_transcribing', 'encoding_video', 'processing'].some(s => tr.className.includes('status-' + s)));
+    }
+
+    function determineRefreshDelay() {
+        if (hasProcessingTasks()) return REFRESH_INTERVAL_ACTIVE;
+        return (document.querySelector('.tasks-table tbody tr') || document.querySelector('.task-card')) ? REFRESH_INTERVAL_IDLE : REFRESH_INTERVAL_EMPTY;
+    }
+
+    function scheduleNextRefresh(delay) {
+        if (!fallbackMode) { clearScheduledRefresh(); return; }
+        clearScheduledRefresh();
+        refreshTimer = setTimeout(() => refreshTasksData(), typeof delay === 'number' ? delay : determineRefreshDelay());
+    }
+
+    // --- 批量操作逻辑 ---
+    const selectedTaskIds = new Set();
+
+    function restoreSelectionState() {
+        document.querySelectorAll('.task-checkbox').forEach(cb => {
+            if (selectedTaskIds.has(cb.value)) cb.checked = true;
+            else cb.checked = false;
+        });
+        updateSelectAllState();
+    }
+
+    function handleCheckboxChange(cb) {
+        if (cb.checked) selectedTaskIds.add(cb.value);
+        else selectedTaskIds.delete(cb.value);
+        updateSelectAllState();
+    }
+
+    function toggleAllTasks(source) {
+        document.querySelectorAll('.task-checkbox').forEach(cb => {
+            cb.checked = source.checked;
+            if (source.checked) selectedTaskIds.add(cb.value);
+            else selectedTaskIds.delete(cb.value);
+        });
+        updateSelectAllState();
+    }
+
+    function updateSelectAllState() {
+        const selectAll = document.getElementById('selectAllTasks');
+        const checkboxes = document.querySelectorAll('.tasks-table tbody .task-checkbox');
+        if (!selectAll) return;
+
+        if (checkboxes.length === 0) {
+            selectAll.checked = false;
+            selectAll.indeterminate = false;
+            return;
+        }
+        let checkedCount = 0;
+        checkboxes.forEach(cb => { if (cb.checked) checkedCount++; });
+        
+        selectAll.checked = checkedCount === checkboxes.length;
+        selectAll.indeterminate = checkedCount > 0 && checkedCount < checkboxes.length;
+        
+        const badge = document.getElementById('selectedCount');
+        if (badge) {
+            if (selectedTaskIds.size > 0) {
+                badge.textContent = selectedTaskIds.size;
+                badge.classList.remove('d-none');
+            } else {
+                badge.classList.add('d-none');
+            }
+        }
+    }
+
+    function openBatchPartitionModal() {
+        if (selectedTaskIds.size === 0) { alert('请先勾选要设置分区的任务'); return; }
+        document.getElementById('batchPartitionCount').textContent = selectedTaskIds.size;
+        new bootstrap.Modal(document.getElementById('batchPartitionModal')).show();
+    }
+
+    async function executeBatchPartition(btn) {
+        const acfunPid = document.getElementById('batchAcfunPartition').value;
+        const bilibiliPid = document.getElementById('batchBilibiliPartition').value;
+        if (!acfunPid && !bilibiliPid) { alert('请至少选择一个平台的分区'); return; }
+
+        const oldHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 处理中...';
+
+        try {
+            const res = await fetch('/tasks/batch_partition', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds), acfun_pid: acfunPid, bilibili_pid: bilibiliPid })
+            });
+            const data = await res.json();
+            alert(data.message);
+            if (data.success) {
+                const modalEl = document.getElementById('batchPartitionModal');
+                const modal = bootstrap.Modal.getInstance(modalEl);
+                if (modal) modal.hide();
+                refreshTasksData(true);
+            }
+        } catch (e) { alert('网络错误，设置分区失败'); } finally {
+            btn.disabled = false;
+            btn.innerHTML = oldHtml;
+        }
+    }
+
+    async function confirmBatchApprove() {
+        if (selectedTaskIds.size === 0) { alert('请先勾选要审核的任务'); return; }
+        if (!confirm(`确定要将选中的 ${selectedTaskIds.size} 个任务标记为“审核通过”吗？`)) return;
+
+        const btn = document.getElementById('batchApproveBtn');
+        const oldHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 处理中...';
+
+        try {
+            const res = await fetch('/tasks/batch_approve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds) })
+            });
+            const data = await res.json();
+            alert(data.message);
+            if (data.success) refreshTasksData(true);
+        } catch (e) { alert('网络错误，批量审核失败'); } finally {
+            btn.disabled = false;
+            btn.innerHTML = oldHtml;
+        }
+    }
+
+    async function confirmBatchUpload() {
+        if (selectedTaskIds.size === 0) { alert('请先勾选要上传的任务'); return; }
+        if (!confirm(`确定要将选中的 ${selectedTaskIds.size} 个任务加入上传队列吗？`)) return;
+
+        const btn = document.getElementById('batchUploadBtn');
+        const oldHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 提交中...';
+
+        try {
+            const res = await fetch('/tasks/batch_upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds) })
+            });
+            const data = await res.json();
+            alert(data.message);
+            if (data.success) {
+                selectedTaskIds.clear();
+                updateSelectAllState();
+                setTimeout(() => window.location.reload(), 1000);
+            }
+        } catch (e) { alert('网络错误，批量上传失败'); } finally {
+            btn.disabled = false;
+            btn.innerHTML = oldHtml;
+        }
+    }
+
+    async function confirmBatchUploadBilibili() {
+        if (selectedTaskIds.size === 0) { alert('请先勾选要上传的任务'); return; }
+        if (!confirm(`确定要将选中的 ${selectedTaskIds.size} 个任务的投稿目标改为 bilibili，并加入上传队列吗？\n\n注意：原上传目标会被覆盖为 bilibili。`)) return;
+
+        const btn = document.getElementById('batchUploadBiliBtn');
+        const oldHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 提交中...';
+
+        try {
+            const res = await fetch('/tasks/batch_upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds), upload_target: 'bilibili' })
+            });
+            const data = await res.json();
+            alert(data.message);
+            if (data.success) {
+                selectedTaskIds.clear();
+                updateSelectAllState();
+                setTimeout(() => window.location.reload(), 1000);
+            }
+        } catch (e) { alert('网络错误，批量上传失败'); } finally {
+            btn.disabled = false;
+            btn.innerHTML = oldHtml;
+        }
+    }
+
+    function openBatchEditModal() {
+        if (selectedTaskIds.size === 0) { alert('请先勾选要修改的任务'); return; }
+        document.getElementById('batchEditCount').textContent = selectedTaskIds.size;
+        new bootstrap.Modal(document.getElementById('batchEditModal')).show();
+    }
+
+    async function executeBatchEdit(btn) {
+        const ids = Array.from(selectedTaskIds);
+        if (ids.length === 0) return;
+
+        const title = document.getElementById('batchEditTitle').value.trim();
+        const description = document.getElementById('batchEditDescription').value.trim();
+        const tagsRaw = document.getElementById('batchEditTags').value.trim();
+
+        if (!title && !description && !tagsRaw) {
+            alert('所有字段均为空，无需保存。请至少填写一个要修改的字段。');
+            return;
+        }
+
+        if (tagsRaw) {
+            const tags = tagsRaw.split(/[,，、]/).map(t => t.trim()).filter(Boolean);
+            if (tags.length === 0) { alert('标签格式不正确，请用逗号分隔多个标签'); return; }
+            if (tags.length > 10) { alert('标签最多 10 个，当前 ' + tags.length + ' 个'); return; }
+            const tooLong = tags.find(t => t.length > 20);
+            if (tooLong) { alert('标签「' + tooLong + '」超过 20 字符，请拆分或缩短'); return; }
+        }
+
+        if (!confirm(`确定将修改保存到选中的 ${ids.length} 个任务吗？（留空字段不受影响）`)) return;
+
+        const oldHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 保存中...';
+
+        try {
+            const res = await fetch('/tasks/batch_update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    task_ids: ids,
+                    title: title,
+                    description: description,
+                    tags: tagsRaw
+                })
+            });
+            const data = await res.json();
+            alert(data.message);
+            if (data.success) {
+                const modalEl = document.getElementById('batchEditModal');
+                bootstrap.Modal.getInstance(modalEl)?.hide();
+                document.getElementById('batchEditTitle').value = '';
+                document.getElementById('batchEditDescription').value = '';
+                document.getElementById('batchEditTags').value = '';
+                selectedTaskIds.clear();
+                updateSelectAllState();
+                setTimeout(() => window.location.reload(), 1000);
+            }
+        } catch (e) { alert('网络错误，批量修改失败'); } finally {
+            btn.disabled = false;
+            btn.innerHTML = oldHtml;
+        }
+    }
+
+    function confirmBatchDelete() {
+        if (selectedTaskIds.size === 0) { alert('请先勾选要删除的任务'); return; }
+        document.getElementById('batchDeleteCount').textContent = selectedTaskIds.size;
+        new bootstrap.Modal(document.getElementById('batchDeleteModal')).show();
+    }
+
+    async function executeBatchDelete() {
+        const ids = Array.from(selectedTaskIds);
+        if (ids.length === 0) return;
+        
+        const deleteFiles = document.getElementById('batchDeleteFiles').checked;
+        const btn = document.getElementById('batchDeleteConfirmBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 删除中...';
+
+        for (const id of ids) {
+            try {
+                const formData = new FormData();
+                formData.append('delete_files', deleteFiles ? 'true' : 'false');
+                await fetch(`/tasks/${id}/delete`, { method: 'POST', body: formData });
+                selectedTaskIds.delete(id);
+            } catch (e) { console.error('删除失败', id, e); }
+        }
+        window.location.reload();
+    }
+
+    // --- 初始化 ---
+    document.addEventListener('DOMContentLoaded', function() {
+        adjustTableColumns();
+        let resizeTimer;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(adjustTableColumns, 150);
+        });
+
+        const root = document.querySelector('#tasksContent');
+        if (root) {
+            root.addEventListener('pointerenter', () => markTasksInteracting(500), { passive: true });
+            root.addEventListener('pointermove', () => markTasksInteracting(250), { passive: true });
+            root.addEventListener('pointerdown', () => markTasksInteracting(2000));
+            root.addEventListener('focusin', () => markTasksInteracting(2000));
+            root.addEventListener('focusout', () => markTasksInteracting(600));
+        }
+        
+        // 仅监听内容区域的 pointerdown，避免干扰顶部工具栏
+        if (root) {
+            root.addEventListener('pointerdown', () => { pointerIsDown = true; });
+            document.addEventListener('pointerup', () => { pointerIsDown = false; });
+        }
+
+        bindTasksEvents();
+        initTooltips();
+        updateTaskDateTimes();
+        updateProgressBars();
+        setInterval(updateTaskDateTimes, 60000);
+
+        initTasksEventStream();
+        setTimeout(() => refreshTasksData(true), 400);
+
+        document.addEventListener('visibilitychange', () => {
+            if (!fallbackMode) return;
+            if (document.hidden) clearScheduledRefresh();
+            else refreshTasksData(true);
+        });
+    });
+</script>
+{% endblock %}
