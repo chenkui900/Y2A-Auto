@@ -329,6 +329,7 @@ TASK_STATES = {
     'PARTITIONING': 'partitioning',
     'MODERATING': 'moderating',
     'AWAITING_REVIEW': 'awaiting_manual_review',
+    'SCHEDULED_UPLOAD': 'scheduled_upload',
     'READY_FOR_UPLOAD': 'ready_for_upload',
     'UPLOADING': 'uploading',
     'COMPLETED': 'completed',
@@ -938,6 +939,10 @@ def init_db():
         if 'selected_partition_id_bilibili' not in columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN selected_partition_id_bilibili TEXT")
             conn.commit()
+        if 'scheduled_upload_at' not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN scheduled_upload_at TEXT")
+            logger.info("数据库升级：添加scheduled_upload_at字段（定时上传）")
+            conn.commit()
         cursor.execute("PRAGMA table_info(tasks)")
         columns = [row[1] for row in cursor.fetchall()]
         cursor.execute("SELECT 1 FROM schema_migrations WHERE migration_key = ? LIMIT 1", ('tasks_partition_backfill_v1',))
@@ -1097,6 +1102,7 @@ def update_task(task_id, silent=False, **kwargs):
         'error_category': 'error_category = ?',
         'pipeline_checkpoint': 'pipeline_checkpoint = ?',
         'upload_progress': 'upload_progress = ?',
+        'scheduled_upload_at': 'scheduled_upload_at = ?',
         'acfun_upload_response': 'acfun_upload_response = ?',
         'bilibili_upload_response': 'bilibili_upload_response = ?',
         'asr_warning_message': 'asr_warning_message = ?',
@@ -1676,6 +1682,38 @@ def pump_upload_queue(reason='触发'):
         _QUEUE_PUMP_LOCK.release()
 
 
+def poll_scheduled_uploads():
+    """把到点的「定时上传」任务转入上传队列。
+
+    由后台 30 秒扫描（_check_and_start_next_pending_task）周期调用：
+    找出 scheduled_upload 状态且计划时间已到的任务，置为 ready_for_upload
+    并触发上传队列补位，到点即传，无需人工干预。
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE status = ? AND scheduled_upload_at IS NOT NULL AND scheduled_upload_at != '' AND scheduled_upload_at <= ?",
+                (TASK_STATES['SCHEDULED_UPLOAD'], now_str)
+            ).fetchall()
+        finally:
+            conn.close()
+        due_ids = [row['id'] for row in rows]
+        if not due_ids:
+            return 0
+        for tid in due_ids:
+            update_task(tid, silent=True,
+                        status=TASK_STATES['READY_FOR_UPLOAD'],
+                        upload_progress=QUEUE_WAITING_MARK)
+        logger.info(f"[定时上传] {len(due_ids)} 个任务到达计划时间，已转入上传队列: {[t[:8] for t in due_ids]}")
+        pump_upload_queue(reason='定时上传到点')
+        return len(due_ids)
+    except Exception as e:
+        logger.warning(f"[定时上传] 到点扫描失败（忽略）: {e}")
+        return 0
+
+
 def _claim_queued_task(task_id):
     """数据库原子认领排队任务：把排队标记改成「正在启动上传…」。
 
@@ -2148,6 +2186,11 @@ class TaskProcessor:
         # 上传队列补位：进程启动恢复后、以及每 30 秒扫描时，把排队的上传任务接上
         try:
             pump_upload_queue('定时扫描')
+        except Exception:
+            pass
+        # 定时上传：把到达计划时间的任务转入上传队列
+        try:
+            poll_scheduled_uploads()
         except Exception:
             pass
         try:

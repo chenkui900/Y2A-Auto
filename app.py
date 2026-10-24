@@ -1673,6 +1673,7 @@ def task_status_display(status):
         TASK_STATES['PARTITIONING']: '推荐分区中',
         TASK_STATES['MODERATING']: '内容审核中',
         TASK_STATES['AWAITING_REVIEW']: '等待人工审核',
+        TASK_STATES['SCHEDULED_UPLOAD']: '定时上传',
         TASK_STATES['READY_FOR_UPLOAD']: '准备上传',
         TASK_STATES['UPLOADING']: '上传中',
         TASK_STATES['COMPLETED']: '已完成',
@@ -1696,6 +1697,7 @@ def task_status_color(status):
         TASK_STATES['PARTITIONING']: 'info',
         TASK_STATES['MODERATING']: 'info',
         TASK_STATES['AWAITING_REVIEW']: 'warning',
+        TASK_STATES['SCHEDULED_UPLOAD']: 'dark',
         TASK_STATES['READY_FOR_UPLOAD']: 'primary',
         TASK_STATES['UPLOADING']: 'primary',
         TASK_STATES['COMPLETED']: 'success',
@@ -2157,6 +2159,7 @@ def tasks():
         {'value': TASK_STATES['READY_FOR_UPLOAD'], 'label': '准备上传'},
         {'value': 'processing', 'label': '进行中（含上传中）'},
         {'value': TASK_STATES['AWAITING_REVIEW'], 'label': '等待人工审核'},
+        {'value': TASK_STATES['SCHEDULED_UPLOAD'], 'label': '定时上传'},
         {'value': TASK_STATES['COMPLETED'], 'label': '已完成'},
         {'value': TASK_STATES['FAILED'], 'label': '失败'},
     ]
@@ -3072,6 +3075,70 @@ def batch_approve_tasks_route():
             success_count += 1
 
     return jsonify({'success': True, 'message': f'成功审核 {success_count} 个任务'})
+
+@app.route('/tasks/batch_schedule_upload', methods=['POST'])
+@login_required
+def batch_schedule_upload_route():
+    """批量设置定时上传：任务在计划时间到点后自动进入上传队列开始上传。"""
+    data = request.get_json() or {}
+    task_ids = data.get('task_ids', [])
+    scheduled_at = str(data.get('scheduled_at') or '').strip()
+    # 每日上传数量：0/缺省 = 无限制（全部同一时间），>0 时按每天 K 个自动分摊到后续日期
+    try:
+        daily_count = int(data.get('daily_count') or 0)
+    except (TypeError, ValueError):
+        daily_count = 0
+    daily_count = daily_count if daily_count > 0 else 0
+    if daily_count:
+        daily_count = max(1, min(daily_count, 1000))
+    if not task_ids:
+        return jsonify({'success': False, 'message': '未选择任何任务'}), 400
+    try:
+        due_dt = datetime.strptime(scheduled_at, '%Y-%m-%dT%H:%M')
+    except ValueError:
+        return jsonify({'success': False, 'message': '时间格式不正确，请重新选择'}), 400
+
+    # 上传中/已完成/下载中等流转中的任务不允许直接定时
+    allowed = {
+        TASK_STATES['PENDING'],
+        TASK_STATES['AWAITING_REVIEW'],
+        TASK_STATES['READY_FOR_UPLOAD'],
+        TASK_STATES['FAILED'],
+        TASK_STATES['SCHEDULED_UPLOAD'],  # 允许改期
+    }
+    success, skipped = 0, 0
+    valid_ids = []
+    for task_id in task_ids:
+        task = get_task(task_id)
+        if not task or task['status'] not in allowed:
+            skipped += 1
+            continue
+        valid_ids.append(task_id)
+    # 按天分批：第 i 个任务排在第 i // K 天的同一时间点；K=0（无限制）全部同一时间
+    for i, task_id in enumerate(valid_ids):
+        if daily_count:
+            day_dt = due_dt + timedelta(days=i // daily_count)
+        else:
+            day_dt = due_dt
+        due_str = day_dt.strftime('%Y-%m-%d %H:%M:%S')
+        update_task(task_id, silent=True,
+                    status=TASK_STATES['SCHEDULED_UPLOAD'],
+                    upload_progress=f'定时上传：{due_str} 自动开始',
+                    scheduled_upload_at=due_str)
+        success += 1
+
+    if daily_count and success:
+        total_days = (success + daily_count - 1) // daily_count
+        last_dt = due_dt + timedelta(days=total_days - 1)
+        message = (f'已为 {success} 个任务设置定时上传：每天 {daily_count} 个，'
+                   f'{due_dt.strftime("%Y-%m-%d %H:%M")} 开始，'
+                   f'至 {last_dt.strftime("%Y-%m-%d %H:%M")} 全部传完')
+    else:
+        message = f'已为 {success} 个任务设置定时上传（{due_dt.strftime("%Y-%m-%d %H:%M")} 自动开始）'
+    if skipped:
+        message += f'，跳过 {skipped} 个（上传中/已完成/处理中的任务不可定时）'
+    logger.info(f"[定时上传] {message}")
+    return jsonify({'success': True, 'message': message})
 
 @app.route('/tasks/batch_partition', methods=['POST'])
 @login_required

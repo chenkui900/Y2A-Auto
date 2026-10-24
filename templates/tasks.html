@@ -63,6 +63,9 @@
                 <button type="button" class="btn btn-outline-warning" id="batchUploadBtn" onclick="confirmBatchUpload()">
                     <i class="bi bi-cloud-arrow-up"></i> 批量上传
                 </button>
+                <button type="button" class="btn btn-outline-dark" id="batchScheduleBtn" onclick="openBatchScheduleModal()">
+                    <i class="bi bi-clock-history"></i> 定时上传
+                </button>
                 <button type="button" class="btn btn-outline-info" id="batchUploadBiliBtn" onclick="confirmBatchUploadBilibili()">
                     <i class="bi bi-cloud-arrow-up-fill"></i> 上传到B站
                 </button>
@@ -283,6 +286,49 @@
                         <i class="bi bi-arrow-repeat"></i> 确认重试
                     </button>
                 </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 批量定时上传对话框 -->
+<div class="modal fade" id="batchScheduleModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-clock-history"></i> 批量定时上传</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p>将为选中的 <span class="badge bg-dark" id="batchScheduleCount">0</span> 个任务设置定时上传。</p>
+                <div class="mb-3">
+                    <label for="batchScheduleTime" class="form-label">开始上传时间</label>
+                    <input type="datetime-local" class="form-control" id="batchScheduleTime" step="60" onchange="updateSchedulePreview()">
+                </div>
+                <div class="mb-3">
+                    <label for="batchScheduleDailyCount" class="form-label">每日上传数量</label>
+                    <select class="form-select" id="batchScheduleDailyCount" onchange="updateSchedulePreview()">
+                        <option value="0">无限制（全部同一时间上传）</option>
+                        <option value="20">每天 20 个</option>
+                        <option value="40" selected>每天 40 个</option>
+                        <option value="60">每天 60 个</option>
+                        <option value="80">每天 80 个</option>
+                        <option value="100">每天 100 个</option>
+                    </select>
+                    <div class="form-text" id="batchSchedulePreview">到点后任务自动进入上传队列开始上传（受上传并发数限制依次进行）；可重复选择任务再次设置以改期。</div>
+                </div>
+                <div class="alert alert-warning mb-0">
+                    <i class="bi bi-exclamation-triangle-fill"></i>
+                    任务将跳过人工审核直接定时上传，请确认标题、简介、分区已就绪。
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="bi bi-x-circle"></i> 取消
+                </button>
+                <button type="button" class="btn btn-dark" id="batchScheduleConfirmBtn" onclick="executeBatchSchedule()">
+                    <i class="bi bi-clock-history"></i> 确认定时
+                </button>
             </div>
         </div>
     </div>
@@ -1299,6 +1345,71 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 refreshTasksData(true);
             }
         } catch (e) { alert('网络错误，设置分区失败'); } finally {
+            btn.disabled = false;
+            btn.innerHTML = oldHtml;
+        }
+    }
+
+    // 批量定时上传
+    function openBatchScheduleModal() {
+        if (selectedTaskIds.size === 0) { alert('请先勾选要定时上传的任务'); return; }
+        document.getElementById('batchScheduleCount').textContent = selectedTaskIds.size;
+        // 默认时间：明天同一时间（每日分批通常从明天开始更符合习惯）
+        const el = document.getElementById('batchScheduleTime');
+        const d = new Date(Date.now() + 24 * 3600 * 1000);
+        const pad = n => String(n).padStart(2, '0');
+        el.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        document.getElementById('batchScheduleDailyCount').value = '40';
+        updateSchedulePreview();
+        new bootstrap.Modal(document.getElementById('batchScheduleModal')).show();
+    }
+
+    // 根据每日数量预估最后一批日期
+    function updateSchedulePreview() {
+        const total = selectedTaskIds.size;
+        const k = parseInt(document.getElementById('batchScheduleDailyCount').value, 10) || 0;
+        const previewEl = document.getElementById('batchSchedulePreview');
+        if (k <= 0) {
+            previewEl.textContent = '到点后任务自动进入上传队列开始上传（受上传并发数限制依次进行）；可重复选择任务再次设置以改期。';
+            return;
+        }
+        const timeVal = document.getElementById('batchScheduleTime').value;
+        let endText = '';
+        if (timeVal && total > 0) {
+            const start = new Date(timeVal);
+            const days = Math.ceil(total / k);
+            const end = new Date(start.getTime() + (days - 1) * 24 * 3600 * 1000);
+            const pad = n => String(n).padStart(2, '0');
+            endText = `，至 ${end.getFullYear()}-${pad(end.getMonth() + 1)}-${pad(end.getDate())} 全部传完`;
+        }
+        previewEl.textContent = `将把 ${total} 个任务按每天 ${k} 个分批：每天在所选时间点自动进入上传队列${endText}。`;
+    }
+
+    async function executeBatchSchedule() {
+        const time = document.getElementById('batchScheduleTime').value;
+        if (!time) { alert('请选择计划上传时间'); return; }
+        const dailyCount = parseInt(document.getElementById('batchScheduleDailyCount').value, 10) || 0;
+        const btn = document.getElementById('batchScheduleConfirmBtn');
+        const oldHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 设置中...';
+        try {
+            const res = await fetch('/tasks/batch_schedule_upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds), scheduled_at: time, daily_count: dailyCount })
+            });
+            const data = await res.json();
+            alert(data.message);
+            if (data.success) {
+                const modalEl = document.getElementById('batchScheduleModal');
+                const modal = bootstrap.Modal.getInstance(modalEl);
+                if (modal) modal.hide();
+                selectedTaskIds.clear();
+                updateSelectAllState();
+                refreshTasksData(true);
+            }
+        } catch (e) { alert('网络错误，设置定时上传失败'); } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
         }
