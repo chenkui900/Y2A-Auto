@@ -19,6 +19,36 @@ from logging.handlers import RotatingFileHandler
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, send_file, session, Response, stream_with_context
 from functools import wraps
 from flask_cors import CORS
+
+# ===== 运行期间阻止系统休眠（Windows）=====
+import ctypes
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+def _prevent_system_sleep():
+    """服务运行期间向系统声明"需要保持唤醒"，阻止自动休眠（显示器仍可正常关闭）。
+
+    仅对调用线程持续生效——放在主线程（app.run 阻塞处）即覆盖整个服务生命周期。
+    可用 `powercfg /requests` 查看该请求。
+    """
+    if os.name != 'nt':
+        return
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+        logger.info("已阻止系统休眠（服务运行期间保持唤醒）")
+    except Exception as e:
+        logger.warning(f"设置阻止休眠失败（不影响其他功能）: {e}")
+
+def _allow_system_sleep():
+    """服务关闭时取消阻止休眠，恢复系统默认电源策略。"""
+    if os.name != 'nt':
+        return
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+        logger.info("已恢复系统休眠策略")
+    except Exception:
+        pass
+
 from PIL import Image, UnidentifiedImageError
 from werkzeug.security import safe_join
 from modules.youtube_handler import extract_video_urls_from_playlist
@@ -5220,6 +5250,9 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT', 5500))
         logger.info(f"服务启动，监听地址: http://127.0.0.1:{port}")
 
+        # 服务运行期间阻止系统休眠，避免长时间上传/下载中途被打断
+        _prevent_system_sleep()
+
         # 延迟 1.5 秒打开浏览器，确保 Flask 已经完成端口绑定并开始监听
         import webbrowser
         import threading
@@ -5236,6 +5269,9 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"服务启动失败: {str(e)}")
     finally:
+        # 取消阻止休眠，恢复系统默认电源策略
+        _allow_system_sleep()
+
         # 关闭全局任务处理器
         shutdown_global_task_processor()
 

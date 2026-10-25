@@ -1586,6 +1586,31 @@ STOP_RELEASE_GRACE_SECONDS = 60
 _QUEUE_PUMP_LOCK = threading.Lock()
 
 
+_VIDEO_FILE_EXTS = frozenset({'.mp4', '.webm', '.mkv', '.mov', '.avi', '.flv', '.m4v'})
+# 有下载数据任务的调度优先级：2=已下载完（有成品视频）> 1=有残留分片（续传快）> 0=无数据
+def _download_data_priority(task_id):
+    """检查任务下载目录：返回 2/1/0，用于「有下载数据优先」调度。"""
+    if not task_id:
+        return 0
+    try:
+        task_dir = os.path.join(DOWNLOADS_DIR, str(task_id))
+        if not os.path.isdir(task_dir):
+            return 0
+        has_other = False
+        for name in os.listdir(task_dir):
+            if name.startswith('.') or name == 'metadata.json':
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in _VIDEO_FILE_EXTS:
+                return 2
+            if name in ('video.info.json', 'video.webp'):
+                continue
+            has_other = True  # .part 分片、fragment 残留等
+        return 1 if has_other else 0
+    except Exception:
+        return 0
+
+
 def _list_queued_upload_tasks(limit=200):
     """数据库里仍在「上传队列」中的任务：状态=准备上传（除「已退出队列」外）。
 
@@ -1597,10 +1622,12 @@ def _list_queued_upload_tasks(limit=200):
     conn = get_db_connection()
     try:
         rows = conn.execute(
-            "SELECT id FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR upload_progress NOT LIKE ?) ORDER BY created_at ASC LIMIT ?",
-            (TASK_STATES['READY_FOR_UPLOAD'], QUEUE_RETIRED_MARK + '%', int(limit))
+            "SELECT id, created_at FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR upload_progress NOT LIKE ?) LIMIT ?",
+            (TASK_STATES['READY_FOR_UPLOAD'], QUEUE_RETIRED_MARK + '%', int(limit) * 2)
         ).fetchall()
-        return [row['id'] for row in rows]
+        # 有下载数据（成品视频/残留分片）的任务优先上传，其余按创建时间
+        ordered = sorted(rows, key=lambda r: (-_download_data_priority(r['id']), r['created_at'] or ''))
+        return [row['id'] for row in ordered[:int(limit)]]
     except Exception as e:
         logger.debug(f"读取上传队列失败（忽略）: {e}")
         return []
@@ -1617,10 +1644,12 @@ def _refresh_queue_positions():
     try:
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         rows = conn.execute(
-            "SELECT id FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR (upload_progress NOT LIKE ? AND upload_progress != ?)) ORDER BY created_at ASC",
+            "SELECT id, created_at FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR (upload_progress NOT LIKE ? AND upload_progress != ?))",
             (TASK_STATES['READY_FOR_UPLOAD'], QUEUE_RETIRED_MARK + '%', QUEUE_STARTING_MARK)
         ).fetchall()
-        for idx, row in enumerate(rows, 1):
+        # 位次与实际取任务顺序一致：有下载数据优先，其余按创建时间
+        ordered = sorted(rows, key=lambda r: (-_download_data_priority(r['id']), r['created_at'] or ''))
+        for idx, row in enumerate(ordered, 1):
             conn.execute(
                 "UPDATE tasks SET upload_progress = ?, updated_at = ? WHERE id = ?",
                 (f"{QUEUE_WAITING_MARK}（第 {idx} 位）…", now_str, row['id'])
@@ -2220,7 +2249,8 @@ class TaskProcessor:
         if effective_running_count >= max_concurrent:
             logger.info(f"当前有效运行任务数 {effective_running_count}（DB运行中 {len(running_task_ids)}，活动线程 {len(active_task_ids)}），达到并发限制 {max_concurrent}，暂不启动新任务")
             return
-        pending_tasks.sort(key=lambda x: x['created_at'])
+        # 有下载数据的任务优先（已下载完 > 有残留分片 > 无数据），同优先级按创建时间
+        pending_tasks.sort(key=lambda x: (-_download_data_priority(x.get('id')), x['created_at']))
         next_task = pending_tasks[0]
         logger.info(f"发现pending任务，准备启动: {next_task['id'][:8]}... ({next_task.get('youtube_url', 'Unknown URL')[-30:]})")
         job_id = self.schedule_task(next_task['id'])
