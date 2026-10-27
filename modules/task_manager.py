@@ -890,6 +890,13 @@ def init_db():
         applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS app_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    ''')
+    conn.commit()
     try:
         cursor.execute("PRAGMA table_info(tasks)")
         columns = [row[1] for row in cursor.fetchall()]
@@ -942,6 +949,10 @@ def init_db():
         if 'scheduled_upload_at' not in columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN scheduled_upload_at TEXT")
             logger.info("数据库升级：添加scheduled_upload_at字段（定时上传）")
+            conn.commit()
+        if 'queue_position' not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN queue_position INTEGER")
+            logger.info("数据库升级：添加queue_position字段（上传队列位次排序）")
             conn.commit()
         cursor.execute("PRAGMA table_info(tasks)")
         columns = [row[1] for row in cursor.fetchall()]
@@ -1211,7 +1222,23 @@ def get_tasks_paginated(page=1, per_page=20, status=None, search=None):
         total = cursor.fetchone()[0] or 0
         total_pages = math.ceil(total / per_page) if per_page > 0 else 0
         offset = (page - 1) * per_page
-        cursor.execute(f"SELECT * FROM tasks {where_clause} ORDER BY updated_at DESC LIMIT ? OFFSET ?", params + [per_page, offset])
+        # 分层排序：上传中永远置顶 → 正在启动上传 → 排队任务按队列位次从小到大 → 其余按更新时间倒序
+        order_clause = f"""
+            ORDER BY
+                CASE
+                    WHEN status = '{TASK_STATES['UPLOADING']}' THEN 0
+                    WHEN status = '{TASK_STATES['READY_FOR_UPLOAD']}' AND upload_progress LIKE '{QUEUE_STARTING_MARK}%' THEN 1
+                    WHEN status = '{TASK_STATES['READY_FOR_UPLOAD']}' THEN 2
+                    ELSE 3
+                END ASC,
+                CASE
+                    WHEN status = '{TASK_STATES['READY_FOR_UPLOAD']}' AND upload_progress NOT LIKE '{QUEUE_STARTING_MARK}%'
+                        THEN COALESCE(queue_position, 999999)
+                    ELSE 0
+                END ASC,
+                updated_at DESC
+        """
+        cursor.execute(f"SELECT * FROM tasks {where_clause} {order_clause} LIMIT ? OFFSET ?", params + [per_page, offset])
         rows = cursor.fetchall()
         tasks = [dict(row) for row in rows]
         return {'tasks': tasks, 'total': total, 'page': page, 'per_page': per_page, 'total_pages': total_pages, 'has_prev': page > 1, 'has_next': page < total_pages, 'prev_page': page - 1, 'next_page': page + 1}
@@ -1332,6 +1359,94 @@ def retry_failed_tasks(config=None):
             failed_ids.append(task_id)
             update_task(task_id, silent=True, status=TASK_STATES['FAILED'], error_message=original_error or '批量重试调度失败，请稍后重试。')
     return {'total': total, 'scheduled': scheduled, 'failed_ids': failed_ids}
+
+# ==================== 每天首次上传前自动激活失败任务 ====================
+_DAILY_FAILED_ACTIVATE_KEY = 'failed_tasks_activated_date'
+_daily_activate_lock = threading.Lock()
+# 进程内缓存：当天已检查过就不再查库（上传队列补位调用很频繁）
+_daily_activate_checked_date = None
+
+
+def get_app_meta(key, default=None):
+    """读取 app_meta 键值（失败时返回默认值，不抛出）。"""
+    try:
+        conn = get_db_connection()
+        try:
+            row = conn.execute('SELECT value FROM app_meta WHERE key = ?', (key,)).fetchone()
+        finally:
+            conn.close()
+        return row['value'] if row else default
+    except Exception as e:
+        logger.debug(f"读取 app_meta[{key}] 失败: {e}")
+        return default
+
+
+def set_app_meta(key, value):
+    """写入 app_meta 键值。"""
+    try:
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                'INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)',
+                (key, str(value)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return True
+    except Exception as e:
+        logger.warning(f"写入 app_meta[{key}] 失败: {e}")
+        return False
+
+
+def activate_failed_tasks_for_today_once(config=None):
+    """每天第一次上传开始前，自动激活失败任务（等同界面上的「重试失败任务」）。
+
+    - 以 app_meta 记录日期，同一天只会执行一次（进程重启也不会重复触发）；
+    - 当天没有失败任务时同样记账，避免反复查询；
+    - 任何异常都吞掉，绝不影响正常上传流程。
+    """
+    global _daily_activate_checked_date
+    today = datetime.now().strftime('%Y-%m-%d')
+    if _daily_activate_checked_date == today:
+        return None
+    if get_app_meta(_DAILY_FAILED_ACTIVATE_KEY) == today:
+        _daily_activate_checked_date = today
+        return None
+    if not _daily_activate_lock.acquire(blocking=False):
+        return None
+    try:
+        # 拿到锁后二次确认，避免并发下重复激活
+        if get_app_meta(_DAILY_FAILED_ACTIVATE_KEY) == today:
+            _daily_activate_checked_date = today
+            return None
+        try:
+            failed_count = len(get_tasks_by_status(TASK_STATES['FAILED']))
+        except Exception as e:
+            logger.warning(f"[每日激活] 统计失败任务失败（忽略）: {e}")
+            return None
+        if failed_count == 0:
+            set_app_meta(_DAILY_FAILED_ACTIVATE_KEY, today)
+            _daily_activate_checked_date = today
+            logger.info(f"[每日激活] {today} 首次上传前无失败任务，无需激活")
+            return {'total': 0, 'scheduled': 0}
+        # 先记账再执行：即使激活过程异常，也不要在同一天反复重试，避免刷屏/反复拉库
+        set_app_meta(_DAILY_FAILED_ACTIVATE_KEY, today)
+        _daily_activate_checked_date = today
+        result = retry_failed_tasks(config)
+        logger.info(
+            f"[每日激活] {today} 首次上传前自动激活失败任务："
+            f"共 {result.get('total', 0)} 个，重新调度 {result.get('scheduled', 0)} 个"
+        )
+        if result.get('failed_ids'):
+            logger.warning(f"[每日激活] 以下失败任务重新调度失败: {result['failed_ids']}")
+        return result
+    except Exception as e:
+        logger.warning(f"[每日激活] 自动激活失败任务异常（忽略）: {e}")
+        return None
+    finally:
+        _daily_activate_lock.release()
+
 
 def is_metadata_translation_retryable(task):
     if not task or task.get('status') != TASK_STATES['AWAITING_REVIEW']: return False
@@ -1643,6 +1758,8 @@ def _refresh_queue_positions():
     conn = get_db_connection()
     try:
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # 先清掉本状态下的旧位次，避免任务退出队列后残留
+        conn.execute("UPDATE tasks SET queue_position = NULL WHERE status = ?", (TASK_STATES['READY_FOR_UPLOAD'],))
         rows = conn.execute(
             "SELECT id, created_at FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR (upload_progress NOT LIKE ? AND upload_progress != ?))",
             (TASK_STATES['READY_FOR_UPLOAD'], QUEUE_RETIRED_MARK + '%', QUEUE_STARTING_MARK)
@@ -1651,8 +1768,8 @@ def _refresh_queue_positions():
         ordered = sorted(rows, key=lambda r: (-_download_data_priority(r['id']), r['created_at'] or ''))
         for idx, row in enumerate(ordered, 1):
             conn.execute(
-                "UPDATE tasks SET upload_progress = ?, updated_at = ? WHERE id = ?",
-                (f"{QUEUE_WAITING_MARK}（第 {idx} 位）…", now_str, row['id'])
+                "UPDATE tasks SET upload_progress = ?, queue_position = ?, updated_at = ? WHERE id = ?",
+                (f"{QUEUE_WAITING_MARK}（第 {idx} 位）…", idx, now_str, row['id'])
             )
         conn.commit()
     except Exception as e:
@@ -1686,6 +1803,18 @@ def pump_upload_queue(reason='触发'):
         if slots_free <= 0:
             logger.debug(f"[上传队列] {reason}：{len(idle)} 个任务排队中，配额已满（{upload_slots.active}/{upload_slots.limit}），等前一个结束后自动继续")
             return 0
+        # 每天第一次上传前：自动激活失败任务（当天只做一次，失败不影响上传）
+        try:
+            activated = activate_failed_tasks_for_today_once()
+            if activated and activated.get('scheduled'):
+                # 激活可能把任务改成 ready_for_upload，重新取一次队列
+                queued = _list_queued_upload_tasks()
+                active_ids = _get_active_task_ids()
+                idle = [tid for tid in queued if tid not in active_ids]
+                if not idle:
+                    return 0
+        except Exception as e:
+            logger.debug(f"[每日激活] 触发异常（忽略）: {e}")
         started = 0
         for tid in idle[:slots_free]:
             if is_task_cancelled(tid):
@@ -2293,7 +2422,39 @@ class TaskProcessor:
             task_logger.error(f"视频信息采集失败: {result}")
             update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"采集信息失败: {result}")
 
+    def _clean_partial_downloads(self, task_id, task_logger=None):
+        """清理任务目录里残留的半成品下载文件（*.part / *.ytdl / *.temp）。
+
+        中断过的下载会留下碎片和 .ytdl 状态文件，续传时若碎片已被破坏（例如多个进程同时
+        写同一个任务目录），yt-dlp 会报 "Unable to download video: [Errno 2] No such file
+        或 directory: ...part-FragNNN"。这种情况下重新下载前必须先清掉这些残留。
+        只删碎片，保留 video.mp4 / video.webp / metadata.json 等成品文件。
+        """
+        removed = 0
+        task_dir = os.path.join(DOWNLOADS_DIR, task_id)
+        if not os.path.isdir(task_dir):
+            return 0
+        suffixes = ('.part', '.ytdl', '.temp')
+        try:
+            with os.scandir(task_dir) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_file():
+                            continue
+                        name = entry.name.lower()
+                        if any(s in name for s in suffixes):
+                            os.remove(entry.path)
+                            removed += 1
+                    except OSError:
+                        continue
+        except OSError:
+            return removed
+        if removed and task_logger:
+            task_logger.info(f"已清理 {removed} 个未完成的下载碎片文件，准备重新下载")
+        return removed
+
     def _download_video_file(self, task_id, youtube_url, task_logger):
+        """下载视频本体。返回 True 表示视频已就绪；False 表示失败（状态与原因已写入任务）。"""
         from modules.youtube_handler import download_video_data
         task_logger.info(f"审核通过，开始下载视频文件: {youtube_url}")
         update_task(task_id, status=TASK_STATES['DOWNLOADING'])
@@ -2309,26 +2470,36 @@ class TaskProcessor:
             progress_msg = f"{percent:.1f}%"
             task_logger.debug(f"下载进度: {progress_msg}")
             update_task(task_id, upload_progress=progress_msg, silent=True)
-        try:
-            cancel_event = get_task_cancel_event(task_id)
-            success, result = download_video_data(youtube_url, task_id, cookies_path, only_video=True, progress_callback=progress_callback, cancel_event=cancel_event)
-        except Exception as e:
+
+        last_error = ''
+        for attempt in (1, 2):
+            try:
+                cancel_event = get_task_cancel_event(task_id)
+                success, result = download_video_data(youtube_url, task_id, cookies_path, only_video=True, progress_callback=progress_callback, cancel_event=cancel_event)
+            except Exception as e:
+                if is_task_cancelled(task_id): raise TaskCancelledError("任务已取消")
+                task_logger.error(f"下载视频文件时发生异常: {str(e)}")
+                success, result = False, str(e)
             if is_task_cancelled(task_id): raise TaskCancelledError("任务已取消")
-            task_logger.error(f"下载视频文件时发生异常: {str(e)}")
-            update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"下载异常: {str(e)}")
-            return
-        if is_task_cancelled(task_id): raise TaskCancelledError("任务已取消")
-        if success:
-            task_logger.info("视频文件下载成功")
-            task = get_task(task_id)
-            update_data = {'status': TASK_STATES['DOWNLOADED'], 'video_path_local': result.get('video_path', ''), 'upload_progress': None}
-            if task is not None:
-                if result.get('metadata_path') and not task.get('metadata_json_path_local'): update_data['metadata_json_path_local'] = result.get('metadata_path')
-                if result.get('cover_path') and not task.get('cover_path_local'): update_data['cover_path_local'] = result.get('cover_path')
-            update_task(task_id, **update_data)
-        else:
-            task_logger.error(f"视频文件下载失败: {result}")
-            update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"下载视频失败: {result}")
+            if success:
+                task_logger.info("视频文件下载成功")
+                task = get_task(task_id)
+                update_data = {'status': TASK_STATES['DOWNLOADED'], 'video_path_local': result.get('video_path', ''), 'upload_progress': None}
+                if task is not None:
+                    if result.get('metadata_path') and not task.get('metadata_json_path_local'): update_data['metadata_json_path_local'] = result.get('metadata_path')
+                    if result.get('cover_path') and not task.get('cover_path_local'): update_data['cover_path_local'] = result.get('cover_path')
+                update_task(task_id, **update_data)
+                return True
+            last_error = str(result)
+            task_logger.error(f"视频文件下载失败（第 {attempt} 次）: {last_error}")
+            if attempt == 1:
+                # 续传失败多半是碎片损坏，清掉碎片再整段重下一次
+                if self._clean_partial_downloads(task_id, task_logger) > 0:
+                    update_task(task_id, status=TASK_STATES['DOWNLOADING'], upload_progress='0.0%')
+                    continue
+            break
+        update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"下载视频失败: {last_error}")
+        return False
 
     def _recover_cover_path(self, task_id, cover_path, task_logger):
         downloads_dir_real = os.path.realpath(DOWNLOADS_DIR)
@@ -2356,6 +2527,43 @@ class TaskProcessor:
                             update_task(task_id, cover_path_local=entry_path, silent=True)
                             return entry_path
             except OSError: pass
+        return ''
+
+    def _ensure_upload_cover(self, task_id, task, task_logger):
+        """上传前确保封面可用：本地恢复失败时，自动从源视频重新抓取封面。"""
+        cover_path = task.get('cover_path_local', '') if task else ''
+        cover_path = self._recover_cover_path(task_id, cover_path, task_logger)
+        if cover_path:
+            return cover_path
+        youtube_url = task.get('youtube_url', '') if task else ''
+        if not youtube_url:
+            return ''
+        task_logger.info(f"本地封面缺失，尝试重新抓取封面: {youtube_url}")
+        try:
+            from modules.youtube_handler import download_video_data
+            cookies_path = resolve_youtube_cookies_path(self.config, task_logger)
+            if cookies_path:
+                is_valid, _ = validate_cookies(cookies_path, "YouTube")
+                if not is_valid:
+                    cookies_path = None
+            # 注意：必须同时传 only_video=True，否则 download_video_data 会清空任务目录、连已下载的视频一起删除
+            success, result = download_video_data(youtube_url, task_id, cookies_path, skip_download=True, only_video=True, cancel_event=get_task_cancel_event(task_id))
+            if is_task_cancelled(task_id): raise TaskCancelledError("任务已取消")
+            if success and isinstance(result, dict) and result.get('cover_path') and os.path.isfile(result.get('cover_path')):
+                cover_path = result.get('cover_path')
+                # 安全校验：确认视频文件没有被误删
+                video_local = task.get('video_path_local', '') if task else ''
+                if video_local and not os.path.exists(video_local):
+                    task_logger.error(f"封面重抓后视频文件丢失: {video_local}")
+                    return ''
+                update_task(task_id, cover_path_local=cover_path, silent=True)
+                task_logger.info(f"封面重新抓取成功: {cover_path}")
+                return cover_path
+            task_logger.warning(f"封面重新抓取失败: {result}")
+        except TaskCancelledError:
+            raise
+        except Exception as e:
+            task_logger.warning(f"封面重新抓取异常: {str(e)}")
         return ''
 
     def _translate_content(self, task_id, task_logger):
@@ -4644,11 +4852,14 @@ class TaskProcessor:
             if not youtube_url:
                 update_task(task_id, status=TASK_STATES['FAILED'], error_message="无法获取YouTube URL，无法下载视频")
                 return
-            self._download_video_file(task_id, youtube_url, task_logger)
+            if not self._download_video_file(task_id, youtube_url, task_logger):
+                # 下载失败时状态与真实原因已由 _download_video_file 写入，这里直接结束，
+                # 避免被后面的「上传参数不完整，缺少 video_path」覆盖掉真正的原因。
+                return
             task = get_task(task_id)
             video_path = task.get('video_path_local', '') if task else ''
             cover_path = task.get('cover_path_local', '') if task else ''
-        cover_path = self._recover_cover_path(task_id, cover_path, task_logger)
+        cover_path = self._ensure_upload_cover(task_id, task, task_logger)
         if not subtitle_prepared:
             task = self._prepare_subtitle_for_upload(task_id, task_logger) or task
             video_path = task.get('video_path_local', '') if task else video_path
@@ -4726,11 +4937,14 @@ class TaskProcessor:
             if not youtube_url:
                 update_task(task_id, status=TASK_STATES['FAILED'], error_message="无法获取YouTube URL，无法下载视频", upload_progress=None)
                 return
-            self._download_video_file(task_id, youtube_url, task_logger)
+            if not self._download_video_file(task_id, youtube_url, task_logger):
+                # 下载失败时状态与真实原因已由 _download_video_file 写入，这里直接结束，
+                # 避免被后面的「上传参数不完整，缺少 video_path」覆盖掉真正的原因。
+                return
             task = get_task(task_id)
             video_path = task.get('video_path_local', '') if task else ''
             cover_path = task.get('cover_path_local', '') if task else ''
-        cover_path = self._recover_cover_path(task_id, cover_path, task_logger)
+        cover_path = self._ensure_upload_cover(task_id, task, task_logger)
         if not subtitle_prepared:
             task = self._prepare_subtitle_for_upload(task_id, task_logger) or task
             video_path = task.get('video_path_local', '') if task else video_path
@@ -4841,6 +5055,11 @@ def start_task(task_id, config=None):
 
 def force_upload_task(task_id, config=None):
     clear_task_cancel(task_id)
+    # 每天第一次上传前：自动激活失败任务（当天只做一次；内部记账可防止重试链路递归）
+    try:
+        activate_failed_tasks_for_today_once(config)
+    except Exception:
+        pass
     task = get_task(task_id)
     if not task: return False
     allowed_states = [TASK_STATES['AWAITING_REVIEW'], TASK_STATES['COMPLETED'], TASK_STATES['PENDING'], TASK_STATES['READY_FOR_UPLOAD']]

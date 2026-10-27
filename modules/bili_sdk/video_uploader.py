@@ -71,6 +71,31 @@ with open(
     LINES_INFO = json.loads(f.read())
 
 
+# 线路域名可解析性缓存：{host: bool}，避免每次换线都做一次 DNS 查询
+_LINE_HOST_CACHE = {}
+
+
+def _line_host_resolvable(line: dict) -> bool:
+    """线路域名在当前网络是否可解析（解析不到就别切过去，否则必然 Could not resolve host）。"""
+    try:
+        url = str((line or {}).get("probe_url", ""))
+        host = url.split("//", 1)[-1].split("/", 1)[0]
+        if not host:
+            return False
+        if host in _LINE_HOST_CACHE:
+            return _LINE_HOST_CACHE[host]
+        import socket
+        try:
+            socket.getaddrinfo(host, 443)
+            ok = True
+        except Exception:
+            ok = False
+        _LINE_HOST_CACHE[host] = ok
+        return ok
+    except Exception:
+        return False
+
+
 async def _probe() -> dict:
     """
     测试所有线路
@@ -1047,6 +1072,8 @@ class VideoUploader(AsyncEvent):
             threads = max(1, int(preupload.get("threads") or 1))
         except (TypeError, ValueError):
             threads = 1
+        # 限制单任务分块并发上限：多个任务同时上传时，分块并发叠加容易占满带宽导致超时
+        threads = min(threads, 2)
 
         while chunks_pending:
             tasks = []
@@ -1079,6 +1106,32 @@ class VideoUploader(AsyncEvent):
         self.dispatch(VideoUploaderEvents.AFTER_PAGE.value, {"page": page})
 
         return data
+
+    def _rotate_upload_line(self) -> None:
+        """网络失败时轮换上传线路（bda2/ws/qn/bldsa），避开故障节点。
+
+        注意：SDK 内置的线路域名并非在所有网络都能解析（例如部分出口/内网 DNS 下
+        upos-cs-upcdnws / upos-cs-upcdnqn 无 A 记录），切过去只会得到
+        "Could not resolve host"，比不切更糟。因此换线前先确认目标线路域名可解析，
+        解析不通的线路直接跳过。
+        """
+        try:
+            order = ["bda2", "bldsa", "ws", "qn"]
+            current = self.line.get("upcdn") if isinstance(self.line, dict) else None
+            idx = order.index(current) if current in order else -1
+            for i in range(1, len(order) + 1):
+                cand_name = order[(idx + i) % len(order)]
+                if cand_name == current:
+                    continue
+                candidate = LINES_INFO.get(cand_name)
+                if not candidate:
+                    continue
+                if not _line_host_resolvable(candidate):
+                    continue
+                self.line = candidate
+                return
+        except Exception:
+            pass
 
     @staticmethod
     def _switch_upload_endpoint(preupload: dict, line: dict = None) -> dict:
@@ -1130,9 +1183,8 @@ class VideoUploader(AsyncEvent):
         chunk = stream.read(preupload["chunk_size"])
         stream.close()
 
-        # 上传目标 URL
+        # 上传目标 URL：在重试循环内计算，失败轮换线路后能立即生效
         preupload = self._switch_upload_endpoint(preupload, self.line)
-        url = self._get_upload_url(preupload)
 
         real_chunk_size = len(chunk)
 
@@ -1154,7 +1206,7 @@ class VideoUploader(AsyncEvent):
             "page": page,
         }
 
-        max_attempts = 3
+        max_attempts = 5
         retryable_statuses = {408, 429, 500, 502, 503, 504}
 
         for attempt in range(1, max_attempts + 1):
@@ -1167,6 +1219,9 @@ class VideoUploader(AsyncEvent):
 
             status_code = None
             try:
+                # 每次尝试前重新解析端点：线路轮换后立即生效
+                preupload = self._switch_upload_endpoint(preupload, self.line)
+                url = self._get_upload_url(preupload)
                 resp = await session.request(
                     method="PUT",
                     url=url,
@@ -1195,7 +1250,10 @@ class VideoUploader(AsyncEvent):
                     or status_code in retryable_statuses
                 )
                 retrying = retryable and attempt < max_attempts
-                retry_delay = min(2 ** (attempt - 1), 8) if retrying else 0
+                retry_delay = min(2 ** (attempt - 1), 16) if retrying else 0
+                if retrying:
+                    # 连续失败时轮换上传线路（bda2/ws/qn），避开故障节点
+                    self._rotate_upload_line()
                 failure_data = {
                     **attempt_data,
                     "info": str(err),

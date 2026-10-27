@@ -66,6 +66,11 @@
                 <button type="button" class="btn btn-outline-dark" id="batchScheduleBtn" onclick="openBatchScheduleModal()">
                     <i class="bi bi-clock-history"></i> 定时上传
                 </button>
+                <button type="button" class="btn btn-outline-danger" id="cancelScheduleBtn" onclick="confirmCancelAllScheduled()"
+                        title="无需勾选，直接取消全部定时上传（任务退回等待人工审核）">
+                    <i class="bi bi-alarm"></i> 取消定时上传
+                    <span class="badge bg-danger ms-1{% if not scheduled_count %} d-none{% endif %}" id="scheduledCountBadge">{{ scheduled_count or 0 }}</span>
+                </button>
                 <button type="button" class="btn btn-outline-info" id="batchUploadBiliBtn" onclick="confirmBatchUploadBilibili()">
                     <i class="bi bi-cloud-arrow-up-fill"></i> 上传到B站
                 </button>
@@ -1412,6 +1417,50 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         } catch (e) { alert('网络错误，设置定时上传失败'); } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
+        }
+    }
+
+    // 一键取消全部定时上传（不需要勾选任务）
+    async function confirmCancelAllScheduled() {
+        const badge = document.getElementById('scheduledCountBadge');
+        const cnt = parseInt((badge && badge.textContent) || '0', 10) || 0;
+        if (cnt === 0) {
+            alert('当前没有定时上传的任务');
+            return;
+        }
+        if (!confirm(`确定取消全部 ${cnt} 个定时上传任务吗？\n\n取消后这些任务不再到点自动上传，会退回「等待人工审核」，可随时重新定时或手工审核上传。`)) return;
+
+        const btn = document.getElementById('cancelScheduleBtn');
+        const oldHtml = btn.innerHTML;
+        let cancelled = false;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 取消中...';
+        try {
+            const res = await fetch('/tasks/cancel_scheduled_upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            });
+            const data = await res.json();
+            alert(data.message || (data.success ? '已取消全部定时上传' : '取消失败'));
+            if (data.success) {
+                cancelled = true;
+                if (typeof selectedTaskIds !== 'undefined') {
+                    selectedTaskIds.clear();
+                    updateSelectAllState();
+                }
+                refreshTasksData(true);
+            }
+        } catch (e) {
+            alert('网络错误，取消定时上传失败');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = oldHtml;
+            // 取消成功后把按钮上的数量徽标归零隐藏
+            if (cancelled) {
+                const b = document.getElementById('scheduledCountBadge');
+                if (b) { b.textContent = '0'; b.classList.add('d-none'); }
+            }
         }
     }
 

@@ -852,7 +852,8 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
             )
             cmd.extend([
                 '--no-write-info-json',
-                '--no-write-thumbnail',
+                # 封面是上传的必需参数，仅下载视频时也必须一并下载封面
+                '--write-thumbnail',
             ])
             cmd.extend(_build_subtitle_download_args(
                 config,

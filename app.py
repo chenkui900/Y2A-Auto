@@ -2203,6 +2203,11 @@ def tasks():
     if display_status and not any(opt['value'] == display_status for opt in status_options):
         status_options.append({'value': display_status, 'label': f'自定义: {display_status}'})
 
+    try:
+        scheduled_count = len(get_tasks_by_status(TASK_STATES['SCHEDULED_UPLOAD']) or [])
+    except Exception:
+        scheduled_count = 0
+
     return render_template(
         'tasks.html', 
         tasks=pagination_data['tasks'],
@@ -2212,7 +2217,8 @@ def tasks():
         status_options=status_options,
         current_search=search_keyword,
         acfun_partition_mapping=acfun_partition_mapping,
-        bilibili_partition_mapping=bilibili_partition_mapping
+        bilibili_partition_mapping=bilibili_partition_mapping,
+        scheduled_count=scheduled_count
     )
 
 
@@ -3169,6 +3175,47 @@ def batch_schedule_upload_route():
         message += f'，跳过 {skipped} 个（上传中/已完成/处理中的任务不可定时）'
     logger.info(f"[定时上传] {message}")
     return jsonify({'success': True, 'message': message})
+
+
+@app.route('/tasks/cancel_scheduled_upload', methods=['POST'])
+@login_required
+def cancel_scheduled_upload_route():
+    """一键取消全部定时上传：清空计划时间，任务退回「等待人工审核」，不再到点自动上传。
+
+    不需要勾选任务，直接处理库里所有 scheduled_upload 状态的任务。
+    """
+    try:
+        scheduled = get_tasks_by_status(TASK_STATES['SCHEDULED_UPLOAD']) or []
+    except Exception as e:
+        logger.error(f"[定时上传] 读取定时任务失败: {e}")
+        return jsonify({'success': False, 'message': f'读取定时任务失败：{e}'}), 500
+
+    if not scheduled:
+        return jsonify({'success': True, 'cancelled': 0,
+                        'message': '当前没有定时上传的任务，无需取消'})
+
+    cancelled, failed = 0, 0
+    for task in scheduled:
+        try:
+            ok = update_task(task['id'], silent=True,
+                             status=TASK_STATES['AWAITING_REVIEW'],
+                             upload_progress='已取消定时上传，等待人工审核',
+                             scheduled_upload_at=None)
+            if ok:
+                cancelled += 1
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"[定时上传] 取消任务 {task['id'][:8]} 失败: {e}")
+
+    message = f'已取消 {cancelled} 个任务的定时上传，任务退回「等待人工审核」'
+    if failed:
+        message += f'，{failed} 个取消失败（请查看日志）'
+    logger.info(f"[定时上传] 全部取消：{message}")
+    return jsonify({'success': True, 'cancelled': cancelled,
+                    'total': len(scheduled), 'failed': failed, 'message': message})
+
 
 @app.route('/tasks/batch_partition', methods=['POST'])
 @login_required
@@ -5223,7 +5270,16 @@ if __name__ == '__main__':
     # 自动启动所有pending任务（如果启用了自动模式）
     if config.get('AUTO_MODE_ENABLED', False):
         logger.info("自动模式已启用，正在启动所有pending任务...")
-        auto_start_pending_tasks(config)
+        # 放到后台线程执行：auto_start_pending_tasks 内部会循环尝试启动任务（每次都要多次查库，
+        # 待处理任务多时可能耗时数分钟），若在主线程执行会阻塞端口绑定、导致页面长时间打不开。
+        # 任务本身由任务处理器的定时扫描接管，异步启动不影响正常调度。
+        import threading as _threading
+        _threading.Thread(
+            target=auto_start_pending_tasks,
+            args=(config,),
+            name='AutoStartPendingTasks',
+            daemon=True,
+        ).start()
 
     # 初始化YouTube监控API
     if config.get('YOUTUBE_API_KEY'):
