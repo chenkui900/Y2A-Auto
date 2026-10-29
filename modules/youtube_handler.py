@@ -391,6 +391,21 @@ def _summarize_yt_dlp_error(stdout_text: str | None, stderr_text: str | None) ->
     return lines[-1] if lines else "未知错误"
 
 
+def _summarize_error_text(error_text: str | None, max_length: int = 200) -> str:
+    """从预检查返回的错误文本中提炼简短摘要，用于日志与用户提示。"""
+    if not error_text:
+        return "未知错误"
+    normalized = str(error_text).strip()
+    if not normalized:
+        return "未知错误"
+
+    summary = _summarize_yt_dlp_error(normalized, normalized)
+    summary = str(summary).strip()
+    if len(summary) > max_length:
+        summary = summary[:max_length] + "..."
+    return summary
+
+
 def _find_yt_dlp_command(log: logging.Logger) -> list[str]:
     """解析 yt-dlp 调用命令，冻结环境优先使用主程序内置入口。"""
     log.info("开始查找yt-dlp执行命令...")
@@ -665,6 +680,13 @@ def test_video_availability(youtube_url, yt_dlp_cmd, cookies_path=None, logger=N
                 time.sleep(2)
                 continue
 
+            # 其余错误（网络抖动、临时性失败等）同样用完全部重试机会，
+            # 避免单次瞬时失败直接判定"视频不可用"。
+            if attempt < max_attempts:
+                logger.warning(f"等待后重试视频可用性检查，上次错误摘要: {_summarize_yt_dlp_error(process.stderr, process.stdout)}")
+                time.sleep(3)
+                continue
+
             return False, None, last_error
 
         except subprocess.TimeoutExpired:
@@ -772,8 +794,9 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
                 else:
                     logger.warning("CookieCloud同步失败: %s", sync_info)
             if not available:
-                logger.error("视频不可用或无法访问")
-                return False, "视频不可用或无法访问"
+                error_summary = _summarize_error_text(error_msg)
+                logger.error(f"视频不可用或无法访问, 错误详情: {error_summary}")
+                return False, f"视频不可用或无法访问（{error_summary}）"
 
         if not available and error_msg and _looks_like_youtube_bot_challenge(error_msg):
             # 对于同时存在格式/访问混合异常的场景，保留诊断日志但不阻塞后续下载重试

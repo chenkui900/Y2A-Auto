@@ -3011,6 +3011,8 @@ def batch_upload_tasks_route():
 
     config = load_config()
     valid_tasks = []
+    skipped_status = {}   # 不可上传任务的状态分布，用于给出可读提示
+    skipped_partition = 0
 
     # 校验哪些任务处于可上传状态
     for task_id in task_ids:
@@ -3018,6 +3020,8 @@ def batch_upload_tasks_route():
         if not task:
             continue
         if task['status'] not in [TASK_STATES['READY_FOR_UPLOAD'], TASK_STATES['AWAITING_REVIEW'], TASK_STATES['COMPLETED'], TASK_STATES['FAILED']]:
+            status_label = task_status_display(task['status'])
+            skipped_status[status_label] = skipped_status.get(status_label, 0) + 1
             continue
         # 指定了目标平台时，先覆盖投稿目标，再按新目标校验分区
         if upload_target:
@@ -3027,9 +3031,20 @@ def batch_upload_tasks_route():
         missing = _missing_upload_partition_labels(task, config)
         if not missing:
             valid_tasks.append(task_id)
+        else:
+            skipped_partition += 1
 
     if not valid_tasks:
-        return jsonify({'success': False, 'message': '选中的任务中没有可上传的任务（或缺少分区设置）'}), 400
+        reasons = []
+        if skipped_status:
+            parts = [f'{cnt} 个仍处于「{label}」（需先完成下载/翻译/审核等处理）'
+                     for label, cnt in skipped_status.items()]
+            reasons.append('、'.join(parts))
+        if skipped_partition:
+            reasons.append(f'{skipped_partition} 个缺少分区设置')
+        reason_text = ('：' + '；'.join(reasons)) if reasons else ''
+        return jsonify({'success': False,
+                        'message': f'选中的 {len(task_ids)} 个任务中没有可上传的任务{reason_text}'}), 400
 
     # 读取设置 → 运维与安全 → 资源控制 → 最大并发上传数
     concurrency_limit = _resolve_upload_concurrency_limit(config)

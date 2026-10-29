@@ -108,21 +108,33 @@ async def _probe() -> dict:
     legacy_timeout = request_settings.get_timeout()
     request_settings.set_timeout(30) # 测试时设置为 30
     for line in LINES_INFO.values():
-        start = time.perf_counter()
-        data = bytes(int(1024 * 0.1 * 1024))  # post 0.1MB
-        client = get_client()
-        try:
-            await client.request(
-                method="POST",
-                url=f'https:{line["probe_url"]}',
-                data=data,
-            )
-            cost_time = time.perf_counter() - start
-        except Exception:
-            cost_time = request_settings.get_timeout()
-        if cost_time < min_cost:
-            min_cost, fastest_line = cost_time, line
+        # 网络抖动时每条线路探测重试一次，全部失败才判定该线路不可用
+        best_cost = None
+        for attempt in (1, 2):
+            start = time.perf_counter()
+            data = bytes(int(1024 * 0.1 * 1024))  # post 0.1MB
+            client = get_client()
+            try:
+                await client.request(
+                    method="POST",
+                    url=f'https:{line["probe_url"]}',
+                    data=data,
+                )
+                best_cost = time.perf_counter() - start
+                break
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                    continue
+        if best_cost is not None and best_cost < min_cost:
+            min_cost, fastest_line = best_cost, line
     request_settings.set_timeout(legacy_timeout)
+    if fastest_line is None:
+        # 全部线路探测失败：给出可读的错误，而不是让调用方拿到 None
+        raise RuntimeError(
+            "所有B站上传线路探测失败（upos-*.bilivideo.com 均不可达），"
+            "请检查本机网络、防火墙或运营商对B站上传CDN的连通性后重试"
+        )
     return fastest_line
 
 
