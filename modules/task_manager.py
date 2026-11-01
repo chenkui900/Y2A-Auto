@@ -1070,7 +1070,7 @@ def add_task(youtube_url, upload_target=None):
         emit_notification_event(NotificationEvent(event_type=EVENT_TASK_ADDED, payload={'task_id': task_id, 'youtube_url': youtube_url, 'upload_target': normalized_target}))
     return task_id
 
-def update_task(task_id, silent=False, **kwargs):
+def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
     if not kwargs:
         return False
     status_changed = 'status' in kwargs
@@ -1149,7 +1149,7 @@ def update_task(task_id, silent=False, **kwargs):
                     event_type = 'task_progress'
                     event_payload = {'task_id': task_id, 'status': current_status, 'upload_progress': filtered_kwargs.get('upload_progress'), 'updated_at': filtered_kwargs.get('updated_at')}
                 publish_task_event(event_type, event_payload)
-                if status_changed and previous_status != filtered_kwargs.get('status') and filtered_kwargs.get('status') in (TASK_STATES['COMPLETED'], TASK_STATES['FAILED']):
+                if (not suppress_notification) and status_changed and previous_status != filtered_kwargs.get('status') and filtered_kwargs.get('status') in (TASK_STATES['COMPLETED'], TASK_STATES['FAILED']):
                     merged_task = dict(existing_task or {})
                     merged_task.update(filtered_kwargs)
                     merged_task['id'] = task_id
@@ -1247,6 +1247,36 @@ def get_tasks_paginated(page=1, per_page=20, status=None, search=None):
         return {'tasks': [], 'total': 0, 'page': 1, 'per_page': per_page, 'total_pages': 0, 'has_prev': False, 'has_next': False, 'prev_page': 0, 'next_page': 2}
     finally:
         if conn: conn.close()
+
+def get_task_ids_filtered(status=None, search=None):
+    """按筛选条件（状态/关键词）返回全部任务ID，用于跨页批量选择。"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conditions = []
+        params = []
+        if status:
+            status_list = status.split(',')
+            placeholders = ",".join(["?"] * len(status_list))
+            conditions.append(f"status IN ({placeholders})")
+            params.extend(status_list)
+        if search and search.strip():
+            like = f"%{search.strip()}%"
+            conditions.append(
+                "(id LIKE ? OR youtube_url LIKE ? OR video_title_original LIKE ? "
+                "OR video_title_translated LIKE ? OR acfun_upload_response LIKE ? "
+                "OR bilibili_upload_response LIKE ?)"
+            )
+            params.extend([like] * 6)
+        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        cursor = conn.execute(f"SELECT id FROM tasks {where_clause} ORDER BY updated_at DESC", params)
+        return [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"获取筛选任务ID失败: {e}")
+        return []
+    finally:
+        if conn: conn.close()
+
 
 def get_tasks_by_status(status):
     conn = get_db_connection()

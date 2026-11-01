@@ -1,4 +1,5 @@
 import os
+import io
 import tempfile
 from typing import Any
 from dataclasses import dataclass
@@ -47,15 +48,12 @@ class Picture:
         return f"Picture(height='{self.height}', width='{self.width}', imageType='{self.imageType}', size={self.size}, url='{self.url}')"
 
     def __set_picture_meta_from_bytes(self, imgtype: str) -> None:
-        tmp_dir = tempfile.gettempdir()
-        img_path = os.path.join(tmp_dir, "test." + imgtype)
-        with open(img_path, "wb+") as file:
-            file.write(self.content)
-        img = Image.open(img_path)
-        self.size = int(round(os.path.getsize(img_path) / 1024, 0))
-        self.height = img.height
-        self.width = img.width
+        # 直接在内存中解析图片元数据，避免写固定名临时文件导致并发互踩
+        with Image.open(io.BytesIO(self.content)) as img:
+            self.width = img.width
+            self.height = img.height
         self.imageType = imgtype
+        self.size = int(round(len(self.content) / 1024, 0))
 
     @staticmethod
     async def load_url(url: str) -> "Picture":
@@ -125,12 +123,12 @@ class Picture:
         return obj
 
     def _to_biliapifile(self) -> BiliAPIFile:
-        tmp_dir = tempfile.gettempdir()
-        img_path = os.path.join(tmp_dir, "test." + self.imageType)
-        with open(img_path, "wb") as file:
+        # 使用唯一临时文件名，避免并发上传时互相覆盖同一个 test.xxx
+        fd, img_path = tempfile.mkstemp(prefix="y2a_cover_", suffix="." + self.imageType)
+        with os.fdopen(fd, "wb") as file:
             file.write(self.content)
-        img = Image.open(img_path)
-        mime_type = img.get_format_mimetype()
+        with Image.open(io.BytesIO(self.content)) as img:
+            mime_type = img.get_format_mimetype()
         return BiliAPIFile(path=img_path, mime_type=mime_type)
 
     async def upload(self, credential: Credential) -> "Picture":
@@ -179,14 +177,11 @@ class Picture:
         Returns:
             Picture: `self`
         """
-        tmp_dir = tempfile.gettempdir()
-        img_path = os.path.join(tmp_dir, "test." + self.imageType)
-        open(img_path, "wb").write(self.content)
-        img = Image.open(img_path)
-        new_img_path = os.path.join(tmp_dir, "test." + new_format)
-        img.save(new_img_path)
-        with open(new_img_path, "rb") as file:
-            self.content = file.read()
+        save_format = "JPEG" if new_format.lower() in ("jpg", "jpeg") else new_format.upper()
+        with Image.open(io.BytesIO(self.content)) as img:
+            buf = io.BytesIO()
+            img.save(buf, format=save_format)
+            self.content = buf.getvalue()
         self.__set_picture_meta_from_bytes(new_format)
         return self
 
@@ -201,15 +196,12 @@ class Picture:
         Returns:
             Picture: `self`
         """
-        tmp_dir = tempfile.gettempdir()
-        img_path = os.path.join(tmp_dir, "test." + self.imageType)
-        open(img_path, "wb").write(self.content)
-        img = Image.open(img_path)
-        img = img.resize((width, height))
-        new_img_path = os.path.join(tmp_dir, "test." + self.imageType)
-        img.save(new_img_path)
-        with open(new_img_path, "rb") as file:
-            self.content = file.read()
+        save_format = "JPEG" if self.imageType.lower() in ("jpg", "jpeg") else self.imageType.upper()
+        with Image.open(io.BytesIO(self.content)) as img:
+            img = img.resize((width, height))
+            buf = io.BytesIO()
+            img.save(buf, format=save_format)
+            self.content = buf.getvalue()
         self.__set_picture_meta_from_bytes(self.imageType)
         return self
 
@@ -223,11 +215,9 @@ class Picture:
         Returns:
             Picture: `self`
         """
-        tmp_dir = tempfile.gettempdir()
-        img_path = os.path.join(tmp_dir, "test." + self.imageType)
-        open(img_path, "wb").write(self.content)
-        img = Image.open(img_path)
-        img.save(path, save_all=(True if self.imageType in ["webp", "gif"] else False))
+        with Image.open(io.BytesIO(self.content)) as img:
+            save_all = self.imageType in ("webp", "gif")
+            img.save(path, save_all=save_all)
         self.url = "file://" + path
         return self
 

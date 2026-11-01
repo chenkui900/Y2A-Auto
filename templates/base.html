@@ -9,7 +9,7 @@
     <!-- 使用本地Bootstrap Icons -->
     <link rel="stylesheet" href="{{ url_for('static', filename='lib/icons/bootstrap-icons.css') }}">
     <!-- 自定义样式 -->
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=20261023">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=20261102">
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/favicon.png') }}">
     <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='img/favicon.ico') }}">
     <script>
@@ -98,18 +98,28 @@
     
     <!-- 实时通知模态框 -->
     <div class="modal fade" id="notificationModal" tabindex="-1" aria-hidden="true">
-        <div class="modal-dialog">
+        <div class="modal-dialog modal-dialog-centered">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title"><i class="bi bi-bell"></i> 任务完成通知</h5>
+                    <div class="modal-head-flex">
+                        <div class="modal-head-icon tone-success"><i class="bi bi-bell-fill"></i></div>
+                        <div class="modal-head-text">
+                            <h5 class="modal-title">任务完成通知</h5>
+                            <div class="modal-head-sub">视频已处理完成，可前往平台查看</div>
+                        </div>
+                    </div>
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
                 </div>
                 <div class="modal-body" id="notificationBody">
                     <!-- 通知内容 -->
                 </div>
                 <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
-                    <a href="#" class="btn btn-primary" id="viewVideoBtn" target="_blank" rel="noopener">查看视频</a>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                        <i class="bi bi-x-circle"></i> 关闭
+                    </button>
+                    <a href="#" class="btn btn-primary" id="viewVideoBtn" target="_blank" rel="noopener">
+                        <i class="bi bi-play-circle"></i> 查看视频
+                    </a>
                 </div>
             </div>
         </div>
@@ -118,7 +128,7 @@
     <!-- 使用本地Bootstrap JS Bundle -->
     <script src="{{ url_for('static', filename='lib/bootstrap/bootstrap.bundle.min.js') }}"></script>
     <!-- 自定义JS -->
-    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/main.js') }}?v=20261102"></script>
 
     {% block extra_js %}{% endblock %}
 </body>

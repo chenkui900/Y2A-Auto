@@ -56,7 +56,7 @@ from modules.utils import get_app_subdir
 from modules.config_manager import load_config, update_config, reset_specific_config, DEFAULT_CONFIG
 from modules.whisper_languages import WHISPER_LANGUAGE_LIST
 from modules.subtitle_style import normalize_hex_color
-from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path, is_task_active
+from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_task_ids_filtered, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path, is_task_active
 from modules.acfun_auth import AcfunQrLoginSession
 from modules.bilibili_auth import BilibiliQrLoginSession
 from queue import Empty, Queue
@@ -2146,6 +2146,30 @@ def index():
 
     return render_template('index.html', stats=stats, recent_tasks=recent_tasks)
 
+def _build_processing_states():
+    """「进行中」包含的所有子状态（与 task_manager.py 的 PROCESSING_STATES 保持一致）"""
+    return (
+        'fetching_info,info_fetched,'
+        f"{TASK_STATES['TRANSLATING']},{TASK_STATES['TAGGING']},{TASK_STATES['PARTITIONING']},"
+        f"{TASK_STATES['MODERATING']},{TASK_STATES['DOWNLOADING']},{TASK_STATES['DOWNLOADED']},"
+        f"{TASK_STATES['ASR_TRANSCRIBING']},{TASK_STATES['TRANSLATING_SUBTITLE']},"
+        f"{TASK_STATES['ENCODING_VIDEO']},{TASK_STATES['UPLOADING']}"
+    )
+
+
+@app.route('/tasks/filtered_ids')
+@login_required
+def tasks_filtered_ids():
+    """返回当前筛选条件下的全部任务ID（跨页批量选择用）。"""
+    status_filter = request.args.get('status', '')
+    processing_states = _build_processing_states()
+    if status_filter == 'processing':
+        status_filter = processing_states
+    search_keyword = (request.args.get('q') or '').strip()
+    ids = get_task_ids_filtered(status=status_filter, search=search_keyword)
+    return jsonify({'success': True, 'ids': ids, 'total': len(ids)})
+
+
 @app.route('/tasks')
 @login_required
 def tasks():
@@ -2160,14 +2184,8 @@ def tasks():
     status_filter = raw_status_filter
     
     # 定义"进行中"包含的所有子状态（与 task_manager.py 中的 PROCESSING_STATES 保持一致）
-    processing_states = (
-        'fetching_info,info_fetched,'
-        f"{TASK_STATES['TRANSLATING']},{TASK_STATES['TAGGING']},{TASK_STATES['PARTITIONING']},"
-        f"{TASK_STATES['MODERATING']},{TASK_STATES['DOWNLOADING']},{TASK_STATES['DOWNLOADED']},"
-        f"{TASK_STATES['ASR_TRANSCRIBING']},{TASK_STATES['TRANSLATING_SUBTITLE']},"
-        f"{TASK_STATES['ENCODING_VIDEO']},{TASK_STATES['UPLOADING']}"
-    )
-    
+    processing_states = _build_processing_states()
+
     if status_filter == 'processing':
         status_filter = processing_states
 
@@ -2177,6 +2195,9 @@ def tasks():
     # 传给分页函数
     pagination_data = get_tasks_paginated(page=page, per_page=per_page, status=status_filter, search=search_keyword)
     
+    # 页面渲染需要配置（分区推荐等）
+    config = load_config()
+
     # 获取分区映射
     acfun_partition_mapping = _load_acfun_partition_mapping()
     bilibili_partition_mapping = _build_bilibili_partition_mapping()
@@ -3269,32 +3290,82 @@ def batch_partition_tasks_route():
     return jsonify({'success': True, 'message': f'成功为 {success_count} 个任务设置了分区'})
 
 
-@app.route('/tasks/batch_stop', methods=['POST'])
-@login_required
-def batch_stop_tasks_route():
-    """批量停止“准备上传/上传中”任务。
+def _stoppable_task_states():
+    """「停止」操作可作用的任务状态：运行中 + 排队等待中。
 
-    与单任务 /tasks/<id>/stop 一致的语义：请求取消 + 尝试 terminate 正在跑的
-    subprocess + 把状态置为 FAILED。只对白名单内的状态生效，避免误伤已完成/
-    待审核/下载中等任务。具体能否真正中断取决于 task_manager 是否在关键循环
-    里调用了 raise_if_cancelled——详见 modules/task_manager.py 的改动建议。
+    刻意不包含：
+    - completed / failed：已经是终态，没有可停止的东西；
+    - awaiting_manual_review：任务没在跑，等人工处理；
+    - scheduled_upload：定时上传请用「取消定时上传」，那里会退回待审核而不是置为失败。
     """
-    data = request.get_json() or {}
-    task_ids = data.get('task_ids', [])
-    if not task_ids:
-        return jsonify({'success': False, 'message': '未选择任何任务'}), 400
-
-    from modules.task_manager import request_task_cancel, terminate_active_process
-
-    stoppable_states = {
+    return {
+        TASK_STATES['PENDING'],
+        'fetching_info', 'info_fetched',
+        TASK_STATES['TRANSLATING'],
+        TASK_STATES['TAGGING'],
+        TASK_STATES['PARTITIONING'],
+        TASK_STATES['MODERATING'],
+        TASK_STATES['DOWNLOADING'],
+        TASK_STATES['DOWNLOADED'],
+        TASK_STATES['ASR_TRANSCRIBING'],
+        TASK_STATES['TRANSLATING_SUBTITLE'],
+        TASK_STATES['ENCODING_VIDEO'],
         TASK_STATES['READY_FOR_UPLOAD'],
         TASK_STATES['UPLOADING'],
     }
+
+
+def _stoppable_task_ids():
+    """全库范围内当前可停止的任务ID（按更新时间倒序）。"""
+    return get_task_ids_filtered(status=','.join(sorted(_stoppable_task_states()))) or []
+
+
+@app.route('/tasks/stoppable_count')
+@login_required
+def stoppable_count_route():
+    """预览「停止全部任务」会作用到多少个任务（用于确认弹窗文案）。"""
+    ids = _stoppable_task_ids()
+    return jsonify({'success': True, 'count': len(ids), 'ids': ids})
+
+
+@app.route('/tasks/batch_stop', methods=['POST'])
+@login_required
+def batch_stop_tasks_route():
+    """批量停止任务（支持“停止选中”与“停止全部”两种作用域）。
+
+    与单任务 /tasks/<id>/stop 一致的语义：
+    1) 打取消标记（协作式），后台循环在下一个检查点抛出 TaskCancelledError 退出；
+    2) 若 yt-dlp/ffmpeg 的 subprocess 正在跑，直接 terminate；
+    3) 把状态置为 FAILED，让 UI 立刻反映。
+
+    请求体二选一：
+    - {"task_ids": [...]}  ：停止指定任务（跨页选中的那批）
+    - {"scope": "all"}     ：停止全库所有运行中/排队中的任务
+    """
+    data = request.get_json(silent=True) or {}
+    scope = (data.get('scope') or '').strip().lower()
+    task_ids = data.get('task_ids') or []
+
+    from modules.task_manager import request_task_cancel, terminate_active_process
+
+    stoppable_states = _stoppable_task_states()
+    is_all_scope = (scope == 'all')
+
+    if is_all_scope:
+        task_ids = _stoppable_task_ids()
+        if not task_ids:
+            return jsonify({
+                'success': False,
+                'message': '当前没有正在运行或排队中的任务，无需停止'
+            }), 400
+    elif not task_ids:
+        return jsonify({'success': False, 'message': '未选择任何任务'}), 400
 
     stopped_count = 0
     skipped_count = 0
     missing_count = 0
     terminated_count = 0
+    skipped_status_names = {}
 
     for task_id in task_ids:
         task = get_task(task_id)
@@ -3303,6 +3374,11 @@ def batch_stop_tasks_route():
             continue
         if task['status'] not in stoppable_states:
             skipped_count += 1
+            try:
+                label = task_status_display(task['status'])
+            except Exception:
+                label = task['status']
+            skipped_status_names[label] = skipped_status_names.get(label, 0) + 1
             continue
 
         # 1) 打取消标记——后台循环在下一个检查点会读到并退出
@@ -3311,10 +3387,12 @@ def batch_stop_tasks_route():
         if terminate_active_process(task_id):
             terminated_count += 1
         # 3) 更新数据库状态，让 UI 立刻反映
+        #    主动停止是用户自己的操作，不再逐条推送「任务失败」通知，避免批量停止时刷屏
         update_task(
             task_id,
             status=TASK_STATES['FAILED'],
-            error_message="用户主动停止任务"
+            error_message="用户主动停止任务",
+            suppress_notification=True
         )
         stopped_count += 1
         logger.info(f"批量停止：任务 {task_id} 已请求取消（原状态 {task['status']}）")
@@ -3322,21 +3400,25 @@ def batch_stop_tasks_route():
     if stopped_count == 0:
         detail = []
         if skipped_count:
-            detail.append(f'{skipped_count} 个状态不符合')
+            status_text = '、'.join(f'{name}×{n}' for name, n in skipped_status_names.items())
+            detail.append(f'{skipped_count} 个状态不可停止（{status_text}）' if status_text else f'{skipped_count} 个状态不可停止')
         if missing_count:
             detail.append(f'{missing_count} 个任务不存在')
-        suffix = f'（{"，".join(detail)}）' if detail else ''
+        suffix = f'：{"，".join(detail)}' if detail else ''
         return jsonify({
             'success': False,
-            'message': f'选中的任务中没有“准备上传/上传中”状态的任务{suffix}'
+            'message': f'没有可停止的任务{suffix}'
         }), 400
 
-    msg = f'已停止 {stopped_count} 个任务'
+    if is_all_scope:
+        msg = f'已停止全部 {stopped_count} 个运行中/排队中的任务'
+    else:
+        msg = f'已停止 {stopped_count} 个任务'
     if terminated_count:
-        msg += f'，其中 {terminated_count} 个 subprocess 已终止'
+        msg += f'，其中 {terminated_count} 个后台进程已终止'
     extras = []
     if skipped_count:
-        extras.append(f'跳过 {skipped_count} 个非目标状态')
+        extras.append(f'跳过 {skipped_count} 个不可停止的')
     if missing_count:
         extras.append(f'{missing_count} 个任务不存在')
     if extras:

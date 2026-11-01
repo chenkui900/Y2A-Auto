@@ -2781,7 +2781,7 @@ document.addEventListener('DOMContentLoaded', function () {
             button.textContent = '重置';
             button.title = '将本卡片的设置恢复为默认值';
 
-            button.addEventListener('click', function () {
+            button.addEventListener('click', async function () {
                 // 同名控件（如两个 hours 隐藏域）只重置一次
                 const seen = {};
                 const fields = [];
@@ -2798,7 +2798,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     + '涉及 ' + fields.length + ' 项：' + preview + more + '\n\n'
                     + '此操作立即写入配置，不可撤销。';
 
-                if (!confirm(message)) { return; }
+                if (!(await y2aConfirm(message, { title: '恢复默认值', type: 'warning', confirmText: '恢复默认', cancelText: '取消' }))) { return; }
 
                 fetch('{{ url_for("reset_settings") }}', {
                     method: 'POST',
@@ -2810,12 +2810,12 @@ document.addEventListener('DOMContentLoaded', function () {
                         if (data.status === 'success') {
                             window.location.reload();
                         } else {
-                            alert('重置失败: ' + data.message);
+                            y2aAlert('重置失败: ' + data.message);
                         }
                     })
                     .catch(function (error) {
                         console.error('Error:', error);
-                        alert('重置请求发生错误');
+                        y2aAlert('重置请求发生错误');
                     });
             });
 
@@ -2986,7 +2986,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     };
 
-    const submitTgbotTokenAction = function (action) {
+    const submitTgbotTokenAction = async function (action) {
         if (!tgbotTokenCard) {
             return;
         }
@@ -3002,10 +3002,10 @@ document.addEventListener('DOMContentLoaded', function () {
             return;
         }
         if (isGenerate) {
-            if (!confirm('确定要生成新的 Telegram Bot API Token 吗？旧 Token 会立即失效。')) {
+            if (!(await y2aConfirm('确定要生成新的 Telegram Bot API Token 吗？旧 Token 会立即失效。', { title: '生成新 Token', type: 'warning', confirmText: '生成' }))) {
                 return;
             }
-        } else if (!confirm('确定要撤销 Telegram Bot API Token 吗？撤销后 Bot 将无法提交新任务。')) {
+        } else if (!(await y2aConfirm('确定要撤销 Telegram Bot API Token 吗？撤销后 Bot 将无法提交新任务。', { title: '撤销 Token', type: 'danger', confirmText: '撤销' }))) {
             return;
         }
 

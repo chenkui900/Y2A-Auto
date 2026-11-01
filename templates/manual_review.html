@@ -229,20 +229,27 @@
 
 <!-- 重新翻译确认对话框 -->
 <div class="modal fade" id="retryTranslationModal" tabindex="-1">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title"><i class="bi bi-arrow-clockwise"></i> 确认重新翻译</h5>
+                <div class="modal-head-flex">
+                    <div class="modal-head-icon tone-warning"><i class="bi bi-arrow-clockwise"></i></div>
+                    <div class="modal-head-text">
+                        <h5 class="modal-title">确认重新翻译</h5>
+                        <div class="modal-head-sub">将重新生成标题、简介等元数据</div>
+                    </div>
+                </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
             </div>
             <div class="modal-body">
                 <p>确定要重新翻译任务 <strong id="retryTranslationTitle"></strong> 吗？</p>
-                <div class="alert alert-warning">
+                <div class="confirm-tip tone-warning">
                     <i class="bi bi-exclamation-triangle-fill"></i>
-                    已手动修改的标题、简介、标签和分区选择将被清空并重新生成。
+                    <div>已手动修改的标题、简介、标签和分区选择将被清空并重新生成。</div>
                 </div>
-                <div class="alert alert-info">
-                    将重新生成标题和简介，并在成功后继续执行标签、分区推荐和内容审核等后续流程。
+                <div class="confirm-tip tone-info">
+                    <i class="bi bi-info-circle-fill"></i>
+                    <div>将重新生成标题和简介，并在成功后继续执行标签、分区推荐和内容审核等后续流程。</div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -261,17 +268,23 @@
 
 <!-- 批量重新翻译确认对话框 -->
 <div class="modal fade" id="batchRetryTranslationModal" tabindex="-1">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title"><i class="bi bi-arrow-clockwise"></i> 批量重新翻译</h5>
+                <div class="modal-head-flex">
+                    <div class="modal-head-icon tone-warning"><i class="bi bi-arrow-repeat"></i></div>
+                    <div class="modal-head-text">
+                        <h5 class="modal-title">批量重新翻译</h5>
+                        <div class="modal-head-sub">按系统并发设置自动排队处理</div>
+                    </div>
+                </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
             </div>
             <div class="modal-body">
                 <p>确定要重新翻译全部 <strong id="batchRetryTranslationCount">0</strong> 个翻译失败的任务吗？</p>
-                <div class="alert alert-warning">
+                <div class="confirm-tip tone-warning">
                     <i class="bi bi-exclamation-triangle-fill"></i>
-                    这些任务已手动修改的标题、简介、标签和分区选择将被清空并重新生成；任务会按系统并发设置自动排队处理。
+                    <div>这些任务已手动修改的标题、简介、标签和分区选择将被清空并重新生成；任务会按系统并发设置自动排队处理。</div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -290,17 +303,23 @@
 
 <!-- 强制上传确认对话框 -->
 <div class="modal fade" id="forceUploadModal" tabindex="-1">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title"><i class="bi bi-exclamation-triangle"></i> 确认强制上传</h5>
+                <div class="modal-head-flex">
+                    <div class="modal-head-icon tone-danger"><i class="bi bi-cloud-arrow-up-fill"></i></div>
+                    <div class="modal-head-text">
+                        <h5 class="modal-title">确认强制上传</h5>
+                        <div class="modal-head-sub">将忽略内容审核结果直接投稿</div>
+                    </div>
+                </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
             </div>
             <div class="modal-body">
                 <p>确定要强制上传任务 <strong id="forceUploadTitle"></strong> 吗？</p>
-                <div class="alert alert-warning">
-                    <i class="bi bi-exclamation-triangle-fill"></i> 
-                    此操作将忽略内容审核结果，可能导致内容违规!
+                <div class="confirm-tip tone-warning">
+                    <i class="bi bi-exclamation-triangle-fill"></i>
+                    <div>此操作将忽略内容审核结果，可能导致内容违规!</div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -319,10 +338,16 @@
 
 <!-- 放弃任务确认对话框 -->
 <div class="modal fade" id="abandonTaskModal" tabindex="-1">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title"><i class="bi bi-trash"></i> 确认放弃任务</h5>
+                <div class="modal-head-flex">
+                    <div class="modal-head-icon tone-danger"><i class="bi bi-trash3-fill"></i></div>
+                    <div class="modal-head-text">
+                        <h5 class="modal-title">确认放弃任务</h5>
+                        <div class="modal-head-sub">放弃后任务将从待审核列表移除</div>
+                    </div>
+                </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
             </div>
             <div class="modal-body">

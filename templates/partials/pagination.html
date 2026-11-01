@@ -1,0 +1,52 @@
+{# 分页导航（任务列表用，上下各一处）
+   上下文变量：pagination / current_status_filter / current_search
+   pagination_variant: 'top' | 'bottom'（由调用方 set） #}
+{% if pagination and pagination.total > 0 %}
+{%- set is_top = (pagination_variant|default('bottom')) == 'top' -%}
+<nav aria-label="任务列表分页" class="tasks-pagination {{ 'tasks-pagination-top' if is_top else 'tasks-pagination-bottom mt-4' }}">
+    <div class="d-flex justify-content-between align-items-center {{ 'mb-2' if is_top else 'mb-3' }}">
+        <span class="text-muted small">
+            显示第 {{ (pagination.page - 1) * pagination.per_page + 1 }} - {{ (pagination.page - 1) * pagination.per_page + pagination.tasks|length }} 条，共 {{ pagination.total }} 条任务
+        </span>
+        {% if pagination.total_pages > 1 %}
+        {%- set start_page = pagination.page - 2 if pagination.page > 2 else 1 -%}
+        {%- set end_page = pagination.page + 2 if pagination.page + 2 < pagination.total_pages else pagination.total_pages -%}
+        {%- set status_suffix = '&status=' ~ current_status_filter if current_status_filter else '' -%}
+        {%- set search_suffix = '&q=' ~ (current_search | urlencode) if current_search else '' -%}
+        {%- set filter_suffix = status_suffix ~ search_suffix -%}
+
+        <div class="pagination pagination-sm mb-0" role="list">
+        {%- if pagination.has_prev -%}
+            <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.prev_page }}{{ filter_suffix }}" aria-label="上一页"><span aria-hidden="true">&laquo;</span></a></div>
+        {%- else -%}
+            <div class="page-item disabled" role="listitem"><span class="page-link" aria-label="上一页"><span aria-hidden="true">&laquo;</span></span></div>
+        {%- endif -%}
+        {%- if start_page > 1 -%}
+            <div class="page-item" role="listitem"><a class="page-link" href="?page=1{{ filter_suffix }}">1</a></div>
+            {%- if start_page > 2 -%}
+                <div class="page-item disabled" role="listitem"><span class="page-link">...</span></div>
+            {%- endif -%}
+        {%- endif -%}
+        {%- for page_num in range(start_page, end_page + 1) -%}
+            {%- if page_num == pagination.page -%}
+                <div class="page-item active" role="listitem" aria-current="page"><span class="page-link">{{ page_num }}</span></div>
+            {%- else -%}
+                <div class="page-item" role="listitem"><a class="page-link" href="?page={{ page_num }}{{ filter_suffix }}">{{ page_num }}</a></div>
+            {%- endif -%}
+        {%- endfor -%}
+        {%- if end_page < pagination.total_pages -%}
+            {%- if end_page < pagination.total_pages - 1 -%}
+                <div class="page-item disabled" role="listitem"><span class="page-link">...</span></div>
+            {%- endif -%}
+            <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.total_pages }}{{ filter_suffix }}">{{ pagination.total_pages }}</a></div>
+        {%- endif -%}
+        {%- if pagination.has_next -%}
+            <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.next_page }}{{ filter_suffix }}" aria-label="下一页"><span aria-hidden="true">&raquo;</span></a></div>
+        {%- else -%}
+            <div class="page-item disabled" role="listitem"><span class="page-link" aria-label="下一页"><span aria-hidden="true">&raquo;</span></span></div>
+        {%- endif -%}
+        </div>
+        {% endif %}
+    </div>
+</nav>
+{% endif %}

@@ -11,6 +11,21 @@
 document.addEventListener('DOMContentLoaded', function() {
     console.log('Y2A-Auto 已加载');
 
+    // --- 导航栏高度写入 CSS 变量：供吸顶工具栏（.tasks-head-sticky）定位使用 ---
+    (function syncNavbarHeightVar() {
+        const navbar = document.querySelector('nav.navbar');
+        if (!navbar) return;
+        const apply = () => {
+            const h = Math.round(navbar.getBoundingClientRect().height);
+            if (h > 0) document.documentElement.style.setProperty('--y2a-nav-h', h + 'px');
+        };
+        apply();
+        window.addEventListener('resize', apply);
+        if (window.ResizeObserver) {
+            try { new ResizeObserver(apply).observe(navbar); } catch (e) { /* ignore */ }
+        }
+    })();
+
     // --- 主题切换按钮 ---
     const themeToggle = document.getElementById('themeToggle');
     const syncThemeIcon = () => {
@@ -83,7 +98,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const logCleanupHoursField = document.getElementById('log-cleanup-hours');
     const cleanupHoursHidden = document.getElementById('cleanup-hours-input');
     if(manualCleanupBtn) {
-        manualCleanupBtn.addEventListener('click', function() {
+        manualCleanupBtn.addEventListener('click', async function() {
             // 使用当前输入的小时数（若存在）
             if (logCleanupHoursField && cleanupHoursHidden) {
                 const hours = parseInt(logCleanupHoursField.value, 10);
@@ -92,7 +107,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             }
             const confirmMsg = `确定要手动清理旧日志吗？将删除 ${cleanupHoursHidden ? cleanupHoursHidden.value : ''} 小时前的日志文件。`;
-            if (confirm(confirmMsg)) {
+            if (await y2aConfirm(confirmMsg, { title: '清理旧日志', type: 'warning', confirmText: '开始清理' })) {
                 const form = document.getElementById('cleanup-form');
                 if (form) form.submit();
             }
@@ -135,7 +150,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const downloadCleanupHoursField = document.getElementById('download-cleanup-hours');
     const downloadCleanupHoursHidden = document.getElementById('download-cleanup-hours-input');
     if(manualDownloadCleanupBtn) {
-        manualDownloadCleanupBtn.addEventListener('click', function() {
+        manualDownloadCleanupBtn.addEventListener('click', async function() {
             // 使用当前输入的小时数（若存在）
             if (downloadCleanupHoursField && downloadCleanupHoursHidden) {
                 const hours = parseInt(downloadCleanupHoursField.value, 10);
@@ -144,10 +159,124 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             }
             const confirmMsg = `确定要手动清理旧的下载内容吗？将删除 ${downloadCleanupHoursHidden ? downloadCleanupHoursHidden.value : ''} 小时前的下载文件和目录。`;
-            if (confirm(confirmMsg)) {
+            if (await y2aConfirm(confirmMsg, { title: '清理下载内容', type: 'danger', confirmText: '开始清理' })) {
                 const form = document.getElementById('download-cleanup-form');
                 if (form) form.submit();
             }
         });
     }
 }); 
+// ==========================================================
+// 通用提示对话框（美化版）：y2aAlert / y2aConfirm
+//  - Promise 风格：await y2aConfirm('确定吗？')  -> true / false
+//  - 支持标题、图标类型、补充说明、深浅色主题、ESC/点击遮罩关闭
+// ==========================================================
+(function () {
+    const ICONS = {
+        primary: 'bi-info-circle-fill',
+        info: 'bi-info-circle-fill',
+        success: 'bi-check-circle-fill',
+        warning: 'bi-exclamation-triangle-fill',
+        danger: 'bi-exclamation-octagon-fill'
+    };
+
+    function buildDialog() {
+        const mask = document.createElement('div');
+        mask.className = 'y2a-dialog-mask';
+        mask.setAttribute('role', 'dialog');
+        mask.setAttribute('aria-modal', 'true');
+        mask.innerHTML = `
+            <div class="y2a-dialog" role="document">
+                <div class="y2a-dialog-head">
+                    <div class="y2a-dialog-icon tone-primary"><i class="bi bi-info-circle-fill"></i></div>
+                    <h3 class="y2a-dialog-title"></h3>
+                </div>
+                <div class="y2a-dialog-body">
+                    <div class="y2a-dialog-message"></div>
+                    <div class="y2a-dialog-detail d-none"></div>
+                </div>
+                <div class="y2a-dialog-actions">
+                    <button type="button" class="y2a-dialog-btn ghost" data-role="cancel">取消</button>
+                    <button type="button" class="y2a-dialog-btn primary" data-role="confirm">确定</button>
+                </div>
+            </div>`;
+        document.body.appendChild(mask);
+        return mask;
+    }
+
+    function openDialog(options) {
+        const opts = Object.assign({
+            title: '',
+            message: '',
+            detail: '',
+            type: 'primary',
+            confirmText: '确定',
+            cancelText: '取消',
+            showCancel: false,
+            confirmTone: '' // 覆盖确认按钮配色：primary/success/warning/danger
+        }, options || {});
+
+        return new Promise(function (resolve) {
+            const mask = buildDialog();
+            const iconEl = mask.querySelector('.y2a-dialog-icon');
+            const titleEl = mask.querySelector('.y2a-dialog-title');
+            const msgEl = mask.querySelector('.y2a-dialog-message');
+            const detailEl = mask.querySelector('.y2a-dialog-detail');
+            const cancelBtn = mask.querySelector('[data-role="cancel"]');
+            const confirmBtn = mask.querySelector('[data-role="confirm"]');
+
+            const tone = opts.confirmTone || (opts.showCancel ? (opts.type === 'danger' ? 'danger' : opts.type) : (opts.type === 'danger' ? 'danger' : opts.type));
+            iconEl.className = 'y2a-dialog-icon tone-' + (opts.type || 'primary');
+            iconEl.innerHTML = '<i class="bi ' + (ICONS[opts.type] || ICONS.primary) + '"></i>';
+            titleEl.textContent = opts.title || (opts.showCancel ? '请确认' : '提示');
+            msgEl.textContent = opts.message || '';
+            if (opts.detail) {
+                detailEl.classList.remove('d-none');
+                detailEl.textContent = opts.detail;
+                if (opts.type === 'warning' || opts.type === 'danger') {
+                    detailEl.classList.add('tone-' + opts.type);
+                }
+            }
+            confirmBtn.className = 'y2a-dialog-btn ' + (opts.confirmTone || (opts.type === 'danger' ? 'danger' : (opts.type === 'warning' ? 'warning' : (opts.type === 'success' ? 'success' : 'primary'))));
+            confirmBtn.textContent = opts.confirmText;
+            cancelBtn.textContent = opts.cancelText;
+            cancelBtn.classList.toggle('d-none', !opts.showCancel);
+
+            let settled = false;
+            function close(result) {
+                if (settled) return;
+                settled = true;
+                document.removeEventListener('keydown', onKey);
+                mask.classList.remove('show');
+                document.body.style.overflow = '';
+                setTimeout(function () { mask.remove(); }, 200);
+                resolve(result);
+            }
+            function onKey(e) {
+                if (e.key === 'Escape') close(false);
+                else if (e.key === 'Enter') { e.preventDefault(); close(true); }
+            }
+
+            cancelBtn.addEventListener('click', function () { close(false); });
+            confirmBtn.addEventListener('click', function () { close(true); });
+            mask.addEventListener('click', function (e) { if (e.target === mask) close(false); });
+            document.addEventListener('keydown', onKey);
+
+            document.body.style.overflow = 'hidden';
+            requestAnimationFrame(function () { mask.classList.add('show'); });
+            setTimeout(function () { confirmBtn.focus(); }, 60);
+        });
+    }
+
+    window.y2aAlert = function (message, options) {
+        const opts = Object.assign({ title: '提示', type: 'primary', confirmText: '知道了' }, options || {}, { message: message, showCancel: false });
+        return openDialog(opts);
+    };
+
+    window.y2aConfirm = function (message, options) {
+        const opts = Object.assign({ title: '请确认', type: 'warning', confirmText: '确定', showCancel: true }, options || {}, { message: message, showCancel: true });
+        return openDialog(opts);
+    };
+
+    window.y2aDialog = openDialog;
+})();

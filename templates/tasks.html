@@ -8,8 +8,9 @@
      data-task-fragment-template="{{ url_for('task_fragment', task_id='__TASK_ID__') }}">
     {% set failed_tasks = tasks|selectattr('status', 'equalto', 'failed')|list if tasks else [] %}
     
-    <!-- 顶部工具栏 -->
-    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-4">
+    <!-- 顶部工具栏（吸顶：按钮固定在可视区域顶部，不随表格内容滚动） -->
+    <div class="tasks-head-sticky">
+    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
         <div class="d-flex align-items-center gap-3">
             <h2 class="mb-0">任务列表</h2>
             <!-- 下拉筛选框 -->
@@ -81,6 +82,14 @@
                     <i class="bi bi-trash3"></i> 删除选中 <span id="selectedCount" class="badge bg-danger ms-1 d-none">0</span>
                 </button>
             </div>
+            <button type="button" class="btn btn-outline-danger" id="batchStopBtn" onclick="confirmBatchStop()"
+                    title="停止勾选的任务（仅运行中/排队中的任务会被停止，其余状态自动跳过）">
+                <i class="bi bi-stop-circle"></i> 停止选中
+            </button>
+            <button type="button" class="btn btn-outline-danger" id="stopAllTasksBtn" onclick="confirmStopAllTasks()"
+                    title="停止全库所有正在运行/排队中的任务（不受当前筛选影响）">
+                <i class="bi bi-stop-fill"></i> 停止全部任务
+            </button>
             <button type="button" class="btn btn-danger" onclick="confirmClearAll()">
                 <i class="bi bi-trash"></i> 清除所有任务
             </button>
@@ -88,12 +97,28 @@
         </div>
     </div>
 
+    <!-- 跨页批量选择工具条 -->
+    <div class="selection-bar d-none" id="selectionBar">
+        <span class="sel-count"><i class="bi bi-check2-square"></i> 已选择 <span class="badge bg-primary" id="selCountNum">0</span> 个任务</span>
+        <span class="sel-hint" id="selScopeHint"></span>
+        <button type="button" class="btn btn-sm btn-outline-primary" id="selectAllFilteredBtn" onclick="selectAllFiltered()">
+            <i class="bi bi-layers"></i> 选中当前筛选的全部 <span id="filterTotalNum">0</span> 个（跨页）
+        </button>
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="clearSelection()">
+            <i class="bi bi-x-circle"></i> 清空选择
+        </button>
+    </div>
+    </div><!-- /tasks-head-sticky -->
+
     <!-- 任务列表主体 -->
     <div id="tasksContent">
     {% if tasks %}
     <div class="modern-list">
-        <!-- 桌面端表格 -->
-        <div class="table-responsive modern-table d-none d-md-block">
+        <!-- 顶部页码（与表格底部一致，滚动时保持可见） -->
+        {% set pagination_variant = 'top' %}
+        {% include 'partials/pagination.html' %}
+        <!-- 桌面端表格：固定表头 + 内容区内部滚动 -->
+        <div class="table-responsive modern-table modern-table-scroll d-none d-md-block">
             <table class="table table-striped table-hover table-borderless table-sm align-middle mb-0 tasks-table no-min-width" id="mainTasksTable">
                 <colgroup id="tasksColgroup">
                     <col class="col-check">
@@ -146,55 +171,9 @@
     </div>
     {% endif %}
     
-    <!-- 分页导航 -->
-    {% if pagination and pagination.total > 0 %}
-    <nav aria-label="任务列表分页" class="mt-4">
-        <div class="d-flex justify-content-between align-items-center mb-3">
-            <span class="text-muted small">
-                显示第 {{ (pagination.page - 1) * pagination.per_page + 1 }} - {{ (pagination.page - 1) * pagination.per_page + pagination.tasks|length }} 条，共 {{ pagination.total }} 条任务
-            </span>
-            {% if pagination.total_pages > 1 %}
-            {%- set start_page = pagination.page - 2 if pagination.page > 2 else 1 -%}
-            {%- set end_page = pagination.page + 2 if pagination.page + 2 < pagination.total_pages else pagination.total_pages -%}
-            {%- set status_suffix = '&status=' ~ current_status_filter if current_status_filter else '' -%}
-            {%- set search_suffix = '&q=' ~ (current_search | urlencode) if current_search else '' -%}
-            {%- set filter_suffix = status_suffix ~ search_suffix -%}
-
-            <div class="pagination pagination-sm mb-0" role="list">
-            {%- if pagination.has_prev -%}
-                <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.prev_page }}{{ filter_suffix }}" aria-label="上一页"><span aria-hidden="true">&laquo;</span></a></div>
-            {%- else -%}
-                <div class="page-item disabled" role="listitem"><span class="page-link" aria-label="上一页"><span aria-hidden="true">&laquo;</span></span></div>
-            {%- endif -%}
-            {%- if start_page > 1 -%}
-                <div class="page-item" role="listitem"><a class="page-link" href="?page=1{{ filter_suffix }}">1</a></div>
-                {%- if start_page > 2 -%}
-                    <div class="page-item disabled" role="listitem"><span class="page-link">...</span></div>
-                {%- endif -%}
-            {%- endif -%}
-            {%- for page_num in range(start_page, end_page + 1) -%}
-                {%- if page_num == pagination.page -%}
-                    <div class="page-item active" role="listitem" aria-current="page"><span class="page-link">{{ page_num }}</span></div>
-                {%- else -%}
-                    <div class="page-item" role="listitem"><a class="page-link" href="?page={{ page_num }}{{ filter_suffix }}">{{ page_num }}</a></div>
-                {%- endif -%}
-            {%- endfor -%}
-            {%- if end_page < pagination.total_pages -%}
-                {%- if end_page < pagination.total_pages - 1 -%}
-                    <div class="page-item disabled" role="listitem"><span class="page-link">...</span></div>
-                {%- endif -%}
-                <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.total_pages }}{{ filter_suffix }}">{{ pagination.total_pages }}</a></div>
-            {%- endif -%}
-            {%- if pagination.has_next -%}
-                <div class="page-item" role="listitem"><a class="page-link" href="?page={{ pagination.next_page }}{{ filter_suffix }}" aria-label="下一页"><span aria-hidden="true">&raquo;</span></a></div>
-            {%- else -%}
-                <div class="page-item disabled" role="listitem"><span class="page-link" aria-label="下一页"><span aria-hidden="true">&raquo;</span></span></div>
-            {%- endif -%}
-            </div>
-            {% endif %}
-        </div>
-    </nav>
-    {% endif %}
+    <!-- 底部页码 -->
+    {% set pagination_variant = 'bottom' %}
+    {% include 'partials/pagination.html' %}
     </div>
 </div>
 
@@ -777,6 +756,21 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         });
     }
 
+    // --- 固定布局：计算表格滚动区可用高度（工具栏吸顶、表头固定、内容内部滚动）---
+    function syncTasksLayoutVars() {
+        const scroller = document.querySelector('.modern-table-scroll');
+        if (!scroller) return;
+        // 移动端表格被 d-none 隐藏（改为卡片视图），此时不需要计算滚动区高度
+        if (scroller.offsetParent === null) return;
+        // 表格顶部到页面顶部的距离（工具栏吸顶后也要留出导航栏高度）
+        const scrollerTop = scroller.getBoundingClientRect().top + window.scrollY;
+        const bottomNav = document.querySelector('.tasks-pagination-bottom');
+        const bottomH = bottomNav ? bottomNav.getBoundingClientRect().height + 20 : 56;
+        // 预留：导航栏高度 + 表格上方区域 + 底部页码 + 少量留白
+        const offset = scrollerTop + bottomH + 8;
+        document.documentElement.style.setProperty('--y2a-table-offset', Math.round(offset) + 'px');
+    }
+
     // --- 基础辅助函数 ---
     function copyToClipboard(text) {
         if (!text) return;
@@ -802,13 +796,13 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         new bootstrap.Modal(document.getElementById('deleteTaskModal')).show();
     }
 
-    function confirmStopTask(taskId, taskTitle) {
-        if (!confirm(`确定要停止任务 "${taskTitle}" 吗？\n(已下载的部分文件会被保留，下次点开始可尝试续传)`)) return;
+    async function confirmStopTask(taskId, taskTitle) {
+        if (!(await y2aConfirm(`确定要停止任务 "${taskTitle}" 吗？\n(已下载的部分文件会被保留，下次点开始可尝试续传)`, { title: '停止任务', type: 'warning', confirmText: '停止任务' }))) return;
         const formData = new FormData();
         fetch(`/tasks/${taskId}/stop`, { method: 'POST', body: formData }).then(res => {
             if (res.ok) setTimeout(() => window.location.reload(), 500);
-            else alert('停止任务失败');
-        }).catch(() => alert('网络错误'));
+            else y2aAlert('停止任务失败');
+        }).catch(() => y2aAlert('网络错误'));
     }
 
     function confirmClearAll() {
@@ -995,6 +989,11 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         const currentContent = document.querySelector('#tasksContent');
         if (!currentContent || typeof html !== 'string' || html === currentContent.innerHTML) return;
 
+        // 记录当前滚动位置：局部刷新替换 DOM 后要还原，否则内容会跳回顶部
+        const prevScroller = currentContent.querySelector('.modern-table-scroll');
+        const prevScrollTop = prevScroller ? prevScroller.scrollTop : 0;
+        const prevScrollLeft = prevScroller ? prevScroller.scrollLeft : 0;
+
         disposeTooltips();
         currentContent.innerHTML = html;
         bindTasksEvents();
@@ -1002,9 +1001,17 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         updateTaskDateTimes();
         updateProgressBars();
         restoreSelectionState();
-        
-        // 局部刷新后，重新计算列宽
-        adjustTableColumns(); 
+
+        // 还原表格内容区滚动位置
+        const nextScroller = currentContent.querySelector('.modern-table-scroll');
+        if (nextScroller && (prevScrollTop || prevScrollLeft)) {
+            nextScroller.scrollTop = prevScrollTop;
+            nextScroller.scrollLeft = prevScrollLeft;
+        }
+
+        // 局部刷新后，重新计算列宽与滚动区高度
+        adjustTableColumns();
+        syncTasksLayoutVars();
     }
 
     function scheduleApplyPendingTasksContent() {
@@ -1267,69 +1274,200 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         refreshTimer = setTimeout(() => refreshTasksData(), typeof delay === 'number' ? delay : determineRefreshDelay());
     }
 
-    // --- 批量操作逻辑 ---
+    // --- 批量操作逻辑（支持跨页选择） ---
     const selectedTaskIds = new Set();
+    const CURRENT_STATUS_FILTER = {{ current_status_filter|tojson }};
+    const CURRENT_SEARCH = {{ current_search|tojson }};
+    const SELECTION_STORAGE_KEY = 'y2a_task_selection_v1';
+    let selectAllFilteredMode = false;   // 是否处于「选中当前筛选全部」模式
+    let allFilteredIds = [];             // 该模式下的全部任务ID
+    let filterTotal = {{ pagination.total if pagination else 0 }};  // 当前筛选条件下的任务总数
+
+    function persistSelection() {
+        try {
+            sessionStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify({
+                ids: getSelectedIds(), all: selectAllFilteredMode, allIds: allFilteredIds
+            }));
+        } catch (e) { /* 忽略 */ }
+    }
+
+    function restoreSelectionFromStorage() {
+        try {
+            const raw = sessionStorage.getItem(SELECTION_STORAGE_KEY);
+            if (!raw) return;
+            const data = JSON.parse(raw) || {};
+            (data.ids || []).forEach(id => selectedTaskIds.add(id));
+            if (data.all && Array.isArray(data.allIds) && data.allIds.length) {
+                selectAllFilteredMode = true;
+                allFilteredIds = data.allIds;
+            }
+        } catch (e) { /* 忽略 */ }
+    }
+
+    // 批量操作统一使用这两个函数取「实际要操作的任务」
+    function getSelectedIds() {
+        return selectAllFilteredMode ? allFilteredIds.slice() : Array.from(selectedTaskIds);
+    }
+    function getSelectedCount() {
+        return selectAllFilteredMode ? allFilteredIds.length : selectedTaskIds.size;
+    }
+
+    function selectionChanged() {
+        updateSelectAllState();
+        persistSelection();
+    }
 
     function restoreSelectionState() {
         document.querySelectorAll('.task-checkbox').forEach(cb => {
-            if (selectedTaskIds.has(cb.value)) cb.checked = true;
-            else cb.checked = false;
+            const checked = selectAllFilteredMode || selectedTaskIds.has(cb.value);
+            cb.checked = checked;
+            const row = cb.closest('tr');
+            if (row) row.classList.toggle('row-selected', checked);
         });
         updateSelectAllState();
     }
 
     function handleCheckboxChange(cb) {
+        // 手动改动即退出「全选筛选结果」模式
+        if (selectAllFilteredMode) {
+            selectAllFilteredMode = false;
+            allFilteredIds = [];
+        }
         if (cb.checked) selectedTaskIds.add(cb.value);
         else selectedTaskIds.delete(cb.value);
-        updateSelectAllState();
+        const row = cb.closest('tr');
+        if (row) row.classList.toggle('row-selected', cb.checked);
+        selectionChanged();
     }
 
     function toggleAllTasks(source) {
+        if (selectAllFilteredMode) {
+            selectAllFilteredMode = false;
+            allFilteredIds = [];
+        }
         document.querySelectorAll('.task-checkbox').forEach(cb => {
             cb.checked = source.checked;
             if (source.checked) selectedTaskIds.add(cb.value);
             else selectedTaskIds.delete(cb.value);
+            const row = cb.closest('tr');
+            if (row) row.classList.toggle('row-selected', cb.checked);
         });
-        updateSelectAllState();
+        selectionChanged();
+    }
+
+    // 选中当前筛选条件下的全部任务（跨页）
+    async function selectAllFiltered() {
+        const btn = document.getElementById('selectAllFilteredBtn');
+        const oldHtml = btn ? btn.innerHTML : '';
+        if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 获取中...';
+        }
+        try {
+            const params = new URLSearchParams();
+            if (CURRENT_STATUS_FILTER) params.set('status', CURRENT_STATUS_FILTER);
+            if (CURRENT_SEARCH) params.set('q', CURRENT_SEARCH);
+            const res = await fetch('/tasks/filtered_ids?' + params.toString(), { headers: { 'Accept': 'application/json' } });
+            const data = await res.json();
+            if (!data.success) throw new Error(data.message || '获取失败');
+            if (!data.ids || data.ids.length === 0) {
+                await y2aAlert('当前筛选条件下没有任务', { type: 'info', title: '没有可选择的项' });
+                return;
+            }
+            allFilteredIds = data.ids;
+            filterTotal = data.total || data.ids.length;
+            selectAllFilteredMode = true;
+            selectedTaskIds.clear();
+            document.querySelectorAll('.task-checkbox').forEach(cb => {
+                cb.checked = true;
+                const row = cb.closest('tr');
+                if (row) row.classList.add('row-selected');
+            });
+            selectionChanged();
+        } catch (e) {
+            await y2aAlert('获取筛选任务失败：' + (e.message || e), { type: 'danger' });
+        } finally {
+            if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+        }
+    }
+
+    function clearSelection() {
+        selectedTaskIds.clear();
+        selectAllFilteredMode = false;
+        allFilteredIds = [];
+        document.querySelectorAll('.task-checkbox').forEach(cb => {
+            cb.checked = false;
+            const row = cb.closest('tr');
+            if (row) row.classList.remove('row-selected');
+        });
+        selectionChanged();
     }
 
     function updateSelectAllState() {
         const selectAll = document.getElementById('selectAllTasks');
         const checkboxes = document.querySelectorAll('.tasks-table tbody .task-checkbox');
-        if (!selectAll) return;
-
-        if (checkboxes.length === 0) {
-            selectAll.checked = false;
-            selectAll.indeterminate = false;
-            return;
+        if (selectAll) {
+            if (checkboxes.length === 0) {
+                selectAll.checked = false;
+                selectAll.indeterminate = false;
+            } else {
+                let checkedCount = 0;
+                checkboxes.forEach(cb => { if (cb.checked) checkedCount++; });
+                selectAll.checked = checkedCount === checkboxes.length;
+                selectAll.indeterminate = checkedCount > 0 && checkedCount < checkboxes.length;
+            }
         }
-        let checkedCount = 0;
-        checkboxes.forEach(cb => { if (cb.checked) checkedCount++; });
-        
-        selectAll.checked = checkedCount === checkboxes.length;
-        selectAll.indeterminate = checkedCount > 0 && checkedCount < checkboxes.length;
-        
+
+        const count = getSelectedCount();
         const badge = document.getElementById('selectedCount');
         if (badge) {
-            if (selectedTaskIds.size > 0) {
-                badge.textContent = selectedTaskIds.size;
+            if (count > 0) {
+                badge.textContent = count;
                 badge.classList.remove('d-none');
             } else {
                 badge.classList.add('d-none');
             }
         }
+
+        // 选择工具条
+        const bar = document.getElementById('selectionBar');
+        if (bar) {
+            if (count > 0) {
+                bar.classList.remove('d-none');
+                bar.classList.toggle('all-mode', selectAllFilteredMode);
+                const num = document.getElementById('selCountNum');
+                if (num) num.textContent = count;
+                const hint = document.getElementById('selScopeHint');
+                if (hint) {
+                    if (selectAllFilteredMode) {
+                        hint.textContent = `已覆盖当前筛选的全部结果（含其他页），批量操作将对这 ${count} 个任务生效`;
+                    } else {
+                        const total = filterTotal || parseInt((document.getElementById('filterTotalNum') || {}).textContent, 10) || 0;
+                        hint.textContent = total > count ? `本页已选 ${count} 个，共 ${total} 个匹配任务可跨页全选` : '';
+                    }
+                }
+                const allBtn = document.getElementById('selectAllFilteredBtn');
+                if (allBtn) allBtn.classList.toggle('d-none', selectAllFilteredMode);
+                const totalEl = document.getElementById('filterTotalNum');
+                if (totalEl && filterTotal) totalEl.textContent = filterTotal;
+            } else {
+                bar.classList.add('d-none');
+            }
+            // 选择条显隐会改变吸顶区高度，同步刷新表格滚动区高度
+            syncTasksLayoutVars();
+        }
     }
 
     function openBatchPartitionModal() {
-        if (selectedTaskIds.size === 0) { alert('请先勾选要设置分区的任务'); return; }
-        document.getElementById('batchPartitionCount').textContent = selectedTaskIds.size;
+        if (getSelectedCount() === 0) { y2aAlert('请先勾选要设置分区的任务'); return; }
+        document.getElementById('batchPartitionCount').textContent = getSelectedCount();
         new bootstrap.Modal(document.getElementById('batchPartitionModal')).show();
     }
 
     async function executeBatchPartition(btn) {
         const acfunPid = document.getElementById('batchAcfunPartition').value;
         const bilibiliPid = document.getElementById('batchBilibiliPartition').value;
-        if (!acfunPid && !bilibiliPid) { alert('请至少选择一个平台的分区'); return; }
+        if (!acfunPid && !bilibiliPid) { y2aAlert('请至少选择一个平台的分区'); return; }
 
         const oldHtml = btn.innerHTML;
         btn.disabled = true;
@@ -1339,17 +1477,17 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             const res = await fetch('/tasks/batch_partition', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds), acfun_pid: acfunPid, bilibili_pid: bilibiliPid })
+                body: JSON.stringify({ task_ids: getSelectedIds(), acfun_pid: acfunPid, bilibili_pid: bilibiliPid })
             });
             const data = await res.json();
-            alert(data.message);
+            y2aAlert(data.message);
             if (data.success) {
                 const modalEl = document.getElementById('batchPartitionModal');
                 const modal = bootstrap.Modal.getInstance(modalEl);
                 if (modal) modal.hide();
                 refreshTasksData(true);
             }
-        } catch (e) { alert('网络错误，设置分区失败'); } finally {
+        } catch (e) { y2aAlert('网络错误，设置分区失败'); } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
         }
@@ -1357,8 +1495,8 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
 
     // 批量定时上传
     function openBatchScheduleModal() {
-        if (selectedTaskIds.size === 0) { alert('请先勾选要定时上传的任务'); return; }
-        document.getElementById('batchScheduleCount').textContent = selectedTaskIds.size;
+        if (getSelectedCount() === 0) { y2aAlert('请先勾选要定时上传的任务'); return; }
+        document.getElementById('batchScheduleCount').textContent = getSelectedCount();
         // 默认时间：明天同一时间（每日分批通常从明天开始更符合习惯）
         const el = document.getElementById('batchScheduleTime');
         const d = new Date(Date.now() + 24 * 3600 * 1000);
@@ -1371,7 +1509,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
 
     // 根据每日数量预估最后一批日期
     function updateSchedulePreview() {
-        const total = selectedTaskIds.size;
+        const total = getSelectedCount();
         const k = parseInt(document.getElementById('batchScheduleDailyCount').value, 10) || 0;
         const previewEl = document.getElementById('batchSchedulePreview');
         if (k <= 0) {
@@ -1392,7 +1530,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
 
     async function executeBatchSchedule() {
         const time = document.getElementById('batchScheduleTime').value;
-        if (!time) { alert('请选择计划上传时间'); return; }
+        if (!time) { y2aAlert('请选择计划上传时间'); return; }
         const dailyCount = parseInt(document.getElementById('batchScheduleDailyCount').value, 10) || 0;
         const btn = document.getElementById('batchScheduleConfirmBtn');
         const oldHtml = btn.innerHTML;
@@ -1402,19 +1540,18 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             const res = await fetch('/tasks/batch_schedule_upload', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds), scheduled_at: time, daily_count: dailyCount })
+                body: JSON.stringify({ task_ids: getSelectedIds(), scheduled_at: time, daily_count: dailyCount })
             });
             const data = await res.json();
-            alert(data.message);
+            y2aAlert(data.message);
             if (data.success) {
                 const modalEl = document.getElementById('batchScheduleModal');
                 const modal = bootstrap.Modal.getInstance(modalEl);
                 if (modal) modal.hide();
-                selectedTaskIds.clear();
-                updateSelectAllState();
+                clearSelection();
                 refreshTasksData(true);
             }
-        } catch (e) { alert('网络错误，设置定时上传失败'); } finally {
+        } catch (e) { y2aAlert('网络错误，设置定时上传失败'); } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
         }
@@ -1425,10 +1562,10 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         const badge = document.getElementById('scheduledCountBadge');
         const cnt = parseInt((badge && badge.textContent) || '0', 10) || 0;
         if (cnt === 0) {
-            alert('当前没有定时上传的任务');
+            y2aAlert('当前没有定时上传的任务');
             return;
         }
-        if (!confirm(`确定取消全部 ${cnt} 个定时上传任务吗？\n\n取消后这些任务不再到点自动上传，会退回「等待人工审核」，可随时重新定时或手工审核上传。`)) return;
+        if (!(await y2aConfirm(`确定取消全部 ${cnt} 个定时上传任务吗？\n\n取消后这些任务不再到点自动上传，会退回「等待人工审核」，可随时重新定时或手工审核上传。`))) return;
 
         const btn = document.getElementById('cancelScheduleBtn');
         const oldHtml = btn.innerHTML;
@@ -1442,17 +1579,16 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 body: JSON.stringify({})
             });
             const data = await res.json();
-            alert(data.message || (data.success ? '已取消全部定时上传' : '取消失败'));
+            y2aAlert(data.message || (data.success ? '已取消全部定时上传' : '取消失败'));
             if (data.success) {
                 cancelled = true;
                 if (typeof selectedTaskIds !== 'undefined') {
-                    selectedTaskIds.clear();
-                    updateSelectAllState();
+                    clearSelection();
                 }
                 refreshTasksData(true);
             }
         } catch (e) {
-            alert('网络错误，取消定时上传失败');
+            y2aAlert('网络错误，取消定时上传失败');
         } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
@@ -1465,8 +1601,8 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
     }
 
     async function confirmBatchApprove() {
-        if (selectedTaskIds.size === 0) { alert('请先勾选要审核的任务'); return; }
-        if (!confirm(`确定要将选中的 ${selectedTaskIds.size} 个任务标记为“审核通过”吗？`)) return;
+        if (getSelectedCount() === 0) { y2aAlert('请先勾选要审核的任务'); return; }
+        if (!(await y2aConfirm(`确定要将选中的 ${getSelectedCount()} 个任务标记为“审核通过”吗？`))) return;
 
         const btn = document.getElementById('batchApproveBtn');
         const oldHtml = btn.innerHTML;
@@ -1477,20 +1613,20 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             const res = await fetch('/tasks/batch_approve', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds) })
+                body: JSON.stringify({ task_ids: getSelectedIds() })
             });
             const data = await res.json();
-            alert(data.message);
+            y2aAlert(data.message);
             if (data.success) refreshTasksData(true);
-        } catch (e) { alert('网络错误，批量审核失败'); } finally {
+        } catch (e) { y2aAlert('网络错误，批量审核失败'); } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
         }
     }
 
     async function confirmBatchUpload() {
-        if (selectedTaskIds.size === 0) { alert('请先勾选要上传的任务'); return; }
-        if (!confirm(`确定要将选中的 ${selectedTaskIds.size} 个任务加入上传队列吗？`)) return;
+        if (getSelectedCount() === 0) { y2aAlert('请先勾选要上传的任务'); return; }
+        if (!(await y2aConfirm(`确定要将选中的 ${getSelectedCount()} 个任务加入上传队列吗？`))) return;
 
         const btn = document.getElementById('batchUploadBtn');
         const oldHtml = btn.innerHTML;
@@ -1501,24 +1637,23 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             const res = await fetch('/tasks/batch_upload', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds) })
+                body: JSON.stringify({ task_ids: getSelectedIds() })
             });
             const data = await res.json();
-            alert(data.message);
+            y2aAlert(data.message);
             if (data.success) {
-                selectedTaskIds.clear();
-                updateSelectAllState();
+                clearSelection();
                 setTimeout(() => window.location.reload(), 1000);
             }
-        } catch (e) { alert('网络错误，批量上传失败'); } finally {
+        } catch (e) { y2aAlert('网络错误，批量上传失败'); } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
         }
     }
 
     async function confirmBatchUploadBilibili() {
-        if (selectedTaskIds.size === 0) { alert('请先勾选要上传的任务'); return; }
-        if (!confirm(`确定要将选中的 ${selectedTaskIds.size} 个任务的投稿目标改为 bilibili，并加入上传队列吗？\n\n注意：原上传目标会被覆盖为 bilibili。`)) return;
+        if (getSelectedCount() === 0) { y2aAlert('请先勾选要上传的任务'); return; }
+        if (!(await y2aConfirm(`确定要将选中的 ${getSelectedCount()} 个任务的投稿目标改为 bilibili，并加入上传队列吗？\n\n注意：原上传目标会被覆盖为 bilibili。`))) return;
 
         const btn = document.getElementById('batchUploadBiliBtn');
         const oldHtml = btn.innerHTML;
@@ -1529,29 +1664,28 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             const res = await fetch('/tasks/batch_upload', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_ids: Array.from(selectedTaskIds), upload_target: 'bilibili' })
+                body: JSON.stringify({ task_ids: getSelectedIds(), upload_target: 'bilibili' })
             });
             const data = await res.json();
-            alert(data.message);
+            y2aAlert(data.message);
             if (data.success) {
-                selectedTaskIds.clear();
-                updateSelectAllState();
+                clearSelection();
                 setTimeout(() => window.location.reload(), 1000);
             }
-        } catch (e) { alert('网络错误，批量上传失败'); } finally {
+        } catch (e) { y2aAlert('网络错误，批量上传失败'); } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
         }
     }
 
     function openBatchEditModal() {
-        if (selectedTaskIds.size === 0) { alert('请先勾选要修改的任务'); return; }
-        document.getElementById('batchEditCount').textContent = selectedTaskIds.size;
+        if (getSelectedCount() === 0) { y2aAlert('请先勾选要修改的任务'); return; }
+        document.getElementById('batchEditCount').textContent = getSelectedCount();
         new bootstrap.Modal(document.getElementById('batchEditModal')).show();
     }
 
     async function executeBatchEdit(btn) {
-        const ids = Array.from(selectedTaskIds);
+        const ids = getSelectedIds();
         if (ids.length === 0) return;
 
         const title = document.getElementById('batchEditTitle').value.trim();
@@ -1559,19 +1693,19 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         const tagsRaw = document.getElementById('batchEditTags').value.trim();
 
         if (!title && !description && !tagsRaw) {
-            alert('所有字段均为空，无需保存。请至少填写一个要修改的字段。');
+            y2aAlert('所有字段均为空，无需保存。请至少填写一个要修改的字段。');
             return;
         }
 
         if (tagsRaw) {
             const tags = tagsRaw.split(/[,，、]/).map(t => t.trim()).filter(Boolean);
-            if (tags.length === 0) { alert('标签格式不正确，请用逗号分隔多个标签'); return; }
-            if (tags.length > 10) { alert('标签最多 10 个，当前 ' + tags.length + ' 个'); return; }
+            if (tags.length === 0) { y2aAlert('标签格式不正确，请用逗号分隔多个标签'); return; }
+            if (tags.length > 10) { y2aAlert('标签最多 10 个，当前 ' + tags.length + ' 个'); return; }
             const tooLong = tags.find(t => t.length > 20);
-            if (tooLong) { alert('标签「' + tooLong + '」超过 20 字符，请拆分或缩短'); return; }
+            if (tooLong) { y2aAlert('标签「' + tooLong + '」超过 20 字符，请拆分或缩短'); return; }
         }
 
-        if (!confirm(`确定将修改保存到选中的 ${ids.length} 个任务吗？（留空字段不受影响）`)) return;
+        if (!(await y2aConfirm(`确定将修改保存到选中的 ${ids.length} 个任务吗？（留空字段不受影响）`))) return;
 
         const oldHtml = btn.innerHTML;
         btn.disabled = true;
@@ -1589,31 +1723,134 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 })
             });
             const data = await res.json();
-            alert(data.message);
+            y2aAlert(data.message);
             if (data.success) {
                 const modalEl = document.getElementById('batchEditModal');
                 bootstrap.Modal.getInstance(modalEl)?.hide();
                 document.getElementById('batchEditTitle').value = '';
                 document.getElementById('batchEditDescription').value = '';
                 document.getElementById('batchEditTags').value = '';
-                selectedTaskIds.clear();
-                updateSelectAllState();
+                clearSelection();
                 setTimeout(() => window.location.reload(), 1000);
             }
-        } catch (e) { alert('网络错误，批量修改失败'); } finally {
+        } catch (e) { y2aAlert('网络错误，批量修改失败'); } finally {
             btn.disabled = false;
             btn.innerHTML = oldHtml;
         }
     }
 
+    // --- 停止任务（停止选中 / 停止全部） ---
+    const STOP_DETAIL = '仅「运行中 / 排队中」的任务会被停止，已完成、失败、等待人工审核、定时上传不受影响。'
+        + '停止后任务状态变为「失败」，正在跑的下载/转码进程会被立即终止；需要继续时可稍后点任务的「开始」。';
+
+    function setButtonBusy(btn, busyText) {
+        if (!btn) return function () {};
+        const originalHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ' + busyText;
+        return function restoreButton() {
+            btn.disabled = false;
+            btn.innerHTML = originalHtml;
+        };
+    }
+
+    async function requestBatchStop(payload) {
+        const res = await fetch('/tasks/batch_stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        let data = {};
+        try { data = await res.json(); } catch (e) { /* 非 JSON 响应 */ }
+        return { ok: res.ok, data: data };
+    }
+
+    async function confirmBatchStop() {
+        const count = getSelectedCount();
+        if (count === 0) {
+            await y2aAlert('请先勾选要停止的任务', { type: 'info', title: '还没有选中任务' });
+            return;
+        }
+        const ok = await y2aConfirm('确定要停止选中的 ' + count + ' 个任务吗？', {
+            title: '停止选中任务',
+            type: 'danger',
+            confirmText: '立即停止',
+            detail: STOP_DETAIL
+        });
+        if (!ok) return;
+
+        const restoreButton = setButtonBusy(document.getElementById('batchStopBtn'), '停止中...');
+        try {
+            const { ok: httpOk, data } = await requestBatchStop({ task_ids: getSelectedIds() });
+            if (!httpOk || !data.success) {
+                await y2aAlert(data.message || '停止失败，请稍后重试', { type: 'warning', title: '未能停止' });
+                return;
+            }
+            clearSelection();
+            await y2aAlert(data.message, { type: 'success', title: '已停止' });
+            window.location.reload();
+        } catch (e) {
+            await y2aAlert('停止任务时出错：' + (e.message || e), { type: 'danger', title: '出错了' });
+        } finally {
+            restoreButton();
+        }
+    }
+
+    async function confirmStopAllTasks() {
+        const btn = document.getElementById('stopAllTasksBtn');
+
+        // 先问一下有多少个任务会被停止，让确认文案有具体数字
+        let previewCount = null;
+        let restoreProbe = setButtonBusy(btn, '检查中...');
+        try {
+            const res = await fetch('/tasks/stoppable_count', { headers: { 'Accept': 'application/json' } });
+            const data = await res.json();
+            if (data && data.success) previewCount = data.count;
+        } catch (e) {
+            /* 预览失败不影响后续停止，交给后端判断 */
+        } finally {
+            restoreProbe();
+        }
+
+        if (previewCount === 0) {
+            await y2aAlert('当前没有正在运行或排队中的任务，无需停止', { type: 'info', title: '无需停止' });
+            return;
+        }
+
+        const countText = (previewCount === null) ? '全部' : (previewCount + ' 个');
+        const ok = await y2aConfirm('确定要停止' + countText + '正在运行/排队中的任务吗？', {
+            title: '停止全部任务',
+            type: 'danger',
+            confirmText: '全部停止',
+            detail: '作用范围是全库所有正在运行/排队中的任务（不受当前筛选和分页影响）。' + STOP_DETAIL
+        });
+        if (!ok) return;
+
+        const restoreButton = setButtonBusy(btn, '停止中...');
+        try {
+            const { ok: httpOk, data } = await requestBatchStop({ scope: 'all' });
+            if (!httpOk || !data.success) {
+                await y2aAlert(data.message || '停止失败，请稍后重试', { type: 'warning', title: '未能停止' });
+                return;
+            }
+            clearSelection();
+            await y2aAlert(data.message, { type: 'success', title: '已全部停止' });
+            window.location.reload();
+        } catch (e) {
+            await y2aAlert('停止任务时出错：' + (e.message || e), { type: 'danger', title: '出错了' });
+        } finally {
+            restoreButton();
+        }
+    }
+
     function confirmBatchDelete() {
-        if (selectedTaskIds.size === 0) { alert('请先勾选要删除的任务'); return; }
-        document.getElementById('batchDeleteCount').textContent = selectedTaskIds.size;
+        if (getSelectedCount() === 0) { y2aAlert('请先勾选要删除的任务'); return; }
+        document.getElementById('batchDeleteCount').textContent = getSelectedCount();
         new bootstrap.Modal(document.getElementById('batchDeleteModal')).show();
     }
 
     async function executeBatchDelete() {
-        const ids = Array.from(selectedTaskIds);
+        const ids = getSelectedIds();
         if (ids.length === 0) return;
         
         const deleteFiles = document.getElementById('batchDeleteFiles').checked;
@@ -1634,6 +1871,10 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
 
     // --- 初始化 ---
     document.addEventListener('DOMContentLoaded', function() {
+        // 恢复上一页/上次的勾选状态（跨页选择保留）
+        restoreSelectionFromStorage();
+        updateSelectAllState();
+
         // 导入Excel：提交时显示导入中状态，防止重复提交
         var importForm = document.querySelector('#importExcelModal form');
         if (importForm) {
@@ -1647,10 +1888,14 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         }
 
         adjustTableColumns();
+        syncTasksLayoutVars();
         let resizeTimer;
         window.addEventListener('resize', () => {
             clearTimeout(resizeTimer);
-            resizeTimer = setTimeout(adjustTableColumns, 150);
+            resizeTimer = setTimeout(() => {
+                adjustTableColumns();
+                syncTasksLayoutVars();
+            }, 150);
         });
 
         const root = document.querySelector('#tasksContent');

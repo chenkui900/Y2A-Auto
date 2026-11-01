@@ -489,12 +489,12 @@
                         // 刷新页面以显示新封面
                         location.reload();
                     } else {
-                        alert('更新封面处理模式失败: ' + data.message);
+                        y2aAlert('更新封面处理模式失败: ' + data.message);
                     }
                 })
                 .catch(error => {
                     console.error('更新封面处理模式出错:', error);
-                    alert('更新失败: ' + error);
+                    y2aAlert('更新失败: ' + error);
                 });
             });
         }

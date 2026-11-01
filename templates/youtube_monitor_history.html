@@ -338,8 +338,8 @@ function bindMonitorRunForms() {
     });
 }
 
-function addToTasks(videoId, configId) {
-    if (!confirm('确定要将此视频添加到任务队列吗？')) {
+async function addToTasks(videoId, configId) {
+    if (!(await y2aConfirm('确定要将此视频添加到任务队列吗？', { title: '添加到任务队列', type: 'primary', confirmText: '添加' }))) {
         return;
     }
     
