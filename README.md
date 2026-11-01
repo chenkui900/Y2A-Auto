@@ -123,7 +123,7 @@
 32. 新建任务和导入excel合并；
 33. 增加上传下载限速；
 34. 增加限速可以选择开关时间；
-35. 取消运维与安全-资源控制-任务并发，修改到从网络设置里设置；
+35. 取消运维与安全-资源控制-任务并发，修改到从网络与下载设置里设置；
 
 
 
@@ -197,11 +197,8 @@ python app.py
 - `BILIBILI_COOKIES_PATH`：bilibili Cookie 路径
 - `YOUTUBE_PROXY_ENABLED` / `YOUTUBE_PROXY_URL`：YouTube 下载代理
 - `YOUTUBE_API_PROXY_ENABLED` / `YOUTUBE_API_PROXY_URL`：YouTube 监控 API 独立代理，不继承下载代理
-- `YOUTUBE_DOWNLOAD_THREADS`：下载并发数量，同时代表**同时下载的任务数**（1–16，默认 `4`）。单任务固定 1 条连接（`--concurrent-fragments 1`）
-- `UPLOAD_THREADS`：上传并发数量，同时代表**同时上传的任务数**（1–8，默认 `1`）
-- `DOWNLOAD_RATE_LIMIT` / `UPLOAD_RATE_LIMIT`：上传/下载总限速，写法如 `200K` / `1.5M`（1K = 1024 字节），留空不限速。设置页提供「数值 + 单位（K/M）」两个控件；下载限速按**下载并发数量**一级摊分到每个任务（每个任务固定 1 条连接），多任务并发时总速度也不会超过设定值；想让单个下载吃满限速，把「下载并发数量」调成 1 即可
-- `RATE_LIMIT_ENABLED` / `RATE_LIMIT_TIME_ENABLED` / `RATE_LIMIT_START_TIME` / `RATE_LIMIT_END_TIME`：限速总开关与生效时间段（支持跨零点）
-- `YOUTUBE_THROTTLED_RATE`：旧版下载限速键，仅作兼容回退
+- `YOUTUBE_DOWNLOAD_THREADS`：下载线程数
+- `YOUTUBE_THROTTLED_RATE`：下载速度限制
 - `YOUTUBE_API_KEY`：YouTube Data API v3 密钥，监控功能需要
 - `FFMPEG_LOCATION`：自定义 FFmpeg 路径
 - `FFMPEG_AUTO_DOWNLOAD`：Windows 缺失时自动下载 FFmpeg，默认 `true`
@@ -284,7 +281,8 @@ AI 文本功能同时兼容 OpenAI Chat Completions 与 Responses API。`OPENAI_
 - `VIDEO_COLOR_METADATA_MODE`：`auto`（透传源流色彩信息）/ `bt709`（强制）/ `off`（不写入），默认 `auto`。不写入时播放器会按默认色域解释，可能偏色
 - `VIDEO_X264_TUNE`：软编码 `-tune` 取值（如 `film` / `animation`），留空则不传。取值按 `VIDEO_CPU_CODEC` 各自的白名单校验：`film` 与 `stillimage` 只对 x264 合法，切到 x265 时会被忽略并写入任务日志
 - `VIDEO_CUSTOM_PARAMS_ENABLED` / `VIDEO_CUSTOM_PARAMS`：自定义 FFmpeg 参数（启用后完全覆盖内置编码参数与色彩参数）。若自定义参数里没有写 `-c:v`，系统会按 `VIDEO_CPU_CODEC` 补上 `-c:v libx264` / `-c:v libx265` —— 否则 ffmpeg 会取容器默认编码器（mp4 为 libx264），`VIDEO_CPU_CODEC` 被静默忽略、色彩 VUI 补写也一并失效；若你自己写了 `-c:v`，则以你指定的编码器为准（识别为 libx264 / libx265 时才补写色彩 VUI，并在任务日志中说明）
-- `MAX_CONCURRENT_TASKS` / `MAX_CONCURRENT_UPLOADS`：**已废弃**，不再被任何调度逻辑读取。并发上限已改为跟随「下载并发数量 / 上传并发数量」（见上面的 `YOUTUBE_DOWNLOAD_THREADS` / `UPLOAD_THREADS`），设置 → 运维与安全 → 资源控制 里的「任务并发」卡片已移除；旧配置里的这两个键保留但无效果
+- `MAX_CONCURRENT_TASKS`：最大并发任务数，默认 `2`
+- `MAX_CONCURRENT_UPLOADS`：最大并发上传数，默认 `1`。指**同时进行的上传任务数**（含前置准备到投稿完成的全过程），由设置 → 运维与安全 → 资源控制 → 最大并发上传数控制；修改后立即生效，超出的任务排队等待，不再按任务各开一个线程
 - `LOG_CLEANUP_ENABLED` / `LOG_CLEANUP_HOURS` / `LOG_CLEANUP_INTERVAL`
 - `DOWNLOAD_CLEANUP_ENABLED` / `DOWNLOAD_CLEANUP_HOURS` / `DOWNLOAD_CLEANUP_INTERVAL`
 - `DELETE_DOWNLOAD_FILES_AFTER_UPLOAD`：所有目标平台上传成功后立即删除该任务的下载文件（默认关闭）
@@ -350,10 +348,8 @@ AI 文本功能同时兼容 OpenAI Chat Completions 与 Responses API。`OPENAI_
   "VIDEO_CPU_PRESET": "medium",
   "VIDEO_CPU_PRESET_HD": "veryfast",
   "FFMPEG_AUTO_DOWNLOAD": true,
-  "YOUTUBE_DOWNLOAD_THREADS": 4,
-  "UPLOAD_THREADS": 1,
-  "DOWNLOAD_RATE_LIMIT": "",
-  "UPLOAD_RATE_LIMIT": ""
+  "MAX_CONCURRENT_TASKS": 2,
+  "MAX_CONCURRENT_UPLOADS": 1
 }
 ```
 
