@@ -33,18 +33,19 @@
         <span class="badge bg-{{ task_status_color(task.status) }} task-status-badge">
             {{ task_status_display(task.status) }}
         </span>
-        {% if task.upload_progress %}
-        <div class="progress progress-thin mt-1 mx-auto" style="width: 80%;">
+        {% set speed_text = task.progress_speed|format_speed %}
+        {% set speed_arrow = '↓' if task.status == 'downloading' else '↑' %}
+        <div class="progress progress-thin mt-1 mx-auto{% if not task.upload_progress %} d-none{% endif %}" style="width: 80%;">
             <div class="progress-bar progress-bar-striped progress-bar-animated" 
-                 data-pct="{{ task.upload_progress|replace('%','') }}"></div>
+                 data-pct="{{ (task.upload_progress or '')|replace('%','') }}"></div>
         </div>
-        <div class="small text-muted mt-1" data-task-progress>{{ task.upload_progress }}</div>
-        {% else %}
-        <div class="small text-muted mt-1 d-none" data-task-progress></div>
-        {% endif %}
+        <div class="d-flex align-items-center justify-content-center flex-wrap gap-1 mt-1{% if not task.upload_progress %} d-none{% endif %}" data-task-progress-wrap>
+            <span class="small text-muted" data-task-progress>{{ task.upload_progress or '' }}</span>
+            <span class="task-speed{% if not speed_text %} d-none{% endif %}" data-task-speed>{{ speed_arrow }} {{ speed_text }}</span>
+        </div>
     </td>
 
-    <!-- 4. 更新时间 (由 JS 渲染为 MM-DD HH:mm) -->
+    <!-- 4. 更新时间 (由 JS 渲染为 HH:mm，完整日期在 title 里) -->
     <td class="col-time text-center">
         <span class="task-datetime text-muted" style="font-size: 0.85rem; white-space: nowrap;" data-datetime="{{ task.updated_at }}">
             {{ task.updated_at }}
@@ -101,7 +102,7 @@
     </td>
 
     <!-- 8. 上传结果 -->
-    <td class="col-result">
+    <td class="col-result text-center">
         <div class="upload-result-container">
             {% if task.acfun_upload_response %}
                 {% set acfun_res = parse_json(task.acfun_upload_response) %}
@@ -119,21 +120,32 @@
 
     <!-- 9. 操作 -->
     <td class="col-actions">
-        <div class="d-flex justify-content-end gap-1 flex-wrap">
+        <div class="d-flex justify-content-center gap-1 flex-wrap">
             <a href="{{ url_for('edit_task', task_id=task.id) }}" class="btn btn-sm btn-outline-primary" title="编辑/审核">
                 <i class="bi bi-pencil-square"></i>
             </a>
-            {% if task.status == 'failed' or task.status == 'pending' %}
+            {% if task.status == 'failed' or task.status == 'pending' or task.status == 'paused' %}
                 <form method="post" action="{{ url_for('start_task_route', task_id=task.id) }}" class="d-inline">
-                    <button type="submit" class="btn btn-sm btn-outline-success" title="开始处理"><i class="bi bi-play-fill"></i></button>
+                    <button type="submit" class="btn btn-sm btn-outline-success" title="{{ '继续处理' if task.status == 'paused' else '开始处理' }}"><i class="bi bi-play-fill"></i></button>
                 </form>
             {% endif %}
             {% if task.status == 'ready_for_upload' %}
-                <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="d-inline">
-                    <button type="submit" class="btn btn-sm btn-outline-primary" title="立即上传"><i class="bi bi-cloud-arrow-up"></i></button>
-                </form>
+                {% if task.preempted %}
+                    <form method="post" action="{{ url_for('start_task_route', task_id=task.id) }}" class="d-inline">
+                        <button type="submit" class="btn btn-sm btn-outline-success" title="继续处理（排到并发队列最前面）"><i class="bi bi-play-fill"></i></button>
+                    </form>
+                {% else %}
+                    <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="d-inline">
+                        <button type="submit" class="btn btn-sm btn-outline-primary" title="立即上传"><i class="bi bi-cloud-arrow-up"></i></button>
+                    </form>
+                {% endif %}
             {% endif %}
             {% if task.status in ['downloading', 'translating', 'tagging', 'partitioning', 'moderating', 'uploading', 'asr_transcribing', 'translating_subtitle', 'encoding_video', 'fetching_info'] %}
+                <form method="post" action="{{ url_for('pause_task_route', task_id=task.id) }}" class="d-inline">
+                    <button type="submit" class="btn btn-sm btn-outline-secondary" title="暂停任务（保留进度，之后可继续）">
+                        <i class="bi bi-pause-fill"></i>
+                    </button>
+                </form>
                 <button type="button" class="btn btn-sm btn-outline-warning" title="停止任务" 
                         data-task-id="{{ task.id }}" data-task-title="{{ task.video_title_translated or task.video_title_original }}"
                         onclick="confirmStopTask(this.dataset.taskId, this.dataset.taskTitle)">

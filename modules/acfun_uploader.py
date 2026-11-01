@@ -690,6 +690,13 @@ class AcfunUploader:
         self.log(f"开始上传 {file_name}，共 {fragment_count} 个分块")
         
         # 上传视频文件
+        upload_speed = None
+        if hasattr(self, 'task_id') and self.task_id:
+            try:
+                from modules.task_manager import SpeedEstimator
+                upload_speed = SpeedEstimator(total_bytes=file_size)
+            except Exception:
+                upload_speed = None
         with open(file_path, "rb") as f:
             for fragment_id in range(fragment_count):
                 if cancel_event is not None and cancel_event.is_set():
@@ -713,7 +720,8 @@ class AcfunUploader:
                 # 静默更新任务进度到数据库（如果有task_id），用于网页显示
                 if hasattr(self, 'task_id') and self.task_id:
                     from modules.task_manager import update_task
-                    update_task(self.task_id, upload_progress=f"{progress:.1f}%", silent=True)
+                    speed_bps = upload_speed.record_percent(progress) if upload_speed else None
+                    update_task(self.task_id, upload_progress=f"{progress:.1f}%", progress_speed=speed_bps, silent=True)
 
         
         # 完成上传

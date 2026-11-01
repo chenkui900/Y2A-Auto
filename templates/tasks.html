@@ -134,18 +134,18 @@
                 </colgroup>
                 <thead class="table-light">
                     <tr>
-                        <th class="col-check">
+                        <th class="col-check text-center">
                             <input type="checkbox" class="form-check-input" id="selectAllTasks" onclick="toggleAllTasks(this)">
                         </th>
-                        <th class="col-title">视频标题</th>
+                        <th class="col-title text-center">视频标题</th>
                         <th class="col-status text-center">状态</th>
                         <th class="col-time text-center">更新时间</th>
                         <th class="col-platform text-center">平台</th>
                         <th class="col-partition text-center">分区</th>
-                        <th class="col-tags">标签</th>
-                        <th class="col-result">上传结果</th>
-                        <th class="col-actions text-end">操作</th>
-                        <th class="col-failreason">失败原因</th>
+                        <th class="col-tags text-center">标签</th>
+                        <th class="col-result text-center">上传结果</th>
+                        <th class="col-actions text-center">操作</th>
+                        <th class="col-failreason text-center">失败原因</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -941,16 +941,48 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         return replaced;
     }
 
+    // bytes/s -> "3.4 MB/s"（与后端 format_speed 保持一致）
+    function formatSpeed(bytesPerSec) {
+        const speed = Number(bytesPerSec);
+        if (!isFinite(speed) || speed <= 0) return '';
+        const units = [[1024 ** 3, 'GB/s'], [1024 ** 2, 'MB/s'], [1024, 'KB/s']];
+        for (const [factor, unit] of units) {
+            if (speed >= factor) return `${(speed / factor).toFixed(1)} ${unit}`;
+        }
+        return `${Math.round(speed)} B/s`;
+    }
+
     function applyTaskProgressUpdate(taskId, payload) {
         if (!taskId || !payload) return;
         const escapedTaskId = escapeTaskIdForSelector(taskId);
         const progressText = typeof payload.upload_progress === 'string' ? payload.upload_progress : '';
         const dateTimeValue = payload.updated_at;
+        const speedText = formatSpeed(payload.progress_speed);
+        const speedArrow = payload.status === 'downloading' ? '↓' : '↑';
 
         document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-progress]`).forEach(el => {
             el.textContent = progressText;
-            el.classList.toggle('d-none', !progressText.trim());
+            const wrap = el.closest('[data-task-progress-wrap]');
+            if (wrap) wrap.classList.toggle('d-none', !progressText.trim());
+            else el.classList.toggle('d-none', !progressText.trim());
         });
+
+        // 速度：下载阶段显示 ↓，其余（上传/转码为上传阶段）显示 ↑；无速度时整块隐藏
+        document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-speed]`).forEach(el => {
+            el.textContent = speedText ? `${speedArrow} ${speedText}` : '';
+            el.classList.toggle('d-none', !speedText);
+        });
+
+        // 进度条宽度也随 SSE 实时推进，不用等整行 fragment 刷新
+        const pctMatch = progressText.match(/(\d+(?:\.\d+)?)\s*%/);
+        if (pctMatch) {
+            const pct = Math.max(0, Math.min(100, parseFloat(pctMatch[1])));
+            document.querySelectorAll(`[data-task-id="${escapedTaskId}"] .progress-bar[data-pct]`).forEach(el => {
+                el.setAttribute('data-pct', String(pct));
+                el.style.width = pct + '%';
+                el.setAttribute('aria-valuenow', String(pct));
+            });
+        }
 
         if (dateTimeValue) {
             document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-datetime]`).forEach(el => {
@@ -1219,16 +1251,15 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         queryAllWithin(root, '[data-bs-toggle="tooltip"]').forEach(el => { if (!bootstrap.Tooltip.getInstance(el)) new bootstrap.Tooltip(el); });
     }
 
+    // 更新时间只显示「时:分」；完整日期放在 title 里，鼠标悬停可看
     function formatLocalDateTime(str) {
         try {
             const normalizedStr = String(str).replace(/-/g, '/');
             const date = new Date(normalizedStr);
             if (isNaN(date.getTime())) return str;
-            const month = String(date.getMonth() + 1).padStart(2, '0');
-            const day = String(date.getDate()).padStart(2, '0');
             const hours = String(date.getHours()).padStart(2, '0');
             const minutes = String(date.getMinutes()).padStart(2, '0');
-            return `${month}-${day} ${hours}:${minutes}`;
+            return `${hours}:${minutes}`;
         } catch { return str; }
     }
 

@@ -276,6 +276,53 @@ def clear_task_cancel(task_id, clear_flag=True):
     with _TASK_CANCEL_LOCK:
         _TASK_CANCEL_FLAGS.pop(task_id, None)
 
+# 「暂停」标记：与取消标记共用一把锁。任务因取消而收尾时，若存在暂停标记
+# 则落「已暂停」（可继续），否则才落「失败」。
+_TASK_PAUSE_FLAGS = set()
+
+def request_task_pause(task_id):
+    if not task_id:
+        return False
+    with _TASK_CANCEL_LOCK:
+        _TASK_PAUSE_FLAGS.add(task_id)
+    return True
+
+def is_task_pause_requested(task_id):
+    if not task_id:
+        return False
+    with _TASK_CANCEL_LOCK:
+        return task_id in _TASK_PAUSE_FLAGS
+
+def clear_task_pause(task_id):
+    if not task_id:
+        return
+    with _TASK_CANCEL_LOCK:
+        _TASK_PAUSE_FLAGS.discard(task_id)
+
+# 「并发让位」标记：并发上限被调小后，超出上限的任务会被中断。
+# 与取消标记共用一把锁；任务收尾时若存在该标记，落「准备上传」并插队到队列最前面，
+# 而不是落「失败」——用户只是把并发调小了，任务本身没出错。
+_TASK_PREEMPT_FLAGS = set()
+
+def request_task_preempt(task_id):
+    if not task_id:
+        return False
+    with _TASK_CANCEL_LOCK:
+        _TASK_PREEMPT_FLAGS.add(task_id)
+    return True
+
+def is_task_preempt_requested(task_id):
+    if not task_id:
+        return False
+    with _TASK_CANCEL_LOCK:
+        return task_id in _TASK_PREEMPT_FLAGS
+
+def clear_task_preempt(task_id):
+    if not task_id:
+        return
+    with _TASK_CANCEL_LOCK:
+        _TASK_PREEMPT_FLAGS.discard(task_id)
+
 def _mark_task_active(task_id: str) -> bool:
     if not task_id:
         return False
@@ -333,7 +380,8 @@ TASK_STATES = {
     'READY_FOR_UPLOAD': 'ready_for_upload',
     'UPLOADING': 'uploading',
     'COMPLETED': 'completed',
-    'FAILED': 'failed'
+    'FAILED': 'failed',
+    'PAUSED': 'paused'
 }
 
 PROCESSING_STATES = [
@@ -876,6 +924,9 @@ def init_db():
         error_category TEXT,
         pipeline_checkpoint TEXT,
         upload_progress TEXT,
+        progress_speed REAL,
+        preempted INTEGER DEFAULT 0,
+        queue_priority INTEGER DEFAULT 0,
         acfun_upload_response TEXT,
         bilibili_upload_response TEXT,
         asr_warning_message TEXT,
@@ -908,6 +959,21 @@ def init_db():
 
         if 'upload_progress' not in columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN upload_progress TEXT")
+            conn.commit()
+        if 'progress_speed' not in columns:
+            # 实时速率（bytes/s）：仅下载/上传阶段写入，用于任务列表展示 ↓/↑ 速度
+            cursor.execute("ALTER TABLE tasks ADD COLUMN progress_speed REAL")
+            logger.info("数据库升级：添加progress_speed字段")
+            conn.commit()
+        if 'preempted' not in columns:
+            # 并发让位标记：并发上限下调时被中断的任务，恢复时要先跑完处理流程再上传
+            cursor.execute("ALTER TABLE tasks ADD COLUMN preempted INTEGER DEFAULT 0")
+            logger.info("数据库升级：添加preempted字段（并发超限让位，稍后继续）")
+            conn.commit()
+        if 'queue_priority' not in columns:
+            # 队列优先级：让位的任务插队到「准备上传」队列最前面
+            cursor.execute("ALTER TABLE tasks ADD COLUMN queue_priority INTEGER DEFAULT 0")
+            logger.info("数据库升级：添加queue_priority字段（队列插队排序）")
             conn.commit()
         if 'subtitle_qc_failed' not in columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN subtitle_qc_failed INTEGER DEFAULT 0")
@@ -1070,15 +1136,142 @@ def add_task(youtube_url, upload_target=None):
         emit_notification_event(NotificationEvent(event_type=EVENT_TASK_ADDED, payload={'task_id': task_id, 'youtube_url': youtube_url, 'upload_target': normalized_target}))
     return task_id
 
+_SPEED_UNIT_FACTORS = {
+    'b/s': 1.0,
+    'kb/s': 1000.0,
+    'kib/s': 1024.0,
+    'mb/s': 1000.0 ** 2,
+    'mib/s': 1024.0 ** 2,
+    'gb/s': 1000.0 ** 3,
+    'gib/s': 1024.0 ** 3,
+}
+
+
+def parse_speed_text(value):
+    """把 yt-dlp 输出的速度文本（如 "1.23MiB/s"）转换成 bytes/s。
+
+    解析不出来（"---"、"N/A"、空值等）时返回 None，调用方据此清空速度显示。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and number > 0 else None
+    text = str(value).strip().replace(' ', '')
+    if not text or text.lower() in {'---', '--', '-', 'n/a', 'none', 'unknown', '0b/s'}:
+        return None
+    match = re.match(r'^([0-9]+(?:\.[0-9]+)?)([KMGTP]?i?B)/s$', text, re.IGNORECASE)
+    if not match:
+        return None
+    factor = _SPEED_UNIT_FACTORS.get((match.group(2) or 'B').lower() + '/s')
+    if not factor:
+        return None
+    speed = float(match.group(1)) * factor
+    return speed if speed > 0 else None
+
+
+def format_speed(value):
+    """bytes/s -> 人类可读文本（"3.4 MB/s"）；无效值返回空串。"""
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return ''
+    if not math.isfinite(speed) or speed <= 0:
+        return ''
+    for factor, unit in ((1024.0 ** 3, 'GB/s'), (1024.0 ** 2, 'MB/s'), (1024.0, 'KB/s')):
+        if speed >= factor:
+            return f'{speed / factor:.1f} {unit}'
+    return f'{speed:.0f} B/s'
+
+
+class SpeedEstimator:
+    """按进度增量估算瞬时传输速度（bytes/s），带指数平滑，避免数字来回跳。
+
+    下载阶段 yt-dlp 会直接给出速度，不需要它；上传阶段（B站/AcFun 分块）只有
+    百分比或分块字节数，用它按「增量 / 耗时」算出速度。
+    """
+
+    def __init__(self, total_bytes=None, smooth=0.35, min_interval=0.5):
+        self.total_bytes = float(total_bytes) if total_bytes else None
+        self.smooth = smooth
+        self.min_interval = min_interval
+        self._last_time = None
+        self._last_bytes = 0.0
+        self._speed = None
+
+    @property
+    def speed(self):
+        return self._speed
+
+    def record_bytes(self, transferred_bytes, now=None):
+        now = time.time() if now is None else now
+        try:
+            transferred = float(transferred_bytes)
+        except (TypeError, ValueError):
+            return self._speed
+        if self._last_time is None:
+            self._last_time = now
+            self._last_bytes = transferred
+            return None
+        elapsed = now - self._last_time
+        delta = transferred - self._last_bytes
+        # 采样间隔太短会让速度抖动，直接沿用上一次的值
+        if elapsed < self.min_interval:
+            return self._speed
+        if delta < 0:  # 进度回退（换阶段/换文件）时重新计数
+            self._last_time = now
+            self._last_bytes = transferred
+            return self._speed
+        self._last_time = now
+        self._last_bytes = transferred
+        instant = delta / elapsed
+        if self._speed is None or self._speed <= 0:
+            self._speed = instant
+        else:
+            self._speed = self._speed * (1 - self.smooth) + instant * self.smooth
+        return self._speed
+
+    def record_percent(self, percent, total_bytes=None, now=None):
+        total = self.total_bytes if total_bytes is None else float(total_bytes or 0)
+        if not total:
+            return self._speed
+        try:
+            percent_value = float(percent)
+        except (TypeError, ValueError):
+            return self._speed
+        return self.record_bytes(total * max(0.0, percent_value) / 100.0, now=now)
+
+
 def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
     if not kwargs:
         return False
+    # 并发让位中的任务：各阶段在中断瞬间可能先把状态写成「失败」或继续写成
+    # 「下载中/转码中」，这里统一纠正为「准备上传」，避免让位的任务被重新
+    # 计入运行中、或让位被误报成失败。
+    _preempt_target_status = kwargs.get('status')
+    if is_task_preempt_requested(task_id) and (
+        _preempt_target_status == TASK_STATES['FAILED']
+        or _preempt_target_status in PREEMPTABLE_STATES
+    ):
+        kwargs['status'] = TASK_STATES['READY_FOR_UPLOAD']
+        kwargs['error_message'] = None
+        kwargs['preempted'] = 1
+        kwargs['queue_priority'] = 1
+        kwargs.setdefault('upload_progress', QUEUE_PREEMPT_MARK)
     status_changed = 'status' in kwargs
     new_status = kwargs.get('status') if status_changed else None
     kwargs['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
     if kwargs.get('status') == TASK_STATES['COMPLETED']:
         kwargs['completed_at'] = kwargs['updated_at']
+
+    # 进度更新默认不带速度：只有下载/上传阶段会显式传 progress_speed，
+    # 其余阶段（转码、翻译等）自动清空，避免列表里残留上一个阶段的速度。
+    if 'upload_progress' in kwargs and 'progress_speed' not in kwargs:
+        kwargs['progress_speed'] = None
 
     ALLOWED_COLUMNS = {
         'youtube_url': 'youtube_url = ?',
@@ -1113,6 +1306,10 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
         'error_category': 'error_category = ?',
         'pipeline_checkpoint': 'pipeline_checkpoint = ?',
         'upload_progress': 'upload_progress = ?',
+        'preempted': 'preempted = ?',
+        'queue_priority': 'queue_priority = ?',
+        'queue_position': 'queue_position = ?',
+        'progress_speed': 'progress_speed = ?',
         'scheduled_upload_at': 'scheduled_upload_at = ?',
         'acfun_upload_response': 'acfun_upload_response = ?',
         'bilibili_upload_response': 'bilibili_upload_response = ?',
@@ -1139,7 +1336,7 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
                 event_type = 'task_updated'
                 event_payload = {'task_id': task_id, 'status': filtered_kwargs.get('status')}
                 changed_fields = {key for key in filtered_kwargs.keys() if key != 'updated_at'}
-                if changed_fields == {'upload_progress'}:
+                if changed_fields and changed_fields <= {'upload_progress', 'progress_speed'}:
                     current_status = filtered_kwargs.get('status')
                     if current_status is None:
                         try:
@@ -1147,7 +1344,13 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
                             current_status = row['status'] if row else None
                         except Exception: current_status = None
                     event_type = 'task_progress'
-                    event_payload = {'task_id': task_id, 'status': current_status, 'upload_progress': filtered_kwargs.get('upload_progress'), 'updated_at': filtered_kwargs.get('updated_at')}
+                    event_payload = {
+                        'task_id': task_id,
+                        'status': current_status,
+                        'upload_progress': filtered_kwargs.get('upload_progress'),
+                        'progress_speed': filtered_kwargs.get('progress_speed'),
+                        'updated_at': filtered_kwargs.get('updated_at'),
+                    }
                 publish_task_event(event_type, event_payload)
                 if (not suppress_notification) and status_changed and previous_status != filtered_kwargs.get('status') and filtered_kwargs.get('status') in (TASK_STATES['COMPLETED'], TASK_STATES['FAILED']):
                     merged_task = dict(existing_task or {})
@@ -1172,6 +1375,172 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
                 return False
     finally:
         conn.close()
+
+def finalize_cancelled_task(task_id, message="任务已取消", silent=False):
+    """任务被中断后的统一收尾。
+
+    用户点「暂停」时进程同样走取消流程，靠暂停标记区分最终状态：
+    有暂停标记 → 已暂停（保留断点、可继续）；
+    有并发让位标记 → 准备上传（插队到队列最前面，等有配额了先跑它）；
+    否则 → 失败。
+    """
+    if is_task_preempt_requested(task_id):
+        clear_task_preempt(task_id)
+        update_task(
+            task_id,
+            status=TASK_STATES['READY_FOR_UPLOAD'],
+            error_message=None,
+            upload_progress=QUEUE_PREEMPT_MARK,
+            preempted=1,
+            queue_priority=1,
+            suppress_notification=True,
+            silent=silent,
+        )
+        logger.info(f"任务 {task_id} 因并发上限下调让位，已转入上传队列最前面")
+        return TASK_STATES['READY_FOR_UPLOAD']
+    if is_task_pause_requested(task_id):
+        clear_task_pause(task_id)
+        update_task(
+            task_id,
+            status=TASK_STATES['PAUSED'],
+            error_message=None,
+            upload_progress=None,
+            suppress_notification=True,
+            silent=silent,
+        )
+        logger.info(f"任务 {task_id} 已暂停（等待用户继续）")
+        return TASK_STATES['PAUSED']
+    update_task(
+        task_id,
+        status=TASK_STATES['FAILED'],
+        error_message=message,
+        upload_progress=None,
+        silent=silent,
+    )
+    return TASK_STATES['FAILED']
+
+
+# 可以「让位」的状态：处理流程正在跑，且中断后能从断点继续。
+# 不含 uploading（上传走独立配额，中断代价大）与 ready_for_upload（本来就在队列里）。
+PREEMPTABLE_STATES = [
+    'fetching_info', 'info_fetched', TASK_STATES['TRANSLATING'], TASK_STATES['TAGGING'],
+    TASK_STATES['PARTITIONING'], TASK_STATES['MODERATING'], TASK_STATES['DOWNLOADING'],
+    TASK_STATES['DOWNLOADED'], TASK_STATES['ASR_TRANSCRIBING'],
+    TASK_STATES['TRANSLATING_SUBTITLE'], TASK_STATES['ENCODING_VIDEO'],
+]
+
+
+def preempt_excess_running_tasks(limit, reason='并发上限下调', only_active=False):
+    """把超出并发上限的正在处理的任务转入「准备上传」队列最前面。
+
+    并发上限调小时不能只改数字：已经在跑的任务比新上限多，就得有人让出配额。
+    这里保留最早创建（跑得最久、通常离完成最近）的任务继续处理，让后进来的
+    先让位——它们已经写了断点，等有配额时从队列最前面接着跑。
+
+    only_active=True 时只统计真正还有工作线程在跑的任务，用于「实际运行数超过
+    上限」的自愈场景，避免把数据库里遗留的僵尸状态误判成正在运行。
+    """
+    try:
+        limit = max(1, int(limit))
+    except (TypeError, ValueError):
+        return []
+    active_ids = _get_active_task_ids() if only_active else None
+    scan_states = list(PREEMPTABLE_STATES)
+    if only_active:
+        # 刚被调度、已经占住配额但还没写「下载中」的任务同样要能识别出来
+        scan_states.append(TASK_STATES['PENDING'])
+    running = []
+    seen = set()
+    try:
+        for state in scan_states:
+            for task in get_tasks_by_status(state):
+                tid = task.get('id')
+                if not tid or tid in seen:
+                    continue
+                if only_active and tid not in active_ids:
+                    continue
+                seen.add(tid)
+                running.append(task)
+    except Exception as e:
+        logger.warning(f"[并发让位] 统计正在处理的任务失败，本次不改动运行中的任务: {e}")
+        return []
+    if len(running) <= limit:
+        return []
+    running.sort(key=lambda t: (t.get('created_at') or '', t.get('id') or ''))
+    excess = running[limit:]
+    moved = []
+    for idx, task in enumerate(excess, start=1):
+        tid = task.get('id')
+        if not tid:
+            continue
+        try:
+            # 先打标记再取消：收尾时据此落「准备上传」而不是「失败」
+            request_task_preempt(tid)
+            request_task_cancel(tid)
+            terminated = False
+            try:
+                terminated = bool(terminate_active_process(tid))
+            except Exception:
+                pass
+            update_task(
+                tid,
+                status=TASK_STATES['READY_FOR_UPLOAD'],
+                error_message=None,
+                upload_progress=f"{QUEUE_PREEMPT_MARK}（第 {idx} 位）…",
+                preempted=1,
+                queue_priority=1,
+                queue_position=idx,
+                suppress_notification=True,
+            )
+            moved.append(tid)
+            logger.info(
+                f"[并发让位] 任务 {tid[:8]}（原状态 {task.get('status')}）让出并发配额，"
+                f"转到准备上传队列第 {idx} 位，子进程终止={terminated}。原因：{reason}"
+            )
+        except Exception as e:
+            clear_task_preempt(tid)
+            logger.warning(f"[并发让位] 任务 {tid} 让位失败: {e}")
+    if moved:
+        try:
+            _refresh_queue_positions()
+        except Exception:
+            pass
+    return moved
+
+
+def count_active_processing_tasks():
+    """当前真正有工作线程、且处于「可让位处理阶段」的任务数。"""
+    active_ids = _get_active_task_ids()
+    if not active_ids:
+        return 0
+    count = 0
+    seen = set()
+    try:
+        for state in list(PREEMPTABLE_STATES) + [TASK_STATES['PENDING']]:
+            for task in get_tasks_by_status(state):
+                tid = task.get('id')
+                if tid and tid in active_ids and tid not in seen:
+                    seen.add(tid)
+                    count += 1
+    except Exception:
+        pass
+    return count
+
+
+def count_pending_preempted_tasks():
+    """当前还在队列里等配额的「并发让位」任务数（用于给设置页提示）。"""
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = ? AND COALESCE(preempted, 0) = 1",
+            (TASK_STATES['READY_FOR_UPLOAD'],)
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
 
 def get_task(task_id):
     conn = get_db_connection()
@@ -1726,6 +2095,10 @@ def get_upload_concurrency_status():
 QUEUE_WAITING_MARK = '排队等待上传配额'
 QUEUE_STARTING_MARK = '正在启动上传…'
 QUEUE_RETIRED_MARK = '已退出上传队列'
+# 并发让位：任务因并发上限下调被中断，排在队列最前面等配额
+QUEUE_PREEMPT_MARK = '并发超限待继续'
+# schedule_task 的返回值：并发已满，任务保留原状态排队等空位（不是错误）
+TASK_WAITING_FOR_SLOT = 'waiting_for_slot'
 # 点了「停止」后，给上传线程多少秒自行退出；超时则强制交还配额让队列继续
 STOP_RELEASE_GRACE_SECONDS = 60
 _QUEUE_PUMP_LOCK = threading.Lock()
@@ -1766,8 +2139,11 @@ def _list_queued_upload_tasks(limit=200):
     """
     conn = get_db_connection()
     try:
+        # 并发让位的任务（preempted=1）处理流程还没跑完，不能走「只上传」的补位路径，
+        # 它们由调度器恢复流程，所以这里排除掉。
         rows = conn.execute(
-            "SELECT id, created_at FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR upload_progress NOT LIKE ?) LIMIT ?",
+            "SELECT id, created_at FROM tasks WHERE status = ? AND COALESCE(preempted, 0) = 0 "
+            "AND (upload_progress IS NULL OR upload_progress = '' OR upload_progress NOT LIKE ?) LIMIT ?",
             (TASK_STATES['READY_FOR_UPLOAD'], QUEUE_RETIRED_MARK + '%', int(limit) * 2)
         ).fetchall()
         # 有下载数据（成品视频/残留分片）的任务优先上传，其余按创建时间
@@ -1791,15 +2167,20 @@ def _refresh_queue_positions():
         # 先清掉本状态下的旧位次，避免任务退出队列后残留
         conn.execute("UPDATE tasks SET queue_position = NULL WHERE status = ?", (TASK_STATES['READY_FOR_UPLOAD'],))
         rows = conn.execute(
-            "SELECT id, created_at FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR (upload_progress NOT LIKE ? AND upload_progress != ?))",
+            "SELECT id, created_at, COALESCE(preempted, 0) AS preempted, COALESCE(queue_priority, 0) AS queue_priority "
+            "FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR (upload_progress NOT LIKE ? AND upload_progress != ?))",
             (TASK_STATES['READY_FOR_UPLOAD'], QUEUE_RETIRED_MARK + '%', QUEUE_STARTING_MARK)
         ).fetchall()
-        # 位次与实际取任务顺序一致：有下载数据优先，其余按创建时间
-        ordered = sorted(rows, key=lambda r: (-_download_data_priority(r['id']), r['created_at'] or ''))
+        # 位次与实际取任务顺序一致：并发让位的插到最前 → 有下载数据优先 → 其余按创建时间
+        ordered = sorted(
+            rows,
+            key=lambda r: (-int(r['queue_priority'] or 0), -_download_data_priority(r['id']), r['created_at'] or '')
+        )
         for idx, row in enumerate(ordered, 1):
+            label = QUEUE_PREEMPT_MARK if int(row['preempted'] or 0) else QUEUE_WAITING_MARK
             conn.execute(
                 "UPDATE tasks SET upload_progress = ?, queue_position = ?, updated_at = ? WHERE id = ?",
-                (f"{QUEUE_WAITING_MARK}（第 {idx} 位）…", idx, now_str, row['id'])
+                (f"{label}（第 {idx} 位）…", idx, now_str, row['id'])
             )
         conn.commit()
     except Exception as e:
@@ -1961,7 +2342,7 @@ def _run_queued_upload_job(task_id):
         processor._upload_to_target(task_id, task_logger, allow_missing_translations=True)
     except TaskCancelledError:
         task_logger.info("上传队列：任务已取消，退出队列")
-        update_task(task_id, status=TASK_STATES['FAILED'], error_message="任务已取消")
+        finalize_cancelled_task(task_id, "任务已取消")
     except Exception as e:
         task_logger.error(f"上传队列执行失败: {e}")
         update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"上传失败: {e}")
@@ -1983,11 +2364,92 @@ def _run_queued_upload_job(task_id):
             pass
 
 
+class TaskSlotLimiter:
+    """任务并发配额（1 个正在处理的任务占 1 个配额）。
+
+    相比 threading.Semaphore 的改动：上限可原地调整，不再重建对象。
+    重建对象会让正在等待旧对象的线程永远等不到唤醒，所以旧实现只能在「没有任务
+    在跑」时才敢改上限——这就是「并发改完必须重启才生效」的根因。
+
+    释放不绑定线程：配额在调度线程里占用、在工作线程里释放，按线程记账会漏。
+    """
+
+    def __init__(self, limit=2):
+        self._limit = max(1, int(limit or 1))
+        self._active = 0
+        self._cond = threading.Condition()
+
+    @property
+    def limit(self):
+        return self._limit
+
+    @property
+    def active(self):
+        return self._active
+
+    def set_limit(self, limit):
+        new_limit = max(1, int(limit or 1))
+        with self._cond:
+            if new_limit == self._limit:
+                return False
+            self._limit = new_limit
+            self._cond.notify_all()
+        return True
+
+    def acquire(self, blocking=True, timeout=None, cancel_check=None):
+        deadline = None if timeout is None else time.time() + float(timeout)
+        with self._cond:
+            while self._active >= self._limit:
+                if not blocking:
+                    return False
+                wait_for = 2.0
+                if deadline is not None:
+                    remain = deadline - time.time()
+                    if remain <= 0:
+                        return False
+                    wait_for = min(wait_for, remain)
+                if cancel_check is not None:
+                    try:
+                        if cancel_check():
+                            raise TaskCancelledError("任务已取消")
+                    except TaskCancelledError:
+                        raise
+                    except Exception:
+                        pass
+                self._cond.wait(timeout=wait_for)
+            self._active += 1
+            return True
+
+    def release(self):
+        with self._cond:
+            if self._active > 0:
+                self._active -= 1
+            self._cond.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
 def init_task_semaphore(max_concurrent_tasks=3):
+    """保留原函数名：现在的语义是「调整上限」，对象只在第一次创建。"""
     global task_semaphore
-    logger.info(f"初始化任务信号量，最大并发任务数: {max_concurrent_tasks}")
-    task_semaphore = threading.Semaphore(max_concurrent_tasks)
-    logger.info(f"任务信号量初始化完成: {task_semaphore}")
+    limit = max(1, int(max_concurrent_tasks or 1))
+    with _TASK_SCHEDULING_LOCK:
+        if not isinstance(task_semaphore, TaskSlotLimiter):
+            task_semaphore = TaskSlotLimiter(limit)
+            logger.info(f"初始化任务并发配额，最大并发任务数: {limit}")
+        else:
+            changed = task_semaphore.set_limit(limit)
+            if changed:
+                logger.info(
+                    f"任务并发上限已更新为 {limit}（当前占用 {task_semaphore.active}），立即生效"
+                )
+    return task_semaphore
 
 def reset_stuck_tasks(skip_active=False, cancel_active=False):
     conn = get_db_connection()
@@ -2082,17 +2544,21 @@ class TaskProcessor:
         except Exception as e: logger.warning(f"注册卡住任务扫描失败（不影响主流程）：{e}")
 
     def _refresh_runtime_limits(self, force=False):
+        """把设置里的并发值同步到运行中的配额对象。
+
+        以前只在「没有任何任务在跑」时才敢改上限（改上限要重建信号量，重建会让
+        正在等待的线程永远等不到），所以用户改完必须重启服务。现在配额对象支持
+        原地改上限，这里直接同步，立即生效：
+        - 调大：马上放行排队中的任务，不用等下一轮 30 秒扫描；
+        - 调小：马上收紧，超出的正在处理的任务转入「准备上传」队列最前面。
+        """
         desired_tasks = _as_int(self.config.get('MAX_CONCURRENT_TASKS', 2), 2, minimum=1)
         desired_uploads = _as_int(self.config.get('MAX_CONCURRENT_UPLOADS', 1), 1, minimum=1)
-        if desired_tasks == self._current_max_concurrent_tasks and desired_uploads == self._current_max_concurrent_uploads and not self._runtime_limit_refresh_pending: return True
-        active_task_count = len(_get_active_task_ids())
-        if active_task_count > 0 and not force:
-            signature = (desired_tasks, desired_uploads)
-            if signature != self._last_deferred_limit_signature:
-                logger.info(f"检测到并发配置变更，但当前仍有活动任务运行；新的任务/上传并发上限将延后到空闲时生效: {signature}")
-                self._last_deferred_limit_signature = signature
-            self._runtime_limit_refresh_pending = True
-            return False
+        if (desired_tasks == self._current_max_concurrent_tasks
+                and desired_uploads == self._current_max_concurrent_uploads
+                and not self._runtime_limit_refresh_pending):
+            return True
+        previous_tasks = self._current_max_concurrent_tasks
         with _TASK_SCHEDULING_LOCK:
             init_task_semaphore(desired_tasks)
             init_upload_semaphore(desired_uploads)
@@ -2100,7 +2566,20 @@ class TaskProcessor:
             self._current_max_concurrent_uploads = desired_uploads
             self._runtime_limit_refresh_pending = False
             self._last_deferred_limit_signature = None
-        logger.info(f"并发配置已生效 - 最大并发任务: {desired_tasks}, 最大并发上传: {desired_uploads}")
+        logger.info(
+            f"并发配置已生效（无需重启服务） - 最大并发任务: {desired_tasks}, 最大并发上传: {desired_uploads}"
+        )
+        if desired_tasks < previous_tasks:
+            try:
+                moved = preempt_excess_running_tasks(
+                    desired_tasks, reason='最大并发任务数下调', only_active=True
+                )
+                logger.info(f"并发上限下调：{len(moved)} 个超出上限的任务已转入准备上传队列最前面")
+            except Exception as e:
+                logger.warning(f"并发上限下调后让位处理失败（忽略）: {e}")
+        elif desired_tasks > previous_tasks:
+            # 调大后立刻补位，不用等下一轮定时扫描
+            self._trigger_quick_scan('并发上限上调')
         return True
 
     def refresh_config(self, config=None):
@@ -2108,10 +2587,49 @@ class TaskProcessor:
         self._register_periodic_jobs()
         self._refresh_runtime_limits(force=False)
 
-    def _enqueue_task_retry(self, task_id, delay_seconds=2):
+    def _trigger_quick_scan(self, reason='配置变更'):
+        """异步触发一次调度扫描，让「刚放开的配额」立刻被用上。"""
+        def _run():
+            try:
+                self._check_and_start_next_pending_task()
+            except Exception as e:
+                logger.debug(f"{reason}后立即补位失败（定时扫描会兜底）: {e}")
         try:
-            self.scheduler.add_job(self.schedule_task, 'date', run_date=datetime.now() + timedelta(seconds=max(1, int(delay_seconds))), id=f'queued_retry_{task_id}', replace_existing=True, args=[task_id])
-        except Exception as e: logger.debug(f"为任务 {task_id} 注册延迟重试失败，将依赖定时扫描器: {e}")
+            threading.Thread(target=_run, name='quick_reschedule', daemon=True).start()
+        except Exception:
+            pass
+
+    def _resume_preempted_tasks(self, free_slots):
+        """把「并发让位」的任务按队列位次恢复，优先于 pending 任务。"""
+        if free_slots <= 0:
+            return 0
+        try:
+            conn = get_db_connection()
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE status = ? AND COALESCE(preempted, 0) = 1 "
+                "ORDER BY COALESCE(queue_position, 999999) ASC, created_at ASC",
+                (TASK_STATES['READY_FOR_UPLOAD'],)
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            logger.debug(f"读取并发让位任务失败（忽略）: {e}")
+            return 0
+        active_ids = _get_active_task_ids()
+        candidates = [row['id'] for row in rows if row['id'] not in active_ids]
+        if not candidates:
+            return 0
+        slots = task_semaphore
+        resumed = 0
+        for tid in candidates:
+            if resumed >= free_slots:
+                break
+            if slots is not None and slots.active >= slots.limit:
+                break
+            job_id = self.schedule_task(tid)
+            if job_id == f"thread_{tid}":
+                resumed += 1
+                logger.info(f"[并发让位] 任务 {tid[:8]} 已恢复继续处理（队列最前面优先）")
+        return resumed
 
     def _recover_stuck_tasks(self):
         try:
@@ -2135,25 +2653,42 @@ class TaskProcessor:
                 if _is_task_active(task_id):
                     logger.warning(f"任务 {task_id} 已有活动线程，跳过重复调度")
                     return f"thread_{task_id}"
-                queued_job_id = f"queued_retry_{task_id}"
-                try: existing_retry_job = self.scheduler.get_job(queued_job_id)
-                except Exception: existing_retry_job = None
                 task = get_task(task_id)
                 if not task:
                     logger.error(f"任务 {task_id} 不存在")
                     return None
-                if task['status'] not in [TASK_STATES['PENDING'], TASK_STATES['FAILED']]:
+                if task['status'] not in [TASK_STATES['PENDING'], TASK_STATES['FAILED'], TASK_STATES['PAUSED'], TASK_STATES['READY_FOR_UPLOAD']]:
                     logger.warning(f"任务 {task_id} 状态为 {task['status']}，不能调度")
                     return None
+                # 「准备上传」只有并发让位的任务（preempted=1）能被调度回来继续处理流程，
+                # 其余准备上传的任务属于上传队列，由补位器负责，不能在这里抢跑。
+                is_preempted_resume = (
+                    task['status'] == TASK_STATES['READY_FOR_UPLOAD']
+                    and int(task.get('preempted') or 0) == 1
+                )
+                if task['status'] == TASK_STATES['READY_FOR_UPLOAD'] and not is_preempted_resume:
+                    logger.debug(f"任务 {task_id} 处于准备上传状态，交由上传队列补位处理")
+                    return None
+                if is_preempted_resume:
+                    # 让位时的取消标记可能还留在内存里（线程没来得及收尾），
+                    # 恢复前必须清掉，否则一启动就被判定为「已取消」。
+                    clear_task_cancel(task_id)
+                    clear_task_pause(task_id)
+                    clear_task_preempt(task_id)
                 global task_semaphore
                 if task_semaphore is None: init_task_semaphore(self._current_max_concurrent_tasks)
                 assert task_semaphore is not None, "task_semaphore 应该已经初始化"
                 local_task_semaphore = task_semaphore
                 slot_acquired = local_task_semaphore.acquire(blocking=False)
                 if not slot_acquired:
-                    if existing_retry_job is None: self._enqueue_task_retry(task_id, delay_seconds=2)
-                    logger.info(f"任务 {task_id} 当前达到并发上限，保留原状态等待后续调度，不再创建等待线程")
-                    return queued_job_id
+                    # 不再为每个任务注册 2 秒重试：任务多时会在后台形成「每 2 秒
+                    # 把所有任务重试一遍」的日志/数据库风暴。这里只返回「等待配额」，
+                    # 由周期性调度扫描（有空位时）按队首顺序启动。
+                    logger.debug(
+                        f"任务 {task_id} 当前达到并发上限"
+                        f"（{local_task_semaphore.active}/{local_task_semaphore.limit}），等待空位"
+                    )
+                    return TASK_WAITING_FOR_SLOT
                 import threading
                 release_slot_on_failure = True
                 task_marked_active = False
@@ -2173,6 +2708,14 @@ class TaskProcessor:
                         logger.warning(f"任务 {task_id} 在线程启动前检测到重复调度，已跳过")
                         return f"thread_{task_id}"
                     task_marked_active = True
+                    if is_preempted_resume:
+                        # 已经拿到配额、马上要继续跑了：清掉让位标记，处理完再回上传队列正常排队
+                        update_task(task_id, preempted=0, queue_priority=0, queue_position=None, upload_progress=None, silent=True)
+                        logger.info(f"任务 {task_id} 从并发让位队列恢复，继续执行未完成的处理流程")
+                    else:
+                        # 用户手动「开始/继续」时打的插队标记，拿到配额后立即清除，
+                        # 避免影响该任务下一轮排队。
+                        update_task(task_id, queue_priority=0, queue_position=None, upload_progress=None, silent=True)
                     thread = threading.Thread(target=run_task_wrapper, name=f"task_{task_id}", daemon=True)
                     thread.start()
                     release_slot_on_failure = False
@@ -2223,7 +2766,7 @@ class TaskProcessor:
                     task_logger.info("获得任务并发配额，开始执行任务")
                 except TaskCancelledError:
                     task_logger.info("任务在等待并发配额时已取消")
-                    update_task(task_id, status=TASK_STATES['FAILED'], error_message="任务已取消")
+                    finalize_cancelled_task(task_id, "任务已取消")
                     return
                 except Exception as _e:
                     task_logger.error(f"获取任务并发配额失败: {_e}")
@@ -2351,7 +2894,7 @@ class TaskProcessor:
                 update_task(task_id, status=TASK_STATES['READY_FOR_UPLOAD'])
         except TaskCancelledError:
             task_logger.info("任务已取消，停止后续处理")
-            update_task(task_id, status=TASK_STATES['FAILED'], error_message="任务已取消")
+            finalize_cancelled_task(task_id, "任务已取消")
         except Exception as e:
             task_logger.error(f"任务处理过程中发生错误: {str(e)}")
             import traceback
@@ -2359,6 +2902,10 @@ class TaskProcessor:
             update_task(task_id, status=TASK_STATES['FAILED'], error_message=str(e))
         finally:
             clear_task_cancel(task_id, clear_flag=True)
+            # 兜底清掉可能残留的暂停标记，避免影响该任务下一次「停止」
+            clear_task_pause(task_id)
+            # 让位标记的落库结果已在 finalize_cancelled_task / update_task 里处理，这里只清内存标记
+            clear_task_preempt(task_id)
             if slot_acquired:
                 try: active_task_semaphore.release()
                 except Exception: pass
@@ -2389,32 +2936,94 @@ class TaskProcessor:
             logger.debug(f"读取最新配置失败，沿用当前配置: {e}")
         
         self._refresh_runtime_limits(force=False)
-        pending_tasks = get_tasks_by_status(TASK_STATES['PENDING'])
-        active_task_ids = _get_active_task_ids()
-        pending_tasks = [task for task in pending_tasks if task.get('id') not in active_task_ids and not is_task_cancelled(task.get('id'))]
-        if not pending_tasks:
-            if active_task_ids: logger.info(f"当前没有可启动的pending任务（{len(active_task_ids)} 个任务线程处于活动状态）")
-            else: logger.info("没有pending任务需要启动")
-            return
-        processing_states = ['fetching_info', 'info_fetched', TASK_STATES['TRANSLATING'], TASK_STATES['TAGGING'], TASK_STATES['PARTITIONING'], TASK_STATES['MODERATING'], TASK_STATES['DOWNLOADING'], TASK_STATES['DOWNLOADED'], TASK_STATES['ASR_TRANSCRIBING'], TASK_STATES['TRANSLATING_SUBTITLE'], TASK_STATES['ENCODING_VIDEO'], TASK_STATES['UPLOADING']]
-        running_tasks = []
-        for state in processing_states: running_tasks.extend(get_tasks_by_status(state))
-        running_task_ids = {task.get('id') for task in running_tasks if task.get('id')}
-        effective_running_count = len(running_task_ids.union(active_task_ids))
         max_concurrent = _as_int(self.config.get('MAX_CONCURRENT_TASKS', 2), 2, minimum=1)
         if _should_reduce_concurrency():
             max_concurrent = max(1, max_concurrent // 2)
             logger.info(f"检测到高内存使用，降低并发数至 {max_concurrent}")
-        if effective_running_count >= max_concurrent:
-            logger.info(f"当前有效运行任务数 {effective_running_count}（DB运行中 {len(running_task_ids)}，活动线程 {len(active_task_ids)}），达到并发限制 {max_concurrent}，暂不启动新任务")
+
+        # 自愈：如果实际还有工作线程在跑的任务比上限多（历史遗留、启动恢复、
+        # 或上一次并发下调时没来得及收尾），先把多出来的转入「准备上传」最前面。
+        # 只统计真正活动的线程，避免把数据库里的僵尸状态当成正在运行。
+        try:
+            active_processing = count_active_processing_tasks()
+            if active_processing > max_concurrent:
+                moved = preempt_excess_running_tasks(
+                    max_concurrent, reason='实际运行数超过并发上限', only_active=True
+                )
+                if moved:
+                    logger.info(
+                        f"检测到 {active_processing} 个任务在跑、并发上限 {max_concurrent}，"
+                        f"已将 {len(moved)} 个超出的任务转入准备上传队列最前面"
+                    )
+        except Exception as e:
+            logger.debug(f"并发自愈检查失败（忽略）: {e}")
+
+        active_task_ids = _get_active_task_ids()
+        pending_tasks = [
+            task for task in get_tasks_by_status(TASK_STATES['PENDING'])
+            if task.get('id') not in active_task_ids and not is_task_cancelled(task.get('id'))
+        ]
+        # 用户手动点了「继续」的暂停任务也进入本次候选：带 queue_priority 标记，
+        # 排在普通 pending 之前；拿到配额后 schedule_task 会清掉标记。
+        paused_resume_tasks = [
+            task for task in get_tasks_by_status(TASK_STATES['PAUSED'])
+            if int(task.get('queue_priority') or 0) >= 1
+            and task.get('id') not in active_task_ids
+            and not is_task_cancelled(task.get('id'))
+        ]
+        candidates = paused_resume_tasks + pending_tasks
+        if not candidates:
+            if active_task_ids:
+                logger.info(f"当前没有可启动的任务（{len(active_task_ids)} 个任务线程处于活动状态）")
+            else:
+                logger.info("没有pending任务需要启动")
             return
-        # 有下载数据的任务优先（已下载完 > 有残留分片 > 无数据），同优先级按创建时间
-        pending_tasks.sort(key=lambda x: (-_download_data_priority(x.get('id')), x['created_at']))
-        next_task = pending_tasks[0]
-        logger.info(f"发现pending任务，准备启动: {next_task['id'][:8]}... ({next_task.get('youtube_url', 'Unknown URL')[-30:]})")
-        job_id = self.schedule_task(next_task['id'])
-        if job_id: logger.info(f"下一个pending任务已自动启动: {next_task['id'][:8]}...")
-        else: logger.error(f"启动下一个pending任务失败: {next_task['id'][:8]}...")
+
+        if task_semaphore is None:
+            init_task_semaphore(max_concurrent)
+        slots_active = task_semaphore.active if task_semaphore else 0
+        free_slots = max(0, max_concurrent - slots_active)
+        # 并发让位的任务插在最前面：有空配额先把它们接着跑完，再考虑 pending。
+        # 注意顺序——必须在「没有待处理任务就返回」之前，否则只有让位任务、
+        # 没有待处理任务时会永远恢复不了。
+        if free_slots > 0:
+            resumed = self._resume_preempted_tasks(free_slots)
+            if resumed > 0:
+                logger.info(f"本轮已恢复 {resumed} 个并发让位任务继续处理")
+                slots_active = task_semaphore.active if task_semaphore else slots_active
+                free_slots = max(0, max_concurrent - slots_active)
+        if free_slots <= 0:
+            logger.info(
+                f"当前并发配额已满（{slots_active}/{max_concurrent}），"
+                f"{len(candidates)} 个任务排队等待空位"
+            )
+            return
+
+        # 手动继续（queue_priority=1）优先 → 有下载数据优先 → 创建时间
+        candidates.sort(key=lambda x: (
+            -int(x.get('queue_priority') or 0),
+            -_download_data_priority(x.get('id')),
+            x.get('created_at') or '',
+        ))
+        started = 0
+        for next_task in candidates:
+            if started >= free_slots:
+                break
+            if task_semaphore is not None and task_semaphore.active >= max_concurrent:
+                break
+            tid = next_task['id']
+            logger.info(
+                f"准备启动任务: {tid[:8]}... "
+                f"(状态={next_task.get('status')}, 优先级={int(next_task.get('queue_priority') or 0)})"
+            )
+            job_id = self.schedule_task(tid)
+            if job_id == f"thread_{tid}":
+                started += 1
+                logger.info(f"任务已启动: {tid[:8]}...")
+            elif job_id == TASK_WAITING_FOR_SLOT:
+                break
+            else:
+                logger.warning(f"启动任务失败: {tid[:8]}...")
 
     def _fetch_video_info(self, task_id, youtube_url, task_logger):
         from modules.youtube_handler import download_video_data
@@ -2499,7 +3108,9 @@ class TaskProcessor:
             percent = progress_info.get('percent', 0)
             progress_msg = f"{percent:.1f}%"
             task_logger.debug(f"下载进度: {progress_msg}")
-            update_task(task_id, upload_progress=progress_msg, silent=True)
+            # yt-dlp 会直接给出速度文本（如 "1.23MiB/s"），转成 bytes/s 存库供列表展示
+            speed_bps = parse_speed_text(progress_info.get('speed'))
+            update_task(task_id, upload_progress=progress_msg, progress_speed=speed_bps, silent=True)
 
         last_error = ''
         for attempt in (1, 2):
@@ -5035,6 +5646,13 @@ class TaskProcessor:
         try:
             uploader = BilibiliUploader(cookie_file=bilibili_cookies_path)
             last_progress_text = '0.0%'
+            try:
+                upload_total_bytes = os.path.getsize(video_path)
+            except OSError:
+                upload_total_bytes = None
+            # B站 SDK 只回报百分比，用「百分比增量 × 文件大小 ÷ 耗时」估算上传速度
+            upload_speed = SpeedEstimator(total_bytes=upload_total_bytes)
+
             def _on_progress(progress_text):
                 if is_task_cancelled(task_id):
                     return  # 任务已停止：僵尸上传的进度不再刷到界面上
@@ -5053,7 +5671,8 @@ class TaskProcessor:
                     except Exception: return
                 if normalized_text == last_progress_text: return
                 last_progress_text = normalized_text
-                update_task(task_id, upload_progress=normalized_text, silent=True)
+                speed_bps = upload_speed.record_percent(float(normalized_text.rstrip('%')))
+                update_task(task_id, upload_progress=normalized_text, progress_speed=speed_bps, silent=True)
             success, result = uploader.upload_video(video_file_path=video_path, cover_file_path=cover_path, title=title, description=description, tags=tags, partition_id=partition_id, youtube_url=original_url, task_id=task_id, progress_callback=_on_progress, title_limit=effective_limits['title_limit'], description_limit=effective_limits['description_limit'])
             if success:
                 if is_task_cancelled(task_id):
@@ -5071,9 +5690,29 @@ class TaskProcessor:
 
 def start_task(task_id, config=None):
     clear_task_cancel(task_id)
+    clear_task_pause(task_id)
+    # 用户手动启动时也清掉可能残留的并发让位标记，避免后续真实失败被当成「让位」
+    clear_task_preempt(task_id)
     task = get_task(task_id)
     if not task: return False
-    if task['status'] not in [TASK_STATES['PENDING'], TASK_STATES['AWAITING_REVIEW'], TASK_STATES['FAILED']]: return False
+    allowed_states = [
+        TASK_STATES['PENDING'], TASK_STATES['AWAITING_REVIEW'],
+        TASK_STATES['FAILED'], TASK_STATES['PAUSED'],
+    ]
+    if task['status'] not in allowed_states:
+        # 「准备上传」里只有并发让位（preempted=1）的任务能从断点继续处理；
+        # 其余任务是上传队列，不应该被「继续」按钮重新跑一遍流程。
+        if (task['status'] == TASK_STATES['READY_FOR_UPLOAD']
+                and int(task.get('preempted') or 0) == 1):
+            pass
+        else:
+            return False
+    # 用户手动点「开始/继续」= 明确想马上处理：打插队标记，等空位时排在
+    # 普通 pending 任务前面（扫描器按 queue_priority 排序）。
+    try:
+        update_task(task_id, queue_priority=1, silent=True)
+    except Exception:
+        pass
     if not config:
         try:
             from flask import current_app
@@ -5081,6 +5720,36 @@ def start_task(task_id, config=None):
         except (ImportError, RuntimeError): config = {}
     processor = get_global_task_processor(config)
     job_id = processor.schedule_task(task_id)
+    if job_id == TASK_WAITING_FOR_SLOT:
+        # 并发已满：不丢请求，也不无限重试。把任务放回「等待处理」队首，
+        # 空出配额后由扫描器优先启动；暂停任务点「继续」后也能立刻看到反馈。
+        if task['status'] == TASK_STATES['READY_FOR_UPLOAD']:
+            update_task(
+                task_id,
+                upload_progress=f"{QUEUE_PREEMPT_MARK}（等待并发配额）…",
+                preempted=1,
+                queue_priority=2,
+                suppress_notification=True,
+                silent=True,
+            )
+            # 用户手动点「继续」：排到所有让位任务的最前面（第 1 位）
+            try:
+                _refresh_queue_positions()
+            except Exception:
+                pass
+        else:
+            update_task(
+                task_id,
+                status=TASK_STATES['PENDING'],
+                upload_progress='排队等待并发配额…',
+                error_message=None,
+                queue_priority=1,
+                queue_position=None,
+                suppress_notification=True,
+                silent=True,
+            )
+        logger.info(f"任务 {task_id} 已排到等待处理队首，等并发空位后自动继续")
+        return True
     return job_id is not None
 
 def force_upload_task(task_id, config=None):

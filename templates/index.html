@@ -21,7 +21,7 @@
 <!-- KPI cards -->
 <div class="row g-3 mt-2">
     <div class="col-6 col-md-3">
-        <a href="{{ url_for('tasks', status='completed') }}" class="text-decoration-none text-reset">
+        <a href="{{ url_for('tasks', status='completed') }}" class="text-decoration-none text-reset d-block h-100">
             <div class="card h-100 hover-card">
                 <div class="card-body">
                     <div class="d-flex align-items-center justify-content-between">
@@ -36,7 +36,7 @@
         </a>
     </div>
     <div class="col-6 col-md-3">
-        <a href="{{ url_for('tasks', status='failed') }}" class="text-decoration-none text-reset">
+        <a href="{{ url_for('tasks', status='failed') }}" class="text-decoration-none text-reset d-block h-100">
             <div class="card h-100 hover-card">
                 <div class="card-body">
                     <div class="d-flex align-items-center justify-content-between">
@@ -51,7 +51,7 @@
         </a>
     </div>
     <div class="col-6 col-md-3">
-        <a href="{{ url_for('tasks') }}" class="text-decoration-none text-reset">
+        <a href="{{ url_for('tasks') }}" class="text-decoration-none text-reset d-block h-100">
             <div class="card h-100 hover-card">
                 <div class="card-body">
                     <div class="d-flex align-items-center justify-content-between">
@@ -66,19 +66,26 @@
         </a>
     </div>
     <div class="col-6 col-md-3">
-        <a href="{{ url_for('tasks', status='fetching_info,info_fetched,translating,tagging,partitioning,moderating,downloading,downloaded,asr_transcribing,translating_subtitle,encoding_video,uploading') }}" class="text-decoration-none text-reset">
-            <div class="card h-100 hover-card">
-                <div class="card-body">
-                    <div class="d-flex align-items-center justify-content-between">
-                        <div>
-                            <div class="text-muted small">进行中</div>
-                            <div class="fs-3 fw-bold">{{ stats.in_progress }}</div>
-                        </div>
-                        <span class="home-kpi-icon info"><i class="bi bi-lightning-charge"></i></span>
-                    </div>
+        <div class="card h-100">
+            <div class="card-body py-2 d-flex flex-column">
+                <div class="d-flex align-items-center justify-content-between">
+                    <span class="text-muted small">进行中</span>
+                    <span class="home-kpi-icon info"><i class="bi bi-lightning-charge"></i></span>
                 </div>
+                <div class="d-flex align-items-stretch text-center mt-1 flex-grow-1">
+                    <a href="{{ url_for('tasks', status='download_stage') }}" class="flex-fill text-decoration-none text-reset home-progress-part" title="下载、翻译、压制等上传前的处理阶段">
+                        <div class="home-progress-count text-info">{{ stats.downloading_total }}<span class="home-progress-unit">个</span></div>
+                        <div class="small text-muted"><i class="bi bi-cloud-download me-1"></i>下载中</div>
+                    </a>
+                    <div class="vr mx-1 opacity-25"></div>
+                    <a href="{{ url_for('tasks', status='uploading') }}" class="flex-fill text-decoration-none text-reset home-progress-part" title="正在上传到投稿平台">
+                        <div class="home-progress-count text-primary">{{ stats.uploading_total }}<span class="home-progress-unit">个</span></div>
+                        <div class="small text-muted"><i class="bi bi-cloud-upload me-1"></i>上传中</div>
+                    </a>
+                </div>
+                <div class="text-muted small mt-1">合计 <span class="fw-semibold text-body">{{ stats.in_progress }}</span> 个处理中</div>
             </div>
-        </a>
+        </div>
     </div>
 </div>
 
@@ -289,6 +296,28 @@
     .hover-card:hover {
         transform: translateY(-3px);
         box-shadow: 0 .5rem 1rem rgba(0,0,0,.15)!important;
+    }
+    /* 进行中卡片：下载中 / 上传中 两个可点击分区 */
+    .home-progress-part {
+        border-radius: .5rem;
+        padding: .25rem .15rem;
+        transition: background-color .15s ease;
+    }
+    .home-progress-part:hover {
+        background-color: rgba(13, 110, 253, .08);
+    }
+    /* 分区数量：数字加粗放大，后缀「个」缩小，避免窄卡片里挤成一行 */
+    .home-progress-count {
+        font-size: 1.6rem;
+        font-weight: 700;
+        line-height: 1.15;
+        font-variant-numeric: tabular-nums;
+    }
+    .home-progress-unit {
+        font-size: .72rem;
+        font-weight: 500;
+        margin-left: .1rem;
+        opacity: .65;
     }
 </style>
 {% endblock %}

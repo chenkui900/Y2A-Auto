@@ -56,7 +56,7 @@ from modules.utils import get_app_subdir
 from modules.config_manager import load_config, update_config, reset_specific_config, DEFAULT_CONFIG
 from modules.whisper_languages import WHISPER_LANGUAGE_LIST
 from modules.subtitle_style import normalize_hex_color
-from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_task_ids_filtered, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path, is_task_active
+from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_task_ids_filtered, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path, is_task_active, format_speed
 from modules.acfun_auth import AcfunQrLoginSession
 from modules.bilibili_auth import BilibiliQrLoginSession
 from queue import Empty, Queue
@@ -1286,10 +1286,19 @@ def _perform_settings_save(form_data: dict, uploads: dict, operation_id: str | N
         updated_config = update_config(form_data)
 
         try:
-            from modules.task_manager import get_global_task_processor
+            from modules.task_manager import get_global_task_processor, count_pending_preempted_tasks
+            _preempted_before = count_pending_preempted_tasks()
             configure_app(app, updated_config)
             get_global_task_processor(updated_config)
             logger.info("配置已更新并同步到任务处理器")
+            _preempted_after = count_pending_preempted_tasks()
+            if _preempted_after > _preempted_before:
+                _append_settings_message(
+                    messages,
+                    'success',
+                    f'并发上限已下调：{_preempted_after - _preempted_before} 个超出上限的任务已自动转入'
+                    '「准备上传」并排到上传队列最前面，等有配额时优先继续处理。'
+                )
         except Exception as e:
             logger.warning(f"同步任务处理器配置失败: {e}")
 
@@ -1708,6 +1717,7 @@ def task_status_display(status):
         TASK_STATES['UPLOADING']: '上传中',
         TASK_STATES['COMPLETED']: '已完成',
         TASK_STATES['FAILED']: '失败',
+        TASK_STATES['PAUSED']: '已暂停',
         'fetching_info': '采集信息中',
         'info_fetched': '信息已采集',
     }
@@ -1731,7 +1741,8 @@ def task_status_color(status):
         TASK_STATES['READY_FOR_UPLOAD']: 'primary',
         TASK_STATES['UPLOADING']: 'primary',
         TASK_STATES['COMPLETED']: 'success',
-        TASK_STATES['FAILED']: 'danger'
+        TASK_STATES['FAILED']: 'danger',
+        TASK_STATES['PAUSED']: 'secondary'
     }
     return color_map.get(status, 'secondary')
 
@@ -1855,6 +1866,9 @@ app.jinja_env.filters['parse_youtube_duration'] = parse_youtube_duration
 # 错误信息友好化过滤器：把底层错误映射为「原因 + 建议操作」
 from modules.error_hints import friendly_error as _friendly_error
 app.jinja_env.filters['friendly_error'] = _friendly_error
+
+# 传输速度格式化：bytes/s -> "3.4 MB/s"（任务列表显示下载/上传速度）
+app.jinja_env.filters['format_speed'] = format_speed
 
 ALIYUN_LABEL_MAP = {
     "pornographic_adult": "疑似色情内容",
@@ -2017,7 +2031,7 @@ def index():
         cur.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (TASK_STATES['READY_FOR_UPLOAD'],))
         ready_total = cur.fetchone()[0] or 0
 
-        # 进行中的状态集合
+        # 进行中的状态集合：上传前（下载/翻译/压制等）＋上传中，两类互斥、相加即总数
         processing_states = (
             'fetching_info', 'info_fetched',
             TASK_STATES['TRANSLATING'], TASK_STATES['TAGGING'], TASK_STATES['PARTITIONING'],
@@ -2025,9 +2039,18 @@ def index():
             TASK_STATES['ASR_TRANSCRIBING'], TASK_STATES['TRANSLATING_SUBTITLE'],
             TASK_STATES['ENCODING_VIDEO'], TASK_STATES['UPLOADING']
         )
-        placeholders = ",".join(["?"] * len(processing_states))
-        cur.execute(f"SELECT COUNT(*) FROM tasks WHERE status IN ({placeholders})", processing_states)
-        in_progress = cur.fetchone()[0] or 0
+        download_stage_states = tuple(s for s in processing_states if s != TASK_STATES['UPLOADING'])
+
+        cur.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status IN ({})".format(",".join(["?"] * len(download_stage_states))),
+            download_stage_states,
+        )
+        downloading_total = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (TASK_STATES['UPLOADING'],))
+        uploading_total = cur.fetchone()[0] or 0
+
+        in_progress = downloading_total + uploading_total
 
         # 今日完成/失败/新增任务
         cur.execute(
@@ -2121,6 +2144,8 @@ def index():
             'pending_total': pending_total,
             'ready_total': ready_total,
             'in_progress': in_progress,
+            'downloading_total': downloading_total,
+            'uploading_total': uploading_total,
             'completed_today': completed_today,
             'failed_today': failed_today,
             'created_today': created_today,
@@ -2136,6 +2161,8 @@ def index():
             'pending_total': 0,
             'ready_total': 0,
             'in_progress': 0,
+            'downloading_total': 0,
+            'uploading_total': 0,
             'completed_today': 0,
             'failed_today': 0,
             'created_today': 0,
@@ -2157,6 +2184,14 @@ def _build_processing_states():
     )
 
 
+def _build_download_stage_states():
+    """「进行中」里上传之前的所有阶段（下载/翻译/压制…），与「上传中」互斥。"""
+    return ','.join(
+        s for s in _build_processing_states().split(',')
+        if s and s != TASK_STATES['UPLOADING']
+    )
+
+
 @app.route('/tasks/filtered_ids')
 @login_required
 def tasks_filtered_ids():
@@ -2165,6 +2200,8 @@ def tasks_filtered_ids():
     processing_states = _build_processing_states()
     if status_filter == 'processing':
         status_filter = processing_states
+    elif status_filter == 'download_stage':
+        status_filter = _build_download_stage_states()
     search_keyword = (request.args.get('q') or '').strip()
     ids = get_task_ids_filtered(status=status_filter, search=search_keyword)
     return jsonify({'success': True, 'ids': ids, 'total': len(ids)})
@@ -2188,6 +2225,9 @@ def tasks():
 
     if status_filter == 'processing':
         status_filter = processing_states
+    elif status_filter == 'download_stage':
+        # 首页「进行中」卡片的「下载中」分区：上传前的所有处理阶段
+        status_filter = _build_download_stage_states()
 
     # 关键词搜索：标题/URL/任务ID/上传结果（AcFun、B站投稿响应）
     search_keyword = (request.args.get('q') or '').strip()
@@ -2209,8 +2249,12 @@ def tasks():
         {'value': TASK_STATES['PENDING'], 'label': '等待处理'},
         {'value': TASK_STATES['READY_FOR_UPLOAD'], 'label': '准备上传'},
         {'value': 'processing', 'label': '进行中（含上传中）'},
+        {'value': 'download_stage', 'label': '下载中（含处理阶段）'},
+        {'value': TASK_STATES['DOWNLOADING'], 'label': '下载中'},
+        {'value': TASK_STATES['UPLOADING'], 'label': '上传中'},
         {'value': TASK_STATES['AWAITING_REVIEW'], 'label': '等待人工审核'},
         {'value': TASK_STATES['SCHEDULED_UPLOAD'], 'label': '定时上传'},
+        {'value': TASK_STATES['PAUSED'], 'label': '已暂停'},
         {'value': TASK_STATES['COMPLETED'], 'label': '已完成'},
         {'value': TASK_STATES['FAILED'], 'label': '失败'},
     ]
@@ -2898,13 +2942,29 @@ def start_task_route(task_id):
         flash('任务不存在', 'danger')
         return _back_to_tasks()
     
-    if task['status'] not in [TASK_STATES['PENDING'], TASK_STATES['FAILED']]:
+    allowed_start_states = [TASK_STATES['PENDING'], TASK_STATES['FAILED'], TASK_STATES['PAUSED']]
+    is_preempted_resume = (
+        task['status'] == TASK_STATES['READY_FOR_UPLOAD']
+        and int(task.get('preempted') or 0) == 1
+    )
+    if task['status'] not in allowed_start_states and not is_preempted_resume:
         flash(f'当前任务状态为 {task_status_display(task["status"])}，不能启动', 'warning')
         return _back_to_tasks()
     
-    # 已有活动线程（可能在排队等待上传配额）时直接提示，避免重复点击被静默忽略
+    # 已有活动线程时：暂停中的任务可能只是旧线程还没退干净。此时不要直接拒绝，
+    # 给它打上插队标记，线程收尾后的扫描会自动把它接着跑起来。
     if is_task_active(task_id):
-        flash('该任务已在处理中（可能正在排队等待上传配额），请勿重复点击，稍候刷新页面查看进度', 'warning')
+        if task['status'] == TASK_STATES['PAUSED']:
+            update_task(
+                task_id,
+                queue_priority=1,
+                upload_progress='等待当前线程退出后继续…',
+                suppress_notification=True,
+                silent=True,
+            )
+            flash('任务正在停止中，已排到队首，停止完成后会自动继续', 'info')
+        else:
+            flash('该任务已在处理中（可能正在排队等待上传配额），请勿重复点击，稍候刷新页面查看进度', 'warning')
         return _back_to_tasks()
     
     # 清除历史上可能残留的取消标记，避免刚点“开始”又被立刻取消
@@ -2921,13 +2981,18 @@ def start_task_route(task_id):
     success = start_task(task_id, config)
     
     if success:
-        # 检查是否是自动模式
-        if config.get('AUTO_MODE_ENABLED', False):
-            flash('任务已启动，自动模式将会自动完成下载、处理和上传', 'info')
-            
-            # 使用传统页面刷新方式
+        if is_task_active(task_id):
+            # 检查是否是自动模式
+            if config.get('AUTO_MODE_ENABLED', False):
+                flash('任务已启动，自动模式将会自动完成下载、处理和上传', 'info')
+            else:
+                flash('任务处理已启动', 'success')
         else:
-            flash('任务处理已启动', 'success')
+            # 并发已满：start_task 已把任务放回等待队列队首
+            if is_preempted_resume:
+                flash('当前并发已满，任务已排到「准备上传」队列最前面，有空位会优先继续处理', 'info')
+            else:
+                flash('当前并发已满，任务已排到「等待处理」队首，有空位会自动开始', 'info')
     else:
         flash('启动任务处理失败', 'danger')
     
@@ -3811,6 +3876,46 @@ def stop_task_route(task_id):
     logger.info(f"用户主动停止了任务 {task_id}（subprocess terminated={terminated}）")
     flash('任务已停止，如需继续请点击“开始”', 'info')
     return redirect(url_for('tasks'))
+
+
+@app.route('/tasks/<task_id>/pause', methods=['POST'])
+@login_required
+def pause_task_route(task_id):
+    """暂停正在执行的任务：中断当前处理但保留断点，之后可点「继续」。
+
+    与「停止」的中断动作完全一致（打取消标记 + 结束 yt-dlp/ffmpeg 子进程），
+    区别只在收尾状态：暂停落「已暂停」（可继续），停止落「失败」。
+    """
+    task = get_task(task_id)
+    if not task:
+        flash('任务不存在', 'danger')
+        return _back_to_tasks()
+
+    if task['status'] not in _stoppable_task_states():
+        flash(f'当前任务状态为 {task_status_display(task["status"])}，无法暂停', 'warning')
+        return _back_to_tasks()
+
+    from modules.task_manager import request_task_cancel, request_task_pause, terminate_active_process
+
+    # 先打暂停标记再发取消信号：后台线程收尾时据此落「已暂停」而不是「失败」
+    request_task_pause(task_id)
+    request_task_cancel(task_id)
+    terminated = terminate_active_process(task_id)
+
+    # 立刻改状态让界面即时反馈；后台线程收尾时会看到暂停标记，落到同一状态
+    update_task(
+        task_id,
+        status=TASK_STATES['PAUSED'],
+        error_message=None,
+        upload_progress=None,
+        queue_position=None,
+        queue_priority=0,
+        suppress_notification=True,
+    )
+
+    logger.info(f"用户暂停了任务 {task_id}（subprocess terminated={terminated}）")
+    flash('任务已暂停，可点击“继续”从中断处接着处理', 'info')
+    return _back_to_tasks()
 
 
 @app.route('/system_health')

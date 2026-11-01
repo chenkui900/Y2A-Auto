@@ -1514,3 +1514,22 @@ html.dark .tasks-head-sticky::after {
 }
 .tasks-pagination-top .pagination .page-link { padding: .18rem .5rem; }
 .tasks-pagination-bottom { padding: 0 2px; }
+
+/* 任务列表：实时传输速度小标签（下载 ↓ / 上传 ↑） */
+.task-speed {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 6px;
+    border-radius: 999px;
+    font-size: .7rem;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    color: var(--y2a-text-muted);
+    background-color: color-mix(in srgb, var(--y2a-text-muted) 14%, transparent);
+}
+.task-speed::selection { background-color: transparent; }
+
+/* 已暂停任务：整行淡灰底，和「失败」的红色区分开，一眼能看出是用户主动暂停 */
+tr.status-paused td { background-color: rgba(108, 117, 125, .045); }
+.card.task-card.status-paused { border-color: var(--y2a-border); }

@@ -2420,6 +2420,7 @@
                                                 <div class="form-group">
                                                     <label for="max-concurrent-tasks" class="form-label">最大并发任务数</label>
                                                     <input type="number" id="max-concurrent-tasks" name="MAX_CONCURRENT_TASKS" value="{{ config.get('MAX_CONCURRENT_TASKS', 2) }}" min="1" max="10" class="form-control">
+                                                    <small class="text-muted">同时处理（下载/翻译/转码等）的任务数；保存后立即生效，无需重启服务。调小时超出上限的任务会自动转入「准备上传」并排到队列最前面，等有配额时优先继续。</small>
                                                 </div>
                                                 <div class="form-group mb-0">
                                                     <label for="max-concurrent-uploads" class="form-label">最大并发上传数</label>
