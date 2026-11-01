@@ -139,6 +139,19 @@ class TasksSelectionSameStatusTests(unittest.TestCase):
         self.assertIsNotNone(report['persist'])
         self.assertIsNone(report['persist'].get('status'))
 
+        # 10. 锁定状态后，跨页计数按锁定状态刷新（而不是页面筛选的全量数字）
+        counter = report['counterFlow']['afterLockPending']
+        self.assertEqual(counter['totalStatus'], 'pending')
+        self.assertEqual(counter['total'], 12)
+        self.assertEqual(counter['num'], '12')
+        self.assertEqual(counter['label'], '选中全部「等待处理」')
+        self.assertIn('共 12 个「等待处理」任务可跨页全选', counter['hint'])
+
+        # 11. 解锁后计数恢复为页面自带值
+        cleared = report['counterFlow']['afterClear']
+        self.assertEqual(cleared['totalStatus'], 'page')
+        self.assertEqual(cleared['label'], '选中当前筛选的全部')
+
 
 if __name__ == '__main__':
     unittest.main()

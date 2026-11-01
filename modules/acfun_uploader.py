@@ -15,8 +15,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from typing import Optional, List, Union, Tuple
 from .utils import get_app_subdir
-
 from modules.utils import process_cover
+from .rate_limiter import throttle_upload_cancellable
 
 ACFUN_TITLE_LIMIT = 50
 ACFUN_DESCRIPTION_LIMIT = 1000
@@ -410,7 +410,13 @@ class AcfunUploader:
                     time.sleep(2 ** attempt)  # 指数退避
                 
                 # 始终验证SSL证书，不因重试而降级安全策略
-                
+
+                # 上传限速（设置 › 网络与下载 › 上传限速）：按分块大小预约通道时间，
+                # 取消时立刻退出，避免限速期间点了停止还要等一整块的时间。
+                if not throttle_upload_cancellable(len(block), cancel_event):
+                    self.log(f"分块 {fragment_id + 1} 上传已取消")
+                    return False
+
                 response = upload_session.post(
                     self.FRAGMENT_URL,
                     params={

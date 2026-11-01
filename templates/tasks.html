@@ -40,10 +40,7 @@
         </div>
         <div class="d-flex gap-2 flex-wrap align-items-center">
             <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addTaskModal">
-                <i class="bi bi-plus-circle"></i> 新建任务
-            </button>
-            <button type="button" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#importExcelModal">
-                <i class="bi bi-file-earmark-arrow-up"></i> 导入Excel
+                <i class="bi bi-plus-circle"></i> 新建 / 导入任务
             </button>
             {% if failed_tasks %}
             <button type="button" class="btn btn-outline-danger" id="retryFailedTasksBtn" onclick="confirmRetryFailed()">
@@ -119,7 +116,7 @@
         </span>
         <span class="sel-hint" id="selScopeHint"></span>
         <button type="button" class="btn btn-sm btn-outline-primary" id="selectAllFilteredBtn" onclick="selectAllFiltered()">
-            <i class="bi bi-layers"></i> 选中当前筛选的全部 <span id="filterTotalNum">0</span> 个（跨页）
+            <i class="bi bi-layers"></i> <span id="filterTotalLabel">选中当前筛选的全部</span> <span id="filterTotalNum">0</span> 个（跨页）
         </button>
         <button type="button" class="btn btn-sm btn-outline-secondary" onclick="clearSelection()">
             <i class="bi bi-x-circle"></i> 清空选择
@@ -184,7 +181,7 @@
     </div>
     {% else %}
     <div class="alert alert-info">
-        <i class="bi bi-info-circle"></i> 暂无任务，请点击"新建任务"按钮添加任务。
+        <i class="bi bi-info-circle"></i> 暂无任务，请点击"新建 / 导入任务"按钮添加任务。
     </div>
     {% endif %}
     
@@ -195,71 +192,79 @@
 </div>
 
 <!-- ==================== 所有模态框保持不变 ==================== -->
-<!-- 新建任务对话框 -->
+<!-- 新建任务 / 导入 Excel 合并为一个入口，用标签页切换 -->
 <div class="modal fade" id="addTaskModal" tabindex="-1">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-lg">
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title"><i class="bi bi-plus-circle"></i> 新建任务</h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
             </div>
-            <form method="post" action="{{ url_for('add_task_route') }}">
-                <div class="modal-body">
-                    <div class="mb-3">
-                        <label for="youtube_url" class="form-label">YouTube视频URL</label>
-                        <input type="text" class="form-control" id="youtube_url" name="youtube_url" required placeholder="https://www.youtube.com/watch?v=...">
-                        <div class="form-text">支持标准YouTube视频链接、短链（youtu.be）、shorts；任务列表里已存在的视频会自动跳过</div>
+            <div class="modal-body pb-0">
+                <ul class="nav nav-tabs" id="addTaskTabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="addTaskManualTab" data-bs-toggle="tab" data-bs-target="#addTaskManualPane"
+                                type="button" role="tab" aria-controls="addTaskManualPane" aria-selected="true">
+                            <i class="bi bi-link-45deg"></i> 手动填写链接
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="addTaskExcelTab" data-bs-toggle="tab" data-bs-target="#addTaskExcelPane"
+                                type="button" role="tab" aria-controls="addTaskExcelPane" aria-selected="false">
+                            <i class="bi bi-file-earmark-arrow-up"></i> Excel 批量导入
+                        </button>
+                    </li>
+                </ul>
+                <div class="tab-content pt-3">
+                    <!-- 手动填写 -->
+                    <div class="tab-pane fade show active" id="addTaskManualPane" role="tabpanel" aria-labelledby="addTaskManualTab">
+                        <form method="post" action="{{ url_for('add_task_route') }}">
+                            <div class="mb-3">
+                                <label for="youtube_url" class="form-label">YouTube视频URL</label>
+                                <input type="text" class="form-control" id="youtube_url" name="youtube_url" required placeholder="https://www.youtube.com/watch?v=...">
+                                <div class="form-text">支持标准YouTube视频链接、短链（youtu.be）、shorts；任务列表里已存在的视频会自动跳过</div>
+                            </div>
+                            <div class="mb-3">
+                                <label for="upload_target" class="form-label">目标平台</label>
+                                {% set default_target = (config.get('UPLOAD_TARGET_DEFAULT', 'acfun'))|lower %}
+                                <select class="form-select" id="upload_target" name="upload_target">
+                                    <option value="acfun" {% if default_target == 'acfun' %}selected{% endif %}>AcFun</option>
+                                    <option value="bilibili" {% if default_target == 'bilibili' %}selected{% endif %}>bilibili</option>
+                                    <option value="both" {% if default_target == 'both' %}selected{% endif %}>双平台（AcFun + bilibili）</option>
+                                </select>
+                                <div class="form-text">不选择时将使用系统默认平台</div>
+                            </div>
+                            <div class="modal-footer px-0">
+                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-circle"></i> 取消</button>
+                                <button type="submit" class="btn btn-primary"><i class="bi bi-plus-circle"></i> 添加任务</button>
+                            </div>
+                        </form>
                     </div>
-                    <div class="mb-3">
-                        <label for="upload_target" class="form-label">目标平台</label>
-                        {% set default_target = (config.get('UPLOAD_TARGET_DEFAULT', 'acfun'))|lower %}
-                        <select class="form-select" id="upload_target" name="upload_target">
-                            <option value="acfun" {% if default_target == 'acfun' %}selected{% endif %}>AcFun</option>
-                            <option value="bilibili" {% if default_target == 'bilibili' %}selected{% endif %}>bilibili</option>
-                            <option value="both" {% if default_target == 'both' %}selected{% endif %}>双平台（AcFun + bilibili）</option>
-                        </select>
-                        <div class="form-text">不选择时将使用系统默认平台</div>
+                    <!-- Excel 批量导入 -->
+                    <div class="tab-pane fade" id="addTaskExcelPane" role="tabpanel" aria-labelledby="addTaskExcelTab">
+                        <form method="post" action="{{ url_for('import_tasks_from_excel') }}" enctype="multipart/form-data">
+                            <div class="mb-3">
+                                <label for="excel_file" class="form-label">Excel 文件</label>
+                                <input type="file" class="form-control" id="excel_file" name="excel_file" accept=".xlsx,.csv" required>
+                                <div class="form-text">支持 .xlsx / .csv，文件中包含视频网址即可（自动识别所有链接，播放列表链接会被忽略）；已存在的任务会自动跳过。</div>
+                            </div>
+                            <div class="mb-3">
+                                <label for="excel_upload_target" class="form-label">目标平台</label>
+                                {% set default_target2 = (config.get('UPLOAD_TARGET_DEFAULT', 'acfun'))|lower %}
+                                <select class="form-select" id="excel_upload_target" name="upload_target">
+                                    <option value="acfun" {% if default_target2 == 'acfun' %}selected{% endif %}>AcFun</option>
+                                    <option value="bilibili" {% if default_target2 == 'bilibili' %}selected{% endif %}>bilibili</option>
+                                    <option value="both" {% if default_target2 == 'both' %}selected{% endif %}>双平台（AcFun + bilibili）</option>
+                                </select>
+                            </div>
+                            <div class="modal-footer px-0">
+                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-circle"></i> 取消</button>
+                                <button type="submit" class="btn btn-primary" id="importExcelBtn"><i class="bi bi-file-earmark-arrow-up"></i> 导入</button>
+                            </div>
+                        </form>
                     </div>
                 </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-circle"></i> 取消</button>
-                    <button type="submit" class="btn btn-primary"><i class="bi bi-plus-circle"></i> 添加任务</button>
-                </div>
-            </form>
-        </div>
-    </div>
-</div>
-
-<!-- 导入 Excel 对话框 -->
-<div class="modal fade" id="importExcelModal" tabindex="-1">
-    <div class="modal-dialog">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title"><i class="bi bi-file-earmark-arrow-up"></i> 导入Excel任务</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
             </div>
-            <form method="post" action="{{ url_for('import_tasks_from_excel') }}" enctype="multipart/form-data">
-                <div class="modal-body">
-                    <div class="mb-3">
-                        <label for="excel_file" class="form-label">Excel 文件</label>
-                        <input type="file" class="form-control" id="excel_file" name="excel_file" accept=".xlsx,.csv" required>
-                        <div class="form-text">支持 .xlsx / .csv，文件中包含视频网址即可（自动识别所有链接，播放列表链接会被忽略）；已存在的任务会自动跳过。</div>
-                    </div>
-                    <div class="mb-3">
-                        <label for="excel_upload_target" class="form-label">目标平台</label>
-                        {% set default_target2 = (config.get('UPLOAD_TARGET_DEFAULT', 'acfun'))|lower %}
-                        <select class="form-select" id="excel_upload_target" name="upload_target">
-                            <option value="acfun" {% if default_target2 == 'acfun' %}selected{% endif %}>AcFun</option>
-                            <option value="bilibili" {% if default_target2 == 'bilibili' %}selected{% endif %}>bilibili</option>
-                            <option value="both" {% if default_target2 == 'both' %}selected{% endif %}>双平台（AcFun + bilibili）</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-circle"></i> 取消</button>
-                    <button type="submit" class="btn btn-primary" id="importExcelBtn"><i class="bi bi-file-earmark-arrow-up"></i> 导入</button>
-                </div>
-            </form>
         </div>
     </div>
 </div>
@@ -316,7 +321,7 @@
                         <option value="80">每天 80 个</option>
                         <option value="100">每天 100 个</option>
                     </select>
-                    <div class="form-text" id="batchSchedulePreview">到点后任务自动进入上传队列开始上传（受上传并发数限制依次进行）；可重复选择任务再次设置以改期。</div>
+                    <div class="form-text" id="batchSchedulePreview">到点后任务自动进入上传队列开始上传（受上传并发数量（同时上传任务数）限制依次进行）；可重复选择任务再次设置以改期。</div>
                 </div>
                 <div class="alert alert-warning mb-0">
                     <i class="bi bi-exclamation-triangle-fill"></i>
@@ -1417,9 +1422,44 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
     let selectAllFilteredMode = false;   // 是否处于「选中当前筛选全部」模式
     let allFilteredIds = [];             // 该模式下的全部任务ID
     let filterTotal = {{ pagination.total if pagination else 0 }};  // 当前筛选条件下的任务总数
+    let filterTotalStatus = {{ ((current_status_filter or 'page') if current_status_filter and current_status_filter != 'processing' else 'page')|tojson }};  // filterTotal 对应的状态（'page'=页面筛选自带的计数）
     // 跨页批量选择只允许同一状态：记住第一次勾选的任务状态，其他状态一律不可选
     let selectionStatus = null;
     let selectionStatusLabel = '';
+
+    // 锁定状态后，跨页计数要按「锁定状态」重新取，而不是页面筛选的总数（527 那种全量数字会误导）
+    let _filterTotalFetching = null;
+    function refreshFilterTotalForStatus() {
+        const wanted = selectionStatus || null;
+        if (!wanted) {
+            // 解锁后恢复为页面筛选自带的计数
+            if (filterTotalStatus !== 'page') {
+                filterTotal = {{ pagination.total if pagination else 0 }};
+                filterTotalStatus = 'page';
+                updateSelectAllState();
+            }
+            return;
+        }
+        // 页面本来就按该状态筛选（且非 processing 聚合筛选）时，自带 total 已经正确
+        if (filterTotalStatus === wanted) return;
+        if (_filterTotalFetching === wanted) return;
+        _filterTotalFetching = wanted;
+        const params = new URLSearchParams();
+        params.set('status', wanted);
+        if (CURRENT_SEARCH) params.set('q', CURRENT_SEARCH);
+        fetch('/tasks/filtered_ids?' + params.toString(), { headers: { 'Accept': 'application/json' } })
+            .then(res => res.json())
+            .then(data => {
+                if (!data.success) return;
+                // 请求期间锁可能已经变了，只有还锁在同一状态才采纳
+                if (selectionStatus !== wanted) return;
+                filterTotal = data.total || (data.ids ? data.ids.length : 0);
+                filterTotalStatus = wanted;
+                updateSelectAllState();
+            })
+            .catch(() => {})
+            .finally(() => { if (_filterTotalFetching === wanted) _filterTotalFetching = null; });
+    }
 
     function persistSelection() {
         try {
@@ -1486,6 +1526,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         if (status && status !== selectionStatus) {
             selectionStatus = status;
             selectionStatusLabel = checkboxStatusLabel(checkedBoxes[0]);
+            refreshFilterTotalForStatus();
         }
     }
 
@@ -1518,6 +1559,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             if (holder) holder.classList.toggle('row-selected', checked);
         });
         syncStatusLock();
+        refreshFilterTotalForStatus();
         updateSelectAllState();
     }
 
@@ -1539,12 +1581,14 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             if (!selectionStatus && status) {
                 selectionStatus = status;
                 selectionStatusLabel = checkboxStatusLabel(cb);
+                refreshFilterTotalForStatus();
             }
         } else {
             selectedTaskIds.delete(cb.value);
             if (selectedTaskIds.size === 0 && !selectAllFilteredMode) {
                 selectionStatus = null;
                 selectionStatusLabel = '';
+                refreshFilterTotalForStatus();
             }
         }
         const holder = cb.closest('tr, .task-card');
@@ -1564,6 +1608,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             if (!selectionStatus && boxes.length) {
                 selectionStatus = checkboxStatus(boxes[0]) || null;
                 selectionStatusLabel = checkboxStatusLabel(boxes[0]);
+                refreshFilterTotalForStatus();
             }
             boxes.forEach(cb => {
                 const selectable = !selectionStatus || checkboxStatus(cb) === selectionStatus;
@@ -1587,6 +1632,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             if (selectedTaskIds.size === 0) {
                 selectionStatus = null;
                 selectionStatusLabel = '';
+                refreshFilterTotalForStatus();
             }
         }
         syncStatusLock();
@@ -1625,6 +1671,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             }
             allFilteredIds = data.ids;
             filterTotal = data.total || data.ids.length;
+            filterTotalStatus = effectiveStatus;
             selectAllFilteredMode = true;
             selectedTaskIds.clear();
             if (!selectionStatus) {
@@ -1658,6 +1705,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             if (holder) holder.classList.remove('row-selected');
         });
         syncStatusLock();
+        refreshFilterTotalForStatus();
         selectionChanged();
     }
 
@@ -1712,7 +1760,8 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                         hint.textContent = `已覆盖当前筛选的全部结果（含其他页），批量操作将对这 ${count} 个任务生效`;
                     } else {
                         const total = filterTotal || parseInt((document.getElementById('filterTotalNum') || {}).textContent, 10) || 0;
-                        hint.textContent = total > count ? `本页已选 ${count} 个，共 ${total} 个匹配任务可跨页全选` : '';
+                        const scope = selectionStatus ? `「${selectionStatusText()}」任务` : '匹配任务';
+                        hint.textContent = total > count ? `本页已选 ${count} 个，共 ${total} 个${scope}可跨页全选` : '';
                     }
                 }
                 const allBtn = document.getElementById('selectAllFilteredBtn');
@@ -1722,6 +1771,9 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             } else {
                 bar.classList.add('d-none');
             }
+            // 按钮文案与锁定状态挂钩，无论选择条是否显示都保持最新
+            const labelEl = document.getElementById('filterTotalLabel');
+            if (labelEl) labelEl.textContent = selectionStatus ? `选中全部「${selectionStatusText()}」` : '选中当前筛选的全部';
             // 选择条显隐会改变吸顶区高度，同步刷新表格滚动区高度
             syncTasksLayoutVars();
         }
@@ -1782,7 +1834,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         const k = parseInt(document.getElementById('batchScheduleDailyCount').value, 10) || 0;
         const previewEl = document.getElementById('batchSchedulePreview');
         if (k <= 0) {
-            previewEl.textContent = '到点后任务自动进入上传队列开始上传（受上传并发数限制依次进行）；可重复选择任务再次设置以改期。';
+            previewEl.textContent = '到点后任务自动进入上传队列开始上传（受上传并发数量（同时上传任务数）限制依次进行）；可重复选择任务再次设置以改期。';
             return;
         }
         const timeVal = document.getElementById('batchScheduleTime').value;
@@ -2205,8 +2257,8 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         restoreSelectionFromStorage();
         restoreSelectionState();
 
-        // 导入Excel：提交时显示导入中状态，防止重复提交
-        var importForm = document.querySelector('#importExcelModal form');
+        // 导入Excel：提交时显示导入中状态，防止重复提交（入口已合并进「新建任务」的标签页）
+        var importForm = document.querySelector('#addTaskExcelPane form');
         if (importForm) {
             importForm.addEventListener('submit', function() {
                 var btn = document.getElementById('importExcelBtn');

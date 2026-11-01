@@ -54,6 +54,23 @@ from werkzeug.security import safe_join
 from modules.youtube_handler import extract_video_urls_from_playlist
 from modules.utils import get_app_subdir
 from modules.config_manager import load_config, update_config, reset_specific_config, DEFAULT_CONFIG
+from modules.rate_limiter import (
+    normalize_rate_limit,
+    parse_rate_limit,
+    format_rate_limit,
+    normalize_time_of_day,
+    rate_limit_status,
+    invalidate_cache as invalidate_rate_limit_cache,
+    DEFAULT_WINDOW_START,
+    DEFAULT_WINDOW_END,
+)
+from modules.concurrency import (
+    MAX_DOWNLOAD_THREADS,
+    MAX_UPLOAD_THREADS,
+    get_download_concurrency,
+    get_upload_concurrency,
+    split_download_rate,
+)
 from modules.whisper_languages import WHISPER_LANGUAGE_LIST
 from modules.subtitle_style import normalize_hex_color
 from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_task_ids_filtered, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path, is_task_active, format_speed, task_has_downloaded_video, find_duplicate_task
@@ -807,14 +824,16 @@ SETTINGS_CHECKBOX_FIELDS = list(dict.fromkeys([
     'NOTIFY_MESSAGE_PUSHER_ENABLED',
     'COOKIECLOUD_ENABLED',
     'COOKIECLOUD_ALLOW_PLAINTEXT_EXPORT',
+    'RATE_LIMIT_ENABLED',
+    'RATE_LIMIT_TIME_ENABLED',
 ] + SPEECH_PIPELINE_CHECKBOXES))
 
 SETTINGS_INT_FIELDS = list(dict.fromkeys([
-    'MAX_CONCURRENT_TASKS', 'MAX_CONCURRENT_UPLOADS',
+    'YOUTUBE_DOWNLOAD_THREADS', 'UPLOAD_THREADS',
     'LOG_CLEANUP_HOURS', 'LOG_CLEANUP_INTERVAL',
     'DOWNLOAD_CLEANUP_HOURS', 'DOWNLOAD_CLEANUP_INTERVAL',
     'SUBTITLE_BATCH_SIZE', 'SUBTITLE_MAX_RETRIES',
-    'SUBTITLE_RETRY_DELAY', 'SUBTITLE_MAX_WORKERS', 'YOUTUBE_DOWNLOAD_THREADS',
+    'SUBTITLE_RETRY_DELAY', 'SUBTITLE_MAX_WORKERS',
     'YOUTUBE_DOWNLOAD_MAX_HEIGHT',
     'LOGIN_MAX_FAILED_ATTEMPTS', 'LOGIN_LOCKOUT_MINUTES', 'LOGIN_SESSION_TIMEOUT_MINUTES',
     'AI_FAILOVER_TIMEOUT_SECONDS',
@@ -891,6 +910,10 @@ SETTINGS_RANGE_GUARDS = (
     ('SUBTITLE_BACKGROUND_OPACITY', 0.0, 1.0),
     # 编码质量（manual 模式下的 CRF/CQ/QP）
     ('VIDEO_QUALITY_VALUE', 0.0, 51.0),
+    # 并发数量直接决定同时进行的任务数（见 modules/concurrency.py），越界会让调度器
+    # 一次拉起过多任务、把内存和出口连接打满，必须挡在配置层。
+    ('YOUTUBE_DOWNLOAD_THREADS', 1.0, float(MAX_DOWNLOAD_THREADS)),
+    ('UPLOAD_THREADS', 1.0, float(MAX_UPLOAD_THREADS)),
 )
 
 # 回退提示里的中文名称（取自设置页控件文案），仅用于让用户看懂被改了哪一项。
@@ -924,6 +947,9 @@ SETTINGS_GUARD_LABELS = {
     'SUBTITLE_BACKGROUND_OPACITY': '字幕背景不透明度',
     # 编码质量
     'VIDEO_QUALITY_VALUE': '画质数值（CRF/CQ/QP）',
+    # 并发数量（= 同时进行的任务数）
+    'YOUTUBE_DOWNLOAD_THREADS': '下载并发数量',
+    'UPLOAD_THREADS': '上传并发数量',
 }
 
 
@@ -984,6 +1010,71 @@ def _format_settings_revert_message(reverts: list) -> str:
     if not parts:
         return ''
     return '以下设置项超出允许范围，已回退后再保存：' + '；'.join(parts) + '。'
+
+
+RATE_LIMIT_UNIT_CHOICES = ('K', 'M')
+
+
+def _split_rate_limit_for_form(value):
+    """把配置里的限速字符串拆成 (数值, 单位)，供「数值 + 单位」控件回显。
+
+    100K -> ('100', 'K')；1.27M -> ('1.27', 'M')；512 字节 -> ('0.5', 'K')。
+    解析不了（旧配置留了脏值）时返回空数值，页面显示为空即「不限速」。
+    """
+    try:
+        parsed = parse_rate_limit(value)
+    except ValueError:
+        parsed = None
+    if not parsed:
+        return '', 'M'
+    if parsed >= 1024 * 1024:
+        unit, factor = 'M', 1024 * 1024
+    else:
+        unit, factor = 'K', 1024
+    text = f'{parsed / factor:.2f}'.rstrip('0').rstrip('.')
+    return (text or '0.01'), unit
+
+
+def _rate_limit_preview(config):
+    """设置页提示条用的摊分说明。
+
+    下载限速现在按「当前实际在下载的任务数」动态分配（见 modules/download_rate_controller），
+    而不是按「并发上限」死板平分：并发设 4 但只有 1 个在下载时那个任务吃满全部带宽，
+    多个同时下载时自动均分，总速率恰好等于设定值。并发上限只决定「最多同时下载几个」。
+    这里展示的是「此刻」的真实分配；修改限速/并发后无需重启，运行中的任务会自动以新速率续传。
+    """
+    cfg = config or {}
+    download_total = None
+    for key in ('DOWNLOAD_RATE_LIMIT', 'YOUTUBE_THROTTLED_RATE'):
+        try:
+            parsed = parse_rate_limit(cfg.get(key))
+        except ValueError:
+            parsed = None
+        if parsed:
+            download_total = parsed
+            break
+    try:
+        upload_total = parse_rate_limit(cfg.get('UPLOAD_RATE_LIMIT'))
+    except ValueError:
+        upload_total = None
+    max_tasks = get_download_concurrency(cfg)
+    # 实际在下载的任务数（动态分配依据）；无控制器时用并发上限兜底
+    active = max_tasks
+    try:
+        from modules.download_rate_controller import get_download_rate_controller
+        active = get_download_rate_controller().active_count() or max_tasks
+    except Exception:
+        pass
+    per_task, per_connection = split_download_rate(download_total, cfg, active_count=active)
+    return {
+        'download_total': format_rate_limit(download_total) if download_total else '',
+        'download_per_task': format_rate_limit(per_task) if per_task else '',
+        'download_per_connection': format_rate_limit(per_connection) if per_connection else '',
+        'download_tasks': active,
+        'download_max_tasks': max_tasks,
+        'upload_total': format_rate_limit(upload_total) if upload_total else '',
+        'upload_tasks': get_upload_concurrency(cfg),
+    }
 
 
 def _perform_settings_save(form_data: dict, uploads: dict, operation_id: str | None = None) -> dict:
@@ -1282,8 +1373,66 @@ def _perform_settings_save(form_data: dict, uploads: dict, operation_id: str | N
                     '已勾选「使用预设标签」但没有填写任何标签，当前等同于未启用。'
                 )
 
+        # 上传/下载限速：页面是「数值 + 单位（K/M）」两个控件，这里先拼成 500K / 1M。
+        # 隐藏域 _VALUE 存在说明控件可用（总开关关掉时控件被 disabled，不会提交），
+        # 此时以页面上的数值为准；数值清空即恢复「不限速」。
+        for _rate_key in ('DOWNLOAD_RATE_LIMIT', 'UPLOAD_RATE_LIMIT'):
+            _value_key = f'{_rate_key}_VALUE'
+            _unit_key = f'{_rate_key}_UNIT'
+            _value_submitted = _value_key in form_data
+            _raw_value = str(form_data.pop(_value_key, '') or '').strip()
+            _raw_unit = str(form_data.pop(_unit_key, '') or '').strip().upper()
+            if _raw_unit not in ('K', 'M'):
+                _raw_unit = 'K'
+            if _value_submitted:
+                form_data[_rate_key] = f'{_raw_value}{_raw_unit}' if _raw_value else ''
+
+        # 上传/下载限速：规范成 500K / 1M 这种写法；非法输入不落盘，直接回退为「不限速」并提示
+        for _rate_key, _rate_label in (('DOWNLOAD_RATE_LIMIT', '下载限速'), ('UPLOAD_RATE_LIMIT', '上传限速')):
+            if _rate_key not in form_data:
+                continue
+            _submitted_rate = str(form_data.get(_rate_key) or '').strip()
+            try:
+                form_data[_rate_key] = normalize_rate_limit(_submitted_rate)
+            except ValueError:
+                form_data[_rate_key] = ''
+                _append_settings_message(
+                    messages, 'warning',
+                    f'{_rate_label}「{_submitted_rate}」格式无效：支持 500K / 1M / 2.5M 这类写法，'
+                    '也可以直接填字节数；已重置为不限速。'
+                )
+
+        # 限速时间段：规范成 HH:MM；非法输入回退默认值并提示
+        for _time_key, _time_label, _time_default in (
+            ('RATE_LIMIT_START_TIME', '限速开始时间', DEFAULT_WINDOW_START),
+            ('RATE_LIMIT_END_TIME', '限速结束时间', DEFAULT_WINDOW_END),
+        ):
+            if _time_key not in form_data:
+                continue
+            _submitted_time = str(form_data.get(_time_key) or '').strip()
+            try:
+                form_data[_time_key] = normalize_time_of_day(_submitted_time, _time_default)
+            except ValueError:
+                form_data[_time_key] = _time_default
+                _append_settings_message(
+                    messages, 'warning',
+                    f'{_time_label}「{_submitted_time}」不是有效时间，已重置为 {_time_default}。'
+                )
+
         _persist_settings_uploads(form_data, uploads)
         updated_config = update_config(form_data)
+        # 限速配置有 3 秒缓存，保存后立即失效，避免刚改完仍按旧速率跑
+        try:
+            invalidate_rate_limit_cache()
+        except Exception:
+            pass
+        # 下载限速改为「按实际在下载的任务数动态分配」：保存设置后立即让在跑的下载以新速率
+        # 断点续传重拉，无需重启服务。
+        try:
+            from modules.download_rate_controller import get_download_rate_controller
+            get_download_rate_controller().notify_config_changed()
+        except Exception:
+            pass
 
         try:
             from modules.task_manager import get_global_task_processor, count_pending_preempted_tasks
@@ -3102,22 +3251,18 @@ _BATCH_UPLOAD_MAX_WORKERS = 10  # 兜底上限，防止设置被填成离谱的�
 
 
 def _resolve_upload_concurrency_limit(config=None):
-    """读取「最大并发上传数」。
+    """读取「上传并发数量」（= 同时上传的任务数）。
 
-    设置位置：设置 → 运维与安全 → 资源控制 → 最大并发上传数（MAX_CONCURRENT_UPLOADS）。
+    设置位置：设置 → 网络与下载 → 高级选项 → 上传并发数量（UPLOAD_THREADS）。
+    「运维与安全 → 资源控制」里的旧并发设置已经取消，这里不再读
+    MAX_CONCURRENT_UPLOADS。
     优先用本次保存后的配置，取不到再回落到 config.json。
     """
-    value = None
+    from modules.concurrency import get_upload_concurrency
+
     try:
-        if isinstance(config, dict):
-            value = config.get('MAX_CONCURRENT_UPLOADS')
-        if value in (None, ''):
-            value = load_config().get('MAX_CONCURRENT_UPLOADS')
+        return min(_BATCH_UPLOAD_MAX_WORKERS, get_upload_concurrency(config))
     except Exception:
-        value = None
-    try:
-        return min(_BATCH_UPLOAD_MAX_WORKERS, max(1, int(value)))
-    except (TypeError, ValueError):
         return 1
 
 
@@ -3219,7 +3364,7 @@ def batch_upload_tasks_route():
         return jsonify({'success': False,
                         'message': f'选中的 {len(task_ids)} 个任务中没有可上传的任务{reason_text}'}), 400
 
-    # 读取设置 → 运维与安全 → 资源控制 → 最大并发上传数
+    # 并发上限跟随「上传并发数量」（设置 → 网络与下载 → 高级选项）
     concurrency_limit = _resolve_upload_concurrency_limit(config)
 
     # 入队（由后台工作线程按并发上限逐个取出执行）
@@ -4372,9 +4517,26 @@ def settings():
     except Exception as exc:
         logger.debug("获取内置 Prompt 预览失败，将不显示预览: %s", exc)
         builtin_prompts = {}
+    _download_rate_value, _download_rate_unit = _split_rate_limit_for_form(
+        config.get('DOWNLOAD_RATE_LIMIT') or config.get('YOUTUBE_THROTTLED_RATE')
+    )
+    _upload_rate_value, _upload_rate_unit = _split_rate_limit_for_form(
+        config.get('UPLOAD_RATE_LIMIT')
+    )
     return render_template(
         'settings.html',
         config=config,
+        rate_limit_state=rate_limit_status(config),
+        rate_limit_preview=_rate_limit_preview(config),
+        rate_limit_units=RATE_LIMIT_UNIT_CHOICES,
+        download_rate_value=_download_rate_value,
+        download_rate_unit=_download_rate_unit,
+        upload_rate_value=_upload_rate_value,
+        upload_rate_unit=_upload_rate_unit,
+        download_threads_value=get_download_concurrency(config),
+        upload_threads_value=get_upload_concurrency(config),
+        max_download_threads=MAX_DOWNLOAD_THREADS,
+        max_upload_threads=MAX_UPLOAD_THREADS,
         tgbot_token_state=_tgbot_api_token_state(config),
         tgbot_token_csrf_token=_ensure_tgbot_token_csrf_token(),
         whisper_languages=WHISPER_LANGUAGE_LIST,
@@ -4769,6 +4931,12 @@ def reset_settings():
         if keys:
             # 重置指定项
             reset_specific_config(keys)
+            # 若重置涉及下载限速/并发，立即让在跑的下载以新速率续传（无需重启服务）
+            try:
+                from modules.download_rate_controller import get_download_rate_controller
+                get_download_rate_controller().notify_config_changed()
+            except Exception:
+                pass
             flash('当前页面的设置已重置为默认值。', 'success')
         else:
             # 如果未指定keys，则不执行任何操作或返回错误

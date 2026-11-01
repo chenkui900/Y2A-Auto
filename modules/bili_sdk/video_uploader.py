@@ -28,6 +28,12 @@ from .exceptions.ResponseCodeException import ResponseCodeException
 
 _API = get_api("video_uploader")
 
+# 可选的分块限速钩子：由上层（modules.rate_limiter）提供，SDK 独立使用时为 None。
+try:  # pragma: no cover - 取决于宿主工程结构
+    from ..rate_limiter import pace_async_upload as _pace_async_upload
+except Exception:  # pragma: no cover
+    _pace_async_upload = None
+
 
 async def upload_cover(cover: Picture, credential: Credential) -> str:
     """
@@ -1221,11 +1227,20 @@ class VideoUploader(AsyncEvent):
         max_attempts = 5
         retryable_statuses = {408, 429, 500, 502, 503, 504}
 
+        # 上传限速（设置 › 网络与下载 › 上传限速）：按分块大小预约通道时间。
+        # 用 await 等待，不阻塞事件循环；重试复用同一块，不重复记账。
+        if _pace_async_upload is not None and real_chunk_size:
+            try:
+                await _pace_async_upload(real_chunk_size)
+            except Exception:
+                pass
+
         for attempt in range(1, max_attempts + 1):
             attempt_data = {
                 **chunk_event_callback_data,
                 "attempt": attempt,
                 "max_attempts": max_attempts,
+                "size": real_chunk_size,
             }
             self.dispatch(VideoUploaderEvents.PRE_CHUNK.value, attempt_data)
 

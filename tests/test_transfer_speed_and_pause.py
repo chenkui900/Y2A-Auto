@@ -26,6 +26,12 @@ class TransferSpeedAndPauseTests(unittest.TestCase):
         tm.DB_PATH = os.path.join(tmp_dir, 'tasks.db')
         tm.init_db()
         tm.set_download_paused(False, persist=False)
+        # 其他用例可能留下正在收尾的补位线程，全局补位锁被占用时 pump 会直接跳过；
+        # 先等它释放，避免这条用例被无关的时序噪声打成失败。
+        for _ in range(100):
+            if not tm._QUEUE_PUMP_LOCK.locked():
+                break
+            time.sleep(0.05)
 
     def tearDown(self):
         self.tm.set_download_paused(self._orig_paused, persist=False)

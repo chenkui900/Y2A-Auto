@@ -138,10 +138,18 @@ DEFAULT_CONFIG = {
     "YOUTUBE_PROXY_URL": "",  # 代理地址，格式：http://proxy.example.com:8080 或 socks5://127.0.0.1:1080
     "YOUTUBE_PROXY_USERNAME": "",  # 代理用户名（可选）
     "YOUTUBE_PROXY_PASSWORD": "",  # 代理密码（可选）
-    "YOUTUBE_DOWNLOAD_THREADS": 4,  # yt-dlp下载线程数（并发片段数）
+    "YOUTUBE_DOWNLOAD_THREADS": 4,  # 下载并发数量：同时下载的任务数
+    "UPLOAD_THREADS": 1,  # 上传并发数量：同时上传的任务数
     "YOUTUBE_DOWNLOAD_QUALITY_MODE": _YOUTUBE_DOWNLOAD_QUALITY_MODE_DEFAULT,  # highest|manual
     "YOUTUBE_DOWNLOAD_MAX_HEIGHT": _YOUTUBE_DOWNLOAD_MAX_HEIGHT_DEFAULT,  # 手动画质上限
-    "YOUTUBE_THROTTLED_RATE": "",  # 限制下载速度，格式如：1M、500K等，留空不限制
+    "YOUTUBE_THROTTLED_RATE": "",  # 旧版下载限速键（仅作兼容回退，新键见 DOWNLOAD_RATE_LIMIT）
+    # 传输限速：上传/下载各自独立，格式如 500K、1M、2.5M；留空或 0 表示不限制
+    "RATE_LIMIT_ENABLED": True,  # 限速总开关（关闭后上传下载都不限速，但保留已填速率）
+    "RATE_LIMIT_TIME_ENABLED": False,  # 是否只在指定时间段内限速
+    "RATE_LIMIT_START_TIME": "22:00",  # 限速时段起点（HH:MM，可跨零点）
+    "RATE_LIMIT_END_TIME": "06:00",  # 限速时段终点（HH:MM）
+    "DOWNLOAD_RATE_LIMIT": "",  # 下载总限速（按下载并发数量一级摊分到每个任务）
+    "UPLOAD_RATE_LIMIT": "",  # 上传限速（分块上传时按块大小节流）
     # 外部工具路径
     "FFMPEG_LOCATION": "",  # 可选：覆盖 ffmpeg 可执行文件路径；留空则使用项目内置版本
     "FFMPEG_AUTO_DOWNLOAD": True,  # 仅在 Windows 且缺失时尝试联网补齐 ffmpeg/ 目录
@@ -185,9 +193,11 @@ DEFAULT_CONFIG = {
     "SUBTITLE_QC_SAMPLE_MAX_ITEMS": 80,  # AI 抽样条目上限（实际会按边界程度自适应收缩）
     "SUBTITLE_QC_MAX_CHARS": 9000,  # AI 送检最大字符数上限（实际会按边界程度自适应收缩）
     "SUBTITLE_QC_TIMEOUT_SECONDS": 120,  # 质检单次 AI 调用超时（秒），范围 10–600；未配置/非法回退 120
-    # 并发控制配置
-    "MAX_CONCURRENT_TASKS": 2,  # 最大并发任务数
-    "MAX_CONCURRENT_UPLOADS": 1,  # 最大并发上传数
+    # 并发控制配置（已废弃，仅保留键以兼容旧配置文件）
+    # 并发上限现在跟随「下载并发数量 / 上传并发数量」，见 modules/concurrency.py；
+    # 这里的两个旧键不再被任何调度逻辑读取。
+    "MAX_CONCURRENT_TASKS": 2,  # 已废弃：改由 YOUTUBE_DOWNLOAD_THREADS 决定
+    "MAX_CONCURRENT_UPLOADS": 1,  # 已废弃：改由 UPLOAD_THREADS 决定
     "STUCK_TASK_CHECK_INTERVAL_SECONDS": 300,  # 自动扫描并恢复卡住任务的时间间隔（秒）
     # 视频转码相关（硬编默认输出 HEVC/H.265，CPU 保持 H.264）
     "VIDEO_ENCODER": "auto",  # auto/cpu/nvidia/intel/amd - 自动检测或指定编码器

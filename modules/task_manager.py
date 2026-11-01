@@ -62,6 +62,8 @@ from .tag_presets import (
     parse_preset_tags,
     resolve_upload_tags,
 )
+from .concurrency import get_download_concurrency, get_upload_concurrency
+from .download_rate_controller import get_download_rate_controller
 import subprocess
 from typing import Any, Dict
 from werkzeug.security import safe_join
@@ -877,16 +879,17 @@ def recover_interrupted_tasks_to_pending():
     try:
         placeholders = ','.join(['?'] * len(processing_states))
         cursor = conn.execute(
-            f'SELECT id, status, upload_target, acfun_upload_response, bilibili_upload_response, '
-            f'upload_progress, download_progress, video_path_local FROM tasks WHERE status IN ({placeholders})',
+            f'SELECT * FROM tasks WHERE status IN ({placeholders})',
             tuple(processing_states),
         )
         rows = cursor.fetchall() or []
         if not rows: return 0
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         recovered = 0
+        to_upload = 0
         for row in rows:
             task_id = row['id']
+            task_dict = dict(row)
             upload_target = normalize_upload_target(row['upload_target'])
             has_acfun_resp = bool(row['acfun_upload_response'])
             has_bilibili_resp = bool(row['bilibili_upload_response'])
@@ -916,10 +919,23 @@ def recover_interrupted_tasks_to_pending():
                 conn.execute('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?', (TASK_STATES['FAILED'], now_str, task_id))
                 recovered += 1
                 continue
+            # 上传中断 / 下载已完成只差上传：直接回上传队列（独立于下载并发），
+            # 不能再落成 pending 去和下载任务抢「下载并发数量」配额。
+            if row['status'] == TASK_STATES['UPLOADING'] or task_can_enter_upload_queue(task_dict):
+                conn.execute(
+                    '''UPDATE tasks SET status = ?, updated_at = ?, download_progress = COALESCE(download_progress, ?),
+                       upload_progress = ?, error_message = NULL, error_at = NULL, preempted = 0,
+                       queue_priority = 1, queue_position = NULL WHERE id = ?''',
+                    (TASK_STATES['READY_FOR_UPLOAD'], now_str, ratio_value, QUEUE_WAITING_MARK, task_id),
+                )
+                recovered += 1
+                to_upload += 1
+                continue
             conn.execute('''UPDATE tasks SET status = ?, updated_at = ?, download_progress = COALESCE(download_progress, ?), subtitle_qc_failed = 0, subtitle_qc_reason = NULL, subtitle_qc_score = NULL, subtitle_qc_checked_at = NULL, subtitle_quality_state = NULL, asr_warning_message = NULL, subtitle_warning_message = NULL WHERE id = ?''', (TASK_STATES['PENDING'], now_str, ratio_value, task_id))
             recovered += 1
         conn.commit()
-        if recovered: logger.info(f"断点续跑：已恢复 {recovered} 个处理中任务为 pending")
+        if recovered:
+            logger.info(f"断点续跑：已恢复 {recovered} 个处理中任务（其中 {to_upload} 个已下载完成、转入上传队列）")
         return recovered
     except Exception as e:
         logger.warning(f"断点续跑：恢复处理中任务失败（忽略）：{e}")
@@ -2333,8 +2349,8 @@ class UploadSlotLimiter:
     1. 上限可原地调整，不再重建对象。重建对象会让正在等待旧对象的线程
        永远等不到唤醒，同时旧的持锁线程与新对象的持锁线程叠加，
        出现「设置是 1、实际却在上传 2 个」的假象。
-    2. 每次获取配额前（最多 5 秒一次）从 config.json 重读
-       MAX_CONCURRENT_UPLOADS，改完设置无需重启即生效。
+    2. 每次获取配额前（最多 5 秒一次）从 config.json 重读「上传并发数量」
+       （UPLOAD_THREADS），改完设置无需重启即生效。
     3. 同一线程可重入（批量队列先占配额、内部上传再占一次不会死锁）。
     4. 记录当前占用数，日志里能直接看到 占用/上限。
     """
@@ -2373,12 +2389,12 @@ class UploadSlotLimiter:
         self._last_reload = now
         try:
             from modules.config_manager import load_config
-            latest = _as_int(load_config().get('MAX_CONCURRENT_UPLOADS', self._limit), self._limit, minimum=1)
+            latest = get_upload_concurrency(load_config())
             if latest != self._limit:
-                logger.info(f"检测到「最大并发上传数」设置为 {latest}，立即生效（原 {self._limit}）")
+                logger.info(f"检测到「上传并发数量」调整为 {latest}，上传并发立即生效（原 {self._limit}）")
                 self.set_limit(latest)
         except Exception as e:
-            logger.debug(f"读取「最大并发上传数」失败，沿用 {self._limit}: {e}")
+            logger.debug(f"读取「上传并发数量」失败，沿用 {self._limit}: {e}")
 
     def acquire(self, label='上传任务', cancel_check=None, blocking=True):
         ident = threading.get_ident()
@@ -2416,7 +2432,7 @@ class UploadSlotLimiter:
         self._last_reload = now
         try:
             from modules.config_manager import load_config
-            latest = _as_int(load_config().get('MAX_CONCURRENT_UPLOADS', self._limit), self._limit, minimum=1)
+            latest = get_upload_concurrency(load_config())
             if latest != self._limit:
                 self._limit = latest
                 if latest > self._active:
@@ -2605,6 +2621,62 @@ def _download_progress_ratio(task):
     return ratio
 
 
+# 上传前必须跑完的流水线阶段：只下载完、但翻译/标签/分区还没做的任务
+# 不能直接丢进上传队列，否则会传上去一个信息不全的稿件。
+UPLOAD_PREREQUISITE_STAGES = (
+    PIPELINE_STAGE_FETCH_INFO,
+    PIPELINE_STAGE_TRANSLATE_CONTENT,
+    PIPELINE_STAGE_GENERATE_TAGS,
+    PIPELINE_STAGE_RECOMMEND_PARTITION,
+    PIPELINE_STAGE_DOWNLOAD_VIDEO,
+)
+
+
+def task_can_enter_upload_queue(task, config=None):
+    """任务是否「只差上传」：下载完成、上传前流水线跑完、且还没传过。
+
+    这类任务不该再占用下载并发配额排队——否则界面会一直显示「等待处理」，
+    下载比例明明 100% 却永远等不到上传。
+    """
+    if not isinstance(task, dict):
+        try:
+            task = dict(task)
+        except (TypeError, ValueError):
+            return False
+    status = str(task.get('status') or '')
+    if status not in (TASK_STATES['PENDING'], TASK_STATES['READY_FOR_UPLOAD'], TASK_STATES['UPLOADING']):
+        return False
+    video_path = task.get('video_path_local')
+    if not (isinstance(video_path, str) and video_path.strip()):
+        return False
+    if not os.path.exists(video_path):
+        return False
+    if _download_progress_ratio(task) < 0.999:
+        return False
+    # 任一平台已经有投稿响应 → 已经传过，交给人工/失败重试处理，不自动再传一遍
+    if task.get('acfun_upload_response') or task.get('bilibili_upload_response'):
+        return False
+    # 重启时正在上传的任务：直接回上传队列，不再要求重跑流水线校验
+    if status == TASK_STATES['UPLOADING']:
+        return True
+    if config is None:
+        try:
+            from modules.config_manager import load_config
+            config = load_config()
+        except Exception:
+            config = {}
+    try:
+        completed = _get_completed_stages(task, config)
+    except Exception:
+        completed = set()
+    required = list(UPLOAD_PREREQUISITE_STAGES)
+    if config.get('CONTENT_MODERATION_ENABLED', False):
+        required.append(PIPELINE_STAGE_MODERATE_CONTENT)
+    if config.get('SUBTITLE_TRANSLATION_ENABLED', False) and not _is_subtitle_stage_rejected(task, config):
+        required.append(PIPELINE_STAGE_TRANSLATE_SUBTITLE)
+    return all(stage in completed for stage in required)
+
+
 def task_download_ratio(task):
     """列表展示用的「已下载比例」0~1，所有状态都给得出值。
 
@@ -2772,6 +2844,53 @@ def pump_upload_queue(reason='触发'):
         return 0
     finally:
         _QUEUE_PUMP_LOCK.release()
+
+
+def promote_downloaded_pending_tasks(config=None):
+    """把「只差上传」的等待处理任务转入上传队列。
+
+    下载已经 100%、上传前流水线也跑完的任务如果继续当普通 pending 排队，
+    会白等下载并发配额（= 下载并发数量），界面上就是「下载 100% 却
+    一直显示等待处理、永远不开始上传」。上传队列有自己独立的并发配额
+    （= 上传并发数量），直接把这类任务交过去即可。
+    """
+    if config is None:
+        try:
+            from modules.config_manager import load_config
+            config = load_config()
+        except Exception:
+            config = {}
+    promoted = 0
+    try:
+        candidates = get_tasks_by_status(TASK_STATES['PENDING'])
+    except Exception as e:
+        logger.debug(f"[上传队列] 读取待处理任务失败（忽略）: {e}")
+        return 0
+    for task in candidates:
+        tid = task.get('id')
+        if not tid or is_task_cancelled(tid):
+            continue
+        try:
+            if not task_can_enter_upload_queue(task, config):
+                continue
+        except Exception:
+            continue
+        update_task(
+            tid,
+            status=TASK_STATES['READY_FOR_UPLOAD'],
+            upload_progress=QUEUE_WAITING_MARK,
+            error_message=None,
+            preempted=0,
+            queue_priority=1,
+            queue_position=None,
+            suppress_notification=True,
+            silent=True,
+        )
+        promoted += 1
+        logger.info(f"[上传队列] 任务 {tid[:8]} 已下载完成，自动转入上传队列（不再占用下载并发配额）")
+    if promoted:
+        pump_upload_queue(reason='已下载任务自动转上传')
+    return promoted
 
 
 def poll_scheduled_uploads():
@@ -3039,8 +3158,8 @@ def validate_cookies(cookies_path, service_name="Unknown"):
 class TaskProcessor:
     def __init__(self, config=None):
         self.config = dict(config or {})
-        self._current_max_concurrent_tasks = _as_int(self.config.get('MAX_CONCURRENT_TASKS', 2), 2, minimum=1)
-        self._current_max_concurrent_uploads = _as_int(self.config.get('MAX_CONCURRENT_UPLOADS', 1), 1, minimum=1)
+        self._current_max_concurrent_tasks = get_download_concurrency(self.config)
+        self._current_max_concurrent_uploads = get_upload_concurrency(self.config)
         self._runtime_limit_refresh_pending = False
         self._last_deferred_limit_signature = None
         init_upload_semaphore(self._current_max_concurrent_uploads)
@@ -3055,6 +3174,11 @@ class TaskProcessor:
         # 启动时修一次：没有视频却停在「准备上传」的任务会把上传队列堵死
         try: repair_video_less_ready_tasks()
         except Exception as _e: logger.debug(f"启动数据修复失败（忽略）: {_e}")
+        # 已下载完成、只差上传的 pending 任务：启动后立刻转上传队列，不等首轮扫描
+        try: promote_downloaded_pending_tasks(self.config)
+        except Exception as _e: logger.debug(f"启动转上传失败（忽略）: {_e}")
+        try: pump_upload_queue('重启恢复')
+        except Exception as _e: logger.debug(f"重启后上传补位失败（忽略）: {_e}")
         self._register_periodic_jobs()
 
     def _register_periodic_jobs(self):
@@ -3070,7 +3194,10 @@ class TaskProcessor:
         except Exception as e: logger.warning(f"注册卡住任务扫描失败（不影响主流程）：{e}")
 
     def _refresh_runtime_limits(self, force=False):
-        """把设置里的并发值同步到运行中的配额对象。
+        """把「下载并发数量 / 上传并发数量」同步到运行中的配额对象。
+
+        并发上限不再来自「运维与安全 → 资源控制」，而是跟随并发数量设置：
+        下载并发数量 = 同时下载任务数，上传并发数量 = 同时上传任务数。
 
         以前只在「没有任何任务在跑」时才敢改上限（改上限要重建信号量，重建会让
         正在等待的线程永远等不到），所以用户改完必须重启服务。现在配额对象支持
@@ -3078,8 +3205,8 @@ class TaskProcessor:
         - 调大：马上放行排队中的任务，不用等下一轮 30 秒扫描；
         - 调小：马上收紧，超出的正在处理的任务转入「准备上传」队列最前面。
         """
-        desired_tasks = _as_int(self.config.get('MAX_CONCURRENT_TASKS', 2), 2, minimum=1)
-        desired_uploads = _as_int(self.config.get('MAX_CONCURRENT_UPLOADS', 1), 1, minimum=1)
+        desired_tasks = get_download_concurrency(self.config)
+        desired_uploads = get_upload_concurrency(self.config)
         if (desired_tasks == self._current_max_concurrent_tasks
                 and desired_uploads == self._current_max_concurrent_uploads
                 and not self._runtime_limit_refresh_pending):
@@ -3093,7 +3220,8 @@ class TaskProcessor:
             self._runtime_limit_refresh_pending = False
             self._last_deferred_limit_signature = None
         logger.info(
-            f"并发配置已生效（无需重启服务） - 最大并发任务: {desired_tasks}, 最大并发上传: {desired_uploads}"
+            f"并发配置已生效（无需重启服务） - 同时下载任务(下载并发数量): {desired_tasks}, "
+            f"同时上传任务(上传并发数量): {desired_uploads}"
         )
         if desired_tasks < previous_tasks:
             try:
@@ -3483,6 +3611,12 @@ class TaskProcessor:
             logger.debug(f"输出等待队列顺序失败（忽略）: {e}")
 
     def _check_and_start_next_pending_task(self):
+        # 已下载完成、只差上传的任务先转上传队列：上传并发独立于下载并发，
+        # 不能因为下载配额满了就把「下载 100%」的任务一直卡在等待处理。
+        try:
+            promote_downloaded_pending_tasks(self.config)
+        except Exception as e:
+            logger.debug(f"[上传队列] 已下载任务转上传失败（忽略）: {e}")
         # 上传队列补位：进程启动恢复后、以及每 30 秒扫描时，把排队的上传任务接上
         try:
             pump_upload_queue('定时扫描')
@@ -3496,7 +3630,8 @@ class TaskProcessor:
         try:
             from modules.config_manager import load_config
             latest_config = load_config()
-            self.max_concurrent_tasks = int(latest_config.get('MAX_CONCURRENT_TASKS', self.max_concurrent_tasks))
+            # 并发跟随「下载并发数量」，改完设置无需重启即可生效
+            self.max_concurrent_tasks = get_download_concurrency(latest_config)
         except Exception as e:
             logger.debug(f"读取最新配置失败，沿用当前配置: {e}")
         
@@ -3508,7 +3643,7 @@ class TaskProcessor:
             logger.debug("下载已暂停：跳过本轮待处理任务启动（上传队列不受影响）")
             return
 
-        max_concurrent = _as_int(self.config.get('MAX_CONCURRENT_TASKS', 2), 2, minimum=1)
+        max_concurrent = get_download_concurrency(self.config)
         if _should_reduce_concurrency():
             max_concurrent = max(1, max_concurrent // 2)
             logger.info(f"检测到高内存使用，降低并发数至 {max_concurrent}")
@@ -3662,6 +3797,9 @@ class TaskProcessor:
         task_logger.info(f"审核通过，开始下载视频文件: {youtube_url}")
         update_task(task_id, status=TASK_STATES['DOWNLOADING'])
         _raise_if_cancelled(task_id, task_logger)
+        # 注册到下载限速控制器：让总带宽按「当前实际在下载的任务数」动态分配，
+        # 任务结束后注销；实现「并发设 4 但只有 1 个在下载时吃满带宽、多个同时下载时自动均分」。
+        get_download_rate_controller().register(task_id)
         cookies_path = resolve_youtube_cookies_path(self.config, task_logger)
         if cookies_path:
             is_valid, error_msg = validate_cookies(cookies_path, "YouTube")
@@ -3688,38 +3826,41 @@ class TaskProcessor:
             )
 
         last_error = ''
-        for attempt in (1, 2):
-            try:
-                cancel_event = get_task_cancel_event(task_id)
-                success, result = download_video_data(youtube_url, task_id, cookies_path, only_video=True, progress_callback=progress_callback, cancel_event=cancel_event)
-            except Exception as e:
+        try:
+            for attempt in (1, 2):
+                try:
+                    cancel_event = get_task_cancel_event(task_id)
+                    success, result = download_video_data(youtube_url, task_id, cookies_path, only_video=True, progress_callback=progress_callback, cancel_event=cancel_event)
+                except Exception as e:
+                    if is_task_cancelled(task_id): raise TaskCancelledError("任务已取消")
+                    task_logger.error(f"下载视频文件时发生异常: {str(e)}")
+                    success, result = False, str(e)
                 if is_task_cancelled(task_id): raise TaskCancelledError("任务已取消")
-                task_logger.error(f"下载视频文件时发生异常: {str(e)}")
-                success, result = False, str(e)
-            if is_task_cancelled(task_id): raise TaskCancelledError("任务已取消")
-            if success:
-                task_logger.info("视频文件下载成功")
-                task = get_task(task_id)
-                update_data = {'status': TASK_STATES['DOWNLOADED'], 'video_path_local': result.get('video_path', ''), 'upload_progress': None, 'download_progress': 1.0}
-                if task is not None:
-                    if result.get('metadata_path') and not task.get('metadata_json_path_local'): update_data['metadata_json_path_local'] = result.get('metadata_path')
-                    if result.get('cover_path') and not task.get('cover_path_local'): update_data['cover_path_local'] = result.get('cover_path')
-                update_task(task_id, **update_data)
-                return True
-            last_error = str(result)
-            task_logger.error(f"视频文件下载失败（第 {attempt} 次）: {last_error}")
-            if attempt == 1:
-                if is_download_paused():
-                    # 第一次失败恰好赶上用户按了暂停：不再重试，退回队列等恢复
-                    task_logger.info("下载已暂停：不再重试下载，任务退回等待队列")
-                    raise TaskDeferredError("下载已暂停")
-                # 续传失败多半是碎片损坏，清掉碎片再整段重下一次
-                if self._clean_partial_downloads(task_id, task_logger) > 0:
-                    update_task(task_id, status=TASK_STATES['DOWNLOADING'], upload_progress='0.0%', download_progress=0.0)
-                    continue
-            break
-        update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"下载视频失败: {last_error}")
-        return False
+                if success:
+                    task_logger.info("视频文件下载成功")
+                    task = get_task(task_id)
+                    update_data = {'status': TASK_STATES['DOWNLOADED'], 'video_path_local': result.get('video_path', ''), 'upload_progress': None, 'download_progress': 1.0}
+                    if task is not None:
+                        if result.get('metadata_path') and not task.get('metadata_json_path_local'): update_data['metadata_json_path_local'] = result.get('metadata_path')
+                        if result.get('cover_path') and not task.get('cover_path_local'): update_data['cover_path_local'] = result.get('cover_path')
+                    update_task(task_id, **update_data)
+                    return True
+                last_error = str(result)
+                task_logger.error(f"视频文件下载失败（第 {attempt} 次）: {last_error}")
+                if attempt == 1:
+                    if is_download_paused():
+                        # 第一次失败恰好赶上用户按了暂停：不再重试，退回队列等恢复
+                        task_logger.info("下载已暂停：不再重试下载，任务退回等待队列")
+                        raise TaskDeferredError("下载已暂停")
+                    # 续传失败多半是碎片损坏，清掉碎片再整段重下一次
+                    if self._clean_partial_downloads(task_id, task_logger) > 0:
+                        update_task(task_id, status=TASK_STATES['DOWNLOADING'], upload_progress='0.0%', download_progress=0.0)
+                        continue
+                break
+            update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"下载视频失败: {last_error}")
+            return False
+        finally:
+            get_download_rate_controller().unregister(task_id)
 
     def _recover_cover_path(self, task_id, cover_path, task_logger):
         downloads_dir_real = os.path.realpath(DOWNLOADS_DIR)
@@ -6297,17 +6438,44 @@ def start_task(task_id, config=None):
             from flask import current_app
             if 'Y2A_SETTINGS' in current_app.config: config = current_app.config['Y2A_SETTINGS']
         except (ImportError, RuntimeError): config = {}
+    # 已经下载完、只差上传的任务：直接进上传队列。不能让它去抢下载并发配额，
+    # 更不能让 process_task 从头再跑一遍下载/翻译。
+    if task['status'] != TASK_STATES['READY_FOR_UPLOAD'] and task_can_enter_upload_queue(task, config):
+        update_task(
+            task_id,
+            status=TASK_STATES['READY_FOR_UPLOAD'],
+            upload_progress=QUEUE_WAITING_MARK,
+            preempted=0,
+            queue_priority=1,
+            queue_position=None,
+            error_message=None,
+            suppress_notification=True,
+            silent=True,
+        )
+        try:
+            pump_upload_queue(reason='点击开始时转上传队列')
+        except Exception:
+            pass
+        logger.info(f"任务 {task_id} 已下载完成，直接转入上传队列（不占用下载并发配额）")
+        return True
     processor = get_global_task_processor(config)
     job_id = processor.schedule_task(task_id)
     if job_id == TASK_WAITING_FOR_SLOT:
         # 并发已满：不丢请求，也不无限重试。把任务放回「等待处理」队首，
         # 空出配额后由扫描器优先启动；暂停任务点「继续」后也能立刻看到反馈。
-        if task['status'] == TASK_STATES['READY_FOR_UPLOAD']:
+        # 例外：已下载完成、只差上传的任务和下载并发无关，直接回上传队列，
+        # 否则会显示「等待处理」却永远等不到上传。
+        upload_only = task['status'] == TASK_STATES['READY_FOR_UPLOAD'] or task_can_enter_upload_queue(task, config)
+        if upload_only:
+            already_queued = task['status'] == TASK_STATES['READY_FOR_UPLOAD']
             update_task(
                 task_id,
-                upload_progress=f"{QUEUE_PREEMPT_MARK}（等待并发配额）…",
-                preempted=1,
-                queue_priority=2,
+                status=TASK_STATES['READY_FOR_UPLOAD'],
+                upload_progress=(f"{QUEUE_PREEMPT_MARK}（等待上传配额）…" if already_queued else QUEUE_WAITING_MARK),
+                preempted=1 if already_queued else 0,
+                queue_priority=2 if already_queued else 1,
+                queue_position=None,
+                error_message=None,
                 suppress_notification=True,
                 silent=True,
             )
@@ -6316,6 +6484,11 @@ def start_task(task_id, config=None):
                 _refresh_queue_positions()
             except Exception:
                 pass
+            try:
+                pump_upload_queue(reason='点击开始时转上传队列')
+            except Exception:
+                pass
+            logger.info(f"任务 {task_id} 已下载完成，转入上传队列（不受下载并发限制）")
         else:
             update_task(
                 task_id,
@@ -6327,7 +6500,7 @@ def start_task(task_id, config=None):
                 suppress_notification=True,
                 silent=True,
             )
-        logger.info(f"任务 {task_id} 已排到等待处理队首，等并发空位后自动继续")
+            logger.info(f"任务 {task_id} 已排到等待处理队首，等并发空位后自动继续")
         return True
     return job_id is not None
 

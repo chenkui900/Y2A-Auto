@@ -83,12 +83,14 @@ function buildWorld() {
     reg('selScopeHint');
     reg('selectAllFilteredBtn', 'button');
     reg('filterTotalNum');
+    reg('filterTotalLabel');
     reg('selStatusLock');
     reg('selStatusLockLabel');
     reg('downloadPausedBanner', 'div');
 
     const storage = new Map();
     const alerts = [];
+    const fetchCalls = [];
 
     const document = {
         getElementById: (id) => byId[id] || null,
@@ -102,6 +104,26 @@ function buildWorld() {
         addEventListener() {},
     };
 
+    // 模拟 /tasks/filtered_ids：按 status 返回对应总数
+    const STATUS_COUNTS = { pending: 12, downloading: 3, failed: 5 };
+    const fetchMock = (url, options) => {
+        const urlText = String(url || '');
+        fetchCalls.push(urlText);
+        const m = /[?&]status=([a-z_]+)/.exec(urlText);
+        const status = m ? m[1] : '';
+        const total = STATUS_COUNTS[status] || 0;
+        const ids = [];
+        for (let i = 0; i < total; i++) { ids.push('id-' + status + '-' + i); }
+        return Promise.resolve({ json: () => Promise.resolve({ success: true, ids, total }) });
+    };
+
+    class Params {
+        constructor(init) { this.items = new Map(); if (typeof init === 'string' && init) { init.split('&').forEach(kv => { const [k, v] = kv.split('='); this.items.set(decodeURIComponent(k), decodeURIComponent(v || '')); }); } }
+        set(k, v) { this.items.set(String(k), String(v)); }
+        get(k) { return this.items.has(String(k)) ? this.items.get(String(k)) : null; }
+        toString() { return Array.from(this.items.entries()).map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
+    }
+
     const context = {
         document,
         window: { addEventListener() {}, location: { pathname: '/tasks' } },
@@ -112,23 +134,24 @@ function buildWorld() {
         },
         y2aAlert: (message, options) => { alerts.push({ message: String(message || ''), options: options || {} }); return Promise.resolve(); },
         syncTasksLayoutVars: () => {},
-        fetch: () => new Promise(() => {}),
-        URLSearchParams: class { constructor() {} set() {} get() { return null; } toString() { return ''; } },
+        fetch: fetchMock,
+        URLSearchParams: Params,
         bootstrap: { Modal: { getInstance: () => null }, Tooltip: { getInstance: () => null } },
         console,
         Set, Map, RegExp, Math, JSON, String, Number, Object, Array, Error,
         Boolean, Date, Promise, parseInt, parseFloat, isNaN, isFinite,
-        setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
+        setTimeout, clearTimeout, setInterval: () => 1, clearInterval() {},
     };
     context.globalThis = context;
-    return { context: vm.createContext(context), boxes, selectAllEl, alerts, storage };
+    return { context: vm.createContext(context), boxes, selectAllEl, alerts, storage, fetchCalls, byId };
 }
 
 async function runProbe(source) {
     const world = buildWorld();
     const probe = `
 (async () => {
-    const out = { alerts: [], sel: [], checks: {}, lockFlow: {}, persist: null, selectAllFlow: {} };
+    const out = { alerts: [], sel: [], checks: {}, lockFlow: {}, persist: null, selectAllFlow: {}, counterFlow: {} };
+    const flush = () => new Promise(r => setTimeout(r, 5));
     const selectedNow = () => {
         const ids = (typeof getSelectedIds === 'function') ? getSelectedIds() : [];
         return ids;
@@ -143,44 +166,61 @@ async function runProbe(source) {
             statusLabel: (typeof selectionStatusLabel !== 'undefined') ? selectionStatusLabel : null,
         };
     };
+    const counterSnapshot = () => ({
+        num: (document.getElementById('filterTotalNum') || {}).textContent,
+        label: (document.getElementById('filterTotalLabel') || {}).textContent,
+        hint: (document.getElementById('selScopeHint') || {}).textContent,
+        total: (typeof filterTotal !== 'undefined') ? filterTotal : null,
+        totalStatus: (typeof filterTotalStatus !== 'undefined') ? filterTotalStatus : null,
+    });
 
     // 1. 未勾选任何任务时点「跨页全选」：应提示先手动勾选一个任务
     await selectAllFiltered();
 
-    // 2. 勾选等待处理任务 A → 锁定 pending
+    // 2. 勾选等待处理任务 A → 锁定 pending，跨页计数应异步刷新为 pending 的数量
     const A = document.querySelectorAll('.task-checkbox')[0];
     const B = document.querySelectorAll('.task-checkbox')[1];
     const C = document.querySelectorAll('.task-checkbox')[2];
     A.checked = true;
     handleCheckboxChange(A);
+    await flush();
     out.checks.afterA = snapshot();
+    out.counterFlow.afterLockPending = counterSnapshot();
 
     // 3. 试图勾选下载中任务 B → 被拒绝回退
     B.checked = true;
     handleCheckboxChange(B);
+    await flush();
     out.checks.afterRejectB = snapshot();
 
     // 4. 勾选同为等待处理的 C → 允许
     C.checked = true;
     handleCheckboxChange(C);
+    await flush();
     out.checks.afterC = snapshot();
 
     // 5. 取消 A → 仍锁定 pending
     A.checked = false;
     handleCheckboxChange(A);
+    await flush();
     out.checks.afterUncheckA = snapshot();
 
-    // 6. 取消 C → 全部清空，锁解除
+    // 6. 取消 C → 全部清空，锁解除，计数恢复页面自带值
     C.checked = false;
     handleCheckboxChange(C);
+    await flush();
     out.checks.afterUncheckC = snapshot();
+    out.counterFlow.afterClear = counterSnapshot();
 
     // 7. 表头全选：本页混合状态，只勾选第一个任务的状态
     toggleAllTasks({ checked: true });
+    await flush();
     out.selectAllFlow.afterToggleOn = snapshot();
+    out.counterFlow.afterToggleOn = counterSnapshot();
 
     // 8. 表头取消全选 → 清空并解锁
     toggleAllTasks({ checked: false });
+    await flush();
     out.selectAllFlow.afterToggleOff = snapshot();
 
     out.alerts = (typeof alerts !== 'undefined') ? alerts : [];

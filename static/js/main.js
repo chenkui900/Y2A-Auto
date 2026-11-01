@@ -223,6 +223,230 @@ document.addEventListener('DOMContentLoaded', function () {
     renderDownloadCleanupMode();
 });
 // ==========================================================
+// 设置页：上传/下载限速的总开关与生效时间段
+//  - 总开关关闭 → 速率输入与时间段全部停用（不提交，保存时保留原值）
+//  - 时间段关闭 → 全天限速；开启 → 只在 [开始, 结束) 内限速，支持跨零点
+// ==========================================================
+document.addEventListener('DOMContentLoaded', function () {
+    const enabledToggle = document.getElementById('rate-limit-enabled');
+    const scheduleToggle = document.getElementById('rate-limit-time-enabled');
+    const hint = document.getElementById('rate-limit-status-hint');
+    if (!enabledToggle || !hint) return;
+
+    // 限速控件 = 数值输入 + 单位下拉（K/M），另有一个隐藏域存 "500K"/"1M" 这种字符串。
+    // 总开关关闭时数值/单位被 disabled，不参与提交，保存时保留原值。
+    const rateFields = [
+        {
+            key: 'download',
+            value: document.getElementById('download-rate-value'),
+            unit: document.getElementById('download-rate-unit'),
+            hidden: document.getElementById('download-rate-limit'),
+            splitHint: document.getElementById('download-rate-split-hint'),
+            threads: document.getElementById('youtube-download-threads')
+        },
+        {
+            key: 'upload',
+            value: document.getElementById('upload-rate-value'),
+            unit: document.getElementById('upload-rate-unit'),
+            hidden: document.getElementById('upload-rate-limit'),
+            splitHint: document.getElementById('upload-rate-split-hint'),
+            threads: document.getElementById('upload-threads')
+        }
+    ];
+    const downloadSplitHint = rateFields[0].splitHint;
+    const uploadSplitHint = rateFields[1].splitHint;
+    const startField = document.getElementById('rate-limit-start-time');
+    const endField = document.getElementById('rate-limit-end-time');
+    const timeSettings = document.getElementById('rate-limit-time-settings');
+    const UNIT_FACTORS = {K: 1024, M: 1024 * 1024, G: 1024 * 1024 * 1024};
+
+    function rateUnit(field) {
+        const unit = field && field.unit && field.unit.value ? String(field.unit.value).toUpperCase() : 'K';
+        return UNIT_FACTORS[unit] ? unit : 'K';
+    }
+
+    // 数值 + 单位 -> "1.5M"；数值为空表示不限速
+    function composeRate(field) {
+        const raw = field && field.value && field.value.value !== null ? String(field.value.value).trim() : '';
+        if (!raw || Number(raw) <= 0) return '';
+        return raw + rateUnit(field);
+    }
+
+    function parseRateText(text) {
+        const match = /^(\d+(?:\.\d+)?)\s*([KMG]?)$/i.exec(String(text || '').trim());
+        if (!match) return 0;
+        const factor = UNIT_FACTORS[(match[2] || '').toUpperCase()] || 1;
+        return Math.floor(parseFloat(match[1]) * factor) || 0;
+    }
+
+    function formatRate(bytes) {
+        if (!bytes || bytes <= 0) return '不限速';
+        if (bytes >= UNIT_FACTORS.G) return (bytes / UNIT_FACTORS.G).toFixed(2).replace(/\.?0+$/, '') + ' GB/s';
+        if (bytes >= UNIT_FACTORS.M) return (bytes / UNIT_FACTORS.M).toFixed(2).replace(/\.?0+$/, '') + ' MB/s';
+        if (bytes >= UNIT_FACTORS.K) return (bytes / UNIT_FACTORS.K).toFixed(2).replace(/\.?0+$/, '') + ' KB/s';
+        return bytes + ' B/s';
+    }
+
+    function threadCount(field, fallback) {
+        const value = field && field.value !== '' ? parseInt(field.value, 10) : NaN;
+        return isNaN(value) || value < 1 ? fallback : value;
+    }
+
+    // 并发数量决定同时下载的任务数，也决定限速怎么摊分；没保存前先在提示里按新值算一遍
+    function syncSplitHints() {
+        if (downloadSplitHint) {
+            const tasks = threadCount(rateFields[0].threads, parseInt(downloadSplitHint.dataset.tasks, 10) || 1);
+            downloadSplitHint.dataset.tasks = tasks;
+        }
+        if (uploadSplitHint) {
+            const tasks = threadCount(rateFields[1].threads, parseInt(uploadSplitHint.dataset.tasks, 10) || 1);
+            uploadSplitHint.dataset.tasks = tasks;
+        }
+    }
+
+    function renderSplitHints() {
+        if (downloadSplitHint) {
+            const total = parseRateText(composeRate(rateFields[0]));
+            if (!total) {
+                downloadSplitHint.textContent = '留空表示不限速，下载按带宽满速跑。';
+            } else {
+                // 下载限速按「当前实际在下载的任务数」动态分配，不再按并发数量死板平分：
+                // 只有 1 个任务在下载时就吃满全部带宽，多个同时下载时自动均分，总速度不超设定值；
+                // 修改限速/并发后无需重启，正在下载的任务会自动以新速率续传。
+                downloadSplitHint.textContent = '总 ' + formatRate(total)
+                    + ' 会按「当前实际在下载的任务数」动态分配（并发数量只决定最多同时下载几个）：'
+                    + '只有 1 个任务在下载时就吃满全部带宽，多个同时下载时自动均分，总速度也不会超过设定值。'
+                    + '修改限速/并发后无需重启，正在下载的任务会自动以新速率续传。';
+            }
+        }
+        if (uploadSplitHint) {
+            const total = parseRateText(composeRate(rateFields[1]));
+            const tasks = Math.max(1, parseInt(uploadSplitHint.dataset.tasks, 10) || 1);
+            uploadSplitHint.textContent = total
+                ? '总 ' + formatRate(total) + '，由 ' + tasks + ' 个并发上传任务共享（全局记账，不会翻倍）。'
+                : '留空表示不限速，上传按带宽满速跑。';
+        }
+    }
+
+    function syncHiddenRate() {
+        rateFields.forEach(function (field) {
+            if (field.hidden) field.hidden.value = composeRate(field);
+        });
+    }
+
+    function toMinutes(field, fallback) {
+        const text = field && field.value ? String(field.value).trim() : '';
+        const match = /^(\d{1,2}):(\d{2})$/.exec(text);
+        if (!match) return fallback;
+        const hour = parseInt(match[1], 10);
+        const minute = parseInt(match[2], 10);
+        if (isNaN(hour) || isNaN(minute) || hour > 23 || minute > 59) return fallback;
+        return hour * 60 + minute;
+    }
+
+    function pad(value) {
+        return (value < 10 ? '0' : '') + value;
+    }
+
+    function formatMinutes(minutes) {
+        const value = ((minutes % 1440) + 1440) % 1440;
+        return pad(Math.floor(value / 60)) + ':' + pad(value % 60);
+    }
+
+    function inWindow(start, end, nowMinutes) {
+        if (start === end) return true;
+        if (start < end) return nowMinutes >= start && nowMinutes < end;
+        return nowMinutes >= start || nowMinutes < end;
+    }
+
+    function renderRateLimitState() {
+        const enabled = enabledToggle.checked;
+        const scheduled = enabled && scheduleToggle && scheduleToggle.checked;
+
+        // 总开关关闭时，数值与单位都停用；停用后不提交，保存时保留原值
+        rateFields.forEach(function (field) {
+            if (field.value) field.value.disabled = !enabled;
+            if (field.unit) field.unit.disabled = !enabled;
+        });
+        if (scheduleToggle) scheduleToggle.disabled = !enabled;
+        [startField, endField].forEach(function (field) {
+            if (field) field.disabled = !scheduled;
+        });
+        if (timeSettings) timeSettings.classList.toggle('opacity-50', !scheduled);
+        hint.classList.remove('alert-info', 'alert-secondary', 'alert-success', 'alert-warning');
+
+        if (!enabled) {
+            hint.classList.add('alert-secondary');
+            hint.textContent = '限速已关闭：上传和下载都按满速传输。';
+            return;
+        }
+
+        const hasRate = rateFields.some(function (field) {
+            return parseRateText(composeRate(field)) > 0;
+        });
+        if (!hasRate) {
+            hint.classList.add('alert-warning');
+            hint.textContent = '已启用限速，但下载和上传速率都没填，实际仍是满速。填写速率后保存即可生效。';
+            return;
+        }
+        if (!scheduled) {
+            hint.classList.add('alert-info');
+            hint.textContent = '全天限速：上传和下载始终按设定速率传输。';
+            return;
+        }
+
+        const start = toMinutes(startField, 22 * 60);
+        const end = toMinutes(endField, 6 * 60);
+        const now = new Date();
+        const nowMinutes = now.getHours() * 60 + now.getMinutes();
+        const windowText = start > end
+            ? formatMinutes(start) + ' - ' + formatMinutes(end) + '（跨夜）'
+            : formatMinutes(start) + ' - ' + formatMinutes(end);
+        if (start === end) {
+            hint.classList.add('alert-info');
+            hint.textContent = '起止时间相同，视为全天限速：上传和下载始终按设定速率传输。';
+            return;
+        }
+        if (inWindow(start, end, nowMinutes)) {
+            hint.classList.add('alert-success');
+            hint.textContent = '当前处于限速时段（' + windowText + '），按设定速率传输。';
+        } else {
+            hint.classList.add('alert-info');
+            hint.textContent = '当前不在限速时段（' + windowText + '），按满速传输；进入时段后自动限速。';
+        }
+    }
+
+    function renderAll() {
+        renderRateLimitState();
+        syncHiddenRate();
+        renderSplitHints();
+    }
+
+    [enabledToggle, scheduleToggle, startField, endField].forEach(function (field) {
+        if (!field) return;
+        field.addEventListener('change', renderAll);
+    });
+    rateFields.forEach(function (field) {
+        if (field.value) {
+            field.value.addEventListener('input', renderAll);
+            field.value.addEventListener('change', renderAll);
+        }
+        if (field.unit) field.unit.addEventListener('change', renderAll);
+    });
+    [rateFields[0].threads, rateFields[1].threads].forEach(function (field) {
+        if (!field) return;
+        field.addEventListener('input', function () {
+            syncSplitHints();
+            renderSplitHints();
+        });
+    });
+
+    syncSplitHints();
+    renderAll();
+    // 页面长时间停留时，跨过时段边界也要更新提示
+    setInterval(renderRateLimitState, 30000);
+});
+// ==========================================================
 // 通用提示对话框（美化版）：y2aAlert / y2aConfirm
 //  - Promise 风格：await y2aConfirm('确定吗？')  -> true / false
 //  - 支持标题、图标类型、补充说明、深浅色主题、ESC/点击遮罩关闭

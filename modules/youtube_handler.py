@@ -20,6 +20,16 @@ from modules.config_manager import (
 )
 from logging.handlers import RotatingFileHandler
 from .utils import get_app_subdir, get_app_root_dir
+from .rate_limiter import get_download_limit, format_rate_limit
+from .concurrency import (
+    get_download_concurrency,
+    split_download_rate,
+)
+from .download_rate_controller import (
+    get_download_rate_controller,
+    REBALANCE_DEBOUNCE_SECONDS,
+    MAX_RELAUNCH_PER_DOWNLOAD,
+)
 from .ffmpeg_manager import get_ffmpeg_path, is_ffmpeg_usable
 from .cookiecloud import try_cookiecloud_youtube_sync
 from shutil import which as _which
@@ -709,6 +719,187 @@ def test_video_availability(youtube_url, yt_dlp_cmd, cookies_path=None, logger=N
 
     return False, None, last_error or "格式检查失败"
 
+def _download_pacing(config):
+    """计算「每条连接的 --limit-rate」（= 每个任务的分到的配额）。
+
+    返回 ``(per_task, per_connection)``；不限速时两项均为 None。
+
+    yt-dlp 的 ``--limit-rate`` 是按连接生效的（每条连接各自 slow_down），而我们把
+    ``--concurrent-fragments`` 固定为 1（单任务只有 1 条连接），因此每个任务的限额
+    就等于每条连接的限额。总限速只按「下载并发数量」一级摊分：每个任务分到
+    ``总限速 / 下载并发数量``，N 个任务同时跑时总速率恰好等于设定值，不会超标，
+    且单连接限额足够大、yt-dlp 能稳定约束。
+    """
+    total = get_download_limit(config)
+    if not total:
+        return None, None
+        per_task, per_connection = split_download_rate(total, config)
+        return per_task, per_connection
+
+
+def _apply_limit_rate(cmd, rate_bytes):
+    """返回去掉旧 --limit-rate 后、按 rate_bytes（bytes/s）追加新 --limit-rate 的命令副本。
+
+    rate_bytes 为 None 时不限速（仅移除已有的 --limit-rate）。
+    """
+    cleaned = []
+    i = 0
+    n = len(cmd)
+    while i < n:
+        token = cmd[i]
+        if token == '--limit-rate':
+            # 跳过标志及其后的取值
+            i += 2
+            continue
+        cleaned.append(token)
+        i += 1
+    if rate_bytes:
+        cleaned.extend(['--limit-rate', format_rate_limit(rate_bytes)])
+    return cleaned
+
+
+def _terminate_process(process, kill=False):
+    try:
+        if kill:
+            process.kill()
+        else:
+            process.terminate()
+    except Exception:
+        pass
+
+
+def _parse_and_report_progress(line, progress_callback, logger):
+    """解析 yt-dlp 的 '[download]  xx% of ... at ... ETA ...' 行并通过 progress_callback 回调。"""
+    if progress_callback is None:
+        return
+    try:
+        if '[download]' not in line or '%' not in line:
+            return
+        if 'of' not in line or 'at' not in line:
+            return
+        parts = line.split()
+        for i, part in enumerate(parts):
+            if part.endswith('%'):
+                percent_str = part.replace('%', '')
+                progress_percent = float(percent_str)
+                file_size = ""
+                download_speed = ""
+                eta = ""
+                if i + 2 < len(parts) and parts[i + 1] == 'of':
+                    file_size = parts[i + 2]
+                for j in range(i + 3, len(parts)):
+                    if parts[j] == 'at' and j + 1 < len(parts):
+                        download_speed = parts[j + 1]
+                    elif parts[j] == 'ETA' and j + 1 < len(parts):
+                        eta = parts[j + 1]
+                        break
+                progress_callback({
+                    'percent': progress_percent,
+                    'file_size': file_size,
+                    'speed': download_speed,
+                    'eta': eta,
+                })
+                return
+    except (ValueError, IndexError) as exc:
+        logger.debug("解析进度信息失败: %s", exc)
+
+
+def _run_yt_dlp_dynamic(cmd, logger, cancel_event, controller, task_id, progress_callback):
+    """以「动态限速 + 断点续传重拉」方式运行 yt-dlp。
+
+    - 每次拉起都用 controller.per_task_rate_bytes() 计算当前应有限速；
+    - 若下载过程中「实际在下载的任务数」或「总限速」变化（controller.generation 改变），
+      在静默窗口后自动以新速率重新拉起 yt-dlp（断点续传），无需重启服务；
+    - 取消请求立即终止并抛出 RuntimeError('任务已取消')。
+
+    成功返回收集到的输出文本；真正的下载失败抛出 subprocess.CalledProcessError，
+    取消抛出 RuntimeError('任务已取消')，交由 download_video_data 的外层重试/取消逻辑处理。
+    """
+    short_id = task_id[:8] if task_id else '?'
+    relaunch = 0
+    while True:
+        rate = controller.per_task_rate_bytes()
+        run_cmd = _apply_limit_rate(cmd, rate)
+        gen_at_launch = controller.generation
+        logger.info(
+            "拉起 yt-dlp（动态限速）：任务 %s，当前在下载任务数 %d，单任务限速 %s",
+            short_id,
+            controller.active_count(),
+            format_rate_limit(rate) or '不限速',
+        )
+        self_terminated = {'rebalance': False, 'cancel': False}
+        process = subprocess.Popen(
+            run_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            encoding='utf-8',
+            errors='replace',
+        )
+        logger.info("subprocess.Popen创建成功，PID: %s", process.pid)
+
+        def _watchdog():
+            while process.poll() is None:
+                # 同时等待：取消事件 或 限速重平衡事件，带超时以便周期性自检
+                if cancel_event is not None and getattr(cancel_event, 'is_set', None) and cancel_event.is_set():
+                    self_terminated['cancel'] = True
+                    _terminate_process(process)
+                    return
+                fired = controller.rebalance_event.wait(timeout=0.5)
+                if process.poll() is not None:
+                    return
+                if fired and controller.generation != gen_at_launch:
+                    self_terminated['rebalance'] = True
+                    _terminate_process(process)
+                    return
+
+        watcher = threading.Thread(
+            target=_watchdog, name=f"yt-dlp-watch-{short_id}", daemon=True
+        )
+        watcher.start()
+
+        output_lines = []
+        try:
+            if process.stdout is None:
+                raise RuntimeError("进程创建成功但stdout为None")
+            for line in process.stdout:
+                if cancel_event is not None and getattr(cancel_event, 'is_set', None) and cancel_event.is_set():
+                    self_terminated['cancel'] = True
+                    _terminate_process(process)
+                    break
+                output_lines.append(line)
+                _parse_and_report_progress(line.strip(), progress_callback, logger)
+        finally:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _terminate_process(process, kill=True)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            watcher.join(timeout=2)
+        output = ''.join(output_lines)
+
+        if self_terminated.get('cancel'):
+            raise RuntimeError("任务已取消")
+        if self_terminated.get('rebalance'):
+            relaunch += 1
+            if relaunch > MAX_RELAUNCH_PER_DOWNLOAD:
+                logger.warning("下载 %s 因限速变更重拉次数过多，停止重拉，交由外层重试。", short_id)
+                raise subprocess.CalledProcessError(process.returncode or 1, run_cmd, output)
+            logger.info("检测到限速/并发变化，以新速率重新拉起 yt-dlp（断点续传），第 %d 次", relaunch)
+            # 等待去抖窗口，避免在变化期频繁重启；然后消费掉本次重平衡信号
+            time.sleep(REBALANCE_DEBOUNCE_SECONDS)
+            controller.rebalance_event.clear()
+            continue
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, run_cmd, output)
+        return output
+
+
 def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_download=False, only_video=False, progress_callback=None, cancel_event=None):
     """
     下载YouTube视频数据
@@ -827,16 +1018,22 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
         if proxy_url:
             logger.info("下载 YouTube 时已启用代理")
         
-        # 配置下载线程数
-        download_threads = config.get('YOUTUBE_DOWNLOAD_THREADS', 4)
-        cmd.extend(['--concurrent-fragments', str(download_threads)])
-        logger.info(f"使用下载线程数: {download_threads}")
-        
-        # 配置下载速度限制
-        throttled_rate = config.get('YOUTUBE_THROTTLED_RATE', '').strip()
-        if throttled_rate:
-            cmd.extend(['--throttled-rate', throttled_rate])
-            logger.info(f"启用下载速度限制: {throttled_rate}")
+        # 单任务固定 1 条连接：把 yt-dlp 的 --concurrent-fragments 钉死为 1，
+        # 这样 --limit-rate 直接等价于「这个任务的限速」，且单连接限额足够大、yt-dlp 能稳定约束。
+        cmd.extend(['--concurrent-fragments', '1'])
+
+        # 下载带宽「动态分配」：不再按「并发数量」死板平分，而是按「此刻实际在下载的任务数」
+        # 分配（见 modules/download_rate_controller）。真正实现：并发设 4 但只有 1 个在下载时，
+        # 那 1 个任务吃满全部带宽；同时 2 个下载就各半；多个任务总速率恰好等于设定值，不超标。
+        # 具体限速值在 _run_yt_dlp_dynamic 拉起 yt-dlp 时由控制器实时计算，并在运行中随任务
+        # 增减 / 设置变更自动以新速率断点续传重拉，无需重启服务。
+        download_controller = get_download_rate_controller() if not skip_download else None
+        if not skip_download:
+            logger.info(
+                "下载限速策略：按「实际在下载的任务数」动态分配（并发数量 %s 仅决定最多同时下载几个），"
+                "运行中随负载/设置自动调整，无需重启服务",
+                get_download_concurrency(config),
+            )
 
         has_ffmpeg = bool(ffmpeg_location) or is_docker_env()
         quality_plan: dict[str, Any] | None = None
@@ -903,6 +1100,7 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
         # 预先初始化，避免在异常分支中未绑定导致静态分析报错
         process = None
         output = ""
+        _download_succeeded = False
         manual_merge_success = False
         cookiecloud_tried_in_download = False
 
@@ -920,117 +1118,29 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
                     len(cmd),
                 )
 
-                if progress_callback and not skip_download:
-                    # 使用Popen实时获取进度，设置UTF-8编码
-                    logger.info(f"准备执行yt-dlp命令: {' '.join(yt_dlp_cmd)}")
-                    # 同上：只记录参数规模，不回显可能含代理凭据的命令内容（CodeQL #87）
-                    logger.debug("下载命令已就绪，共 %d 个参数（内容省略以隐藏代理凭据）", len(cmd))
-                    
-                    try:
-                        process = subprocess.Popen(
-                            cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            bufsize=1,
-                            universal_newlines=True,
-                            encoding='utf-8',
-                            errors='replace'  # 遇到无法解码的字符时用?替换
-                        )
-                        logger.info(f"subprocess.Popen创建成功，PID: {process.pid}")
-                    except Exception as e:
-                        logger.error(f"subprocess.Popen创建失败: {str(e)}")
-                        raise
-                    
-                    # 检查process.stdout是否为None
-                    if process.stdout is None:
-                        logger.error("process.stdout为None，无法读取输出")
-                        raise RuntimeError("进程创建成功但stdout为None")
-                    
-                    output_lines = []
-                    logger.info("开始读取yt-dlp输出...")
-                    
-                    # 确保process.stdout不为None且可迭代
-                    if process.stdout is None:
-                        logger.error("process.stdout为None，无法读取输出")
-                        raise RuntimeError("进程创建成功但stdout为None")
-                    
-                    for line in process.stdout:
-                        if cancel_event is not None and cancel_event.is_set():
-                            logger.info("检测到任务取消请求，准备终止yt-dlp进程")
-                            process.terminate()
-                            try:
-                                process.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                            raise RuntimeError("任务已取消")
-                        output_lines.append(line)
-                        line = line.strip()
-                        logger.debug(f"yt-dlp输出: {line}")
-                        
-                        # 解析进度信息
-                        if '[download]' in line and '%' in line:
-                            try:
-                                # 解析进度百分比，例如: [download]  45.2% of 123.45MiB at 1.23MiB/s ETA 00:30
-                                if 'of' in line and 'at' in line:
-                                    parts = line.split()
-                                    for i, part in enumerate(parts):
-                                        if part.endswith('%'):
-                                            percent_str = part.replace('%', '')
-                                            progress_percent = float(percent_str)
-                                            
-                                            # 提取文件大小和下载速度
-                                            file_size = ""
-                                            download_speed = ""
-                                            eta = ""
-                                            
-                                            if i + 2 < len(parts) and parts[i + 1] == 'of':
-                                                file_size = parts[i + 2]
-                                            
-                                            for j in range(i + 3, len(parts)):
-                                                if parts[j] == 'at' and j + 1 < len(parts):
-                                                    download_speed = parts[j + 1]
-                                                elif parts[j] == 'ETA' and j + 1 < len(parts):
-                                                    eta = parts[j + 1]
-                                                    break
-                                            
-                                            progress_info = {
-                                                'percent': progress_percent,
-                                                'file_size': file_size,
-                                                'speed': download_speed,
-                                                'eta': eta
-                                            }
-                                            
-                                            progress_callback(progress_info)
-                                            break
-                            except (ValueError, IndexError) as e:
-                                logger.debug(f"解析进度信息失败: {e}")
-                    
-                    process.wait()
-                    output = ''.join(output_lines)
-
-                    if cancel_event is not None and cancel_event.is_set():
-                        logger.info("yt-dlp执行完成后检测到任务取消请求")
-                        raise RuntimeError("任务已取消")
-                    
-                    if process.returncode != 0:
-                        raise subprocess.CalledProcessError(process.returncode, cmd, output)
+                if not skip_download:
+                    # 真实下载视频：动态限速 + 断点续传重拉。运行中的任务会随「实际在下载的任务数」
+                    # 或「总限速」变化，自动以新速率重新拉起（断点续传），无需重启服务。
+                    output = _run_yt_dlp_dynamic(
+                        cmd, logger, cancel_event, download_controller, task_id, progress_callback
+                    )
+                    _download_succeeded = True
                 else:
-                    # 不需要进度回调时使用原来的方式，设置UTF-8编码
+                    # 仅采集元数据（--skip-download）：不传输视频，无需限速
                     process = subprocess.run(
-                        cmd, 
-                        capture_output=True, 
-                        text=True, 
-                        check=True, 
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True,
                         timeout=300,
                         encoding='utf-8',
-                        errors='replace'  # 遇到无法解码的字符时用?替换
+                        errors='replace',  # 遇到无法解码的字符时用?替换
                     )
                     if cancel_event is not None and cancel_event.is_set():
                         logger.info("检测到任务取消请求，终止yt-dlp命令执行")
                         raise RuntimeError("任务已取消")
                     output = process.stdout
-                
+                    _download_succeeded = True
                 break  # 成功执行，跳出重试循环
                 
             except subprocess.CalledProcessError as e:
@@ -1173,7 +1283,7 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
                 continue
         
         # 处理输出结果 — 使用安全检查以防 process 未被创建
-        download_success = manual_merge_success or (process is not None and getattr(process, 'returncode', None) == 0)
+        download_success = manual_merge_success or _download_succeeded
         if download_success:
             logger.info("下载完成，正在收集文件信息")
             
