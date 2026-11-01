@@ -241,6 +241,64 @@ def _convert_vtt_text_to_srt_text(vtt_content: str) -> str:
 class TaskCancelledError(Exception):
     pass
 
+
+class TaskDeferredError(Exception):
+    """任务被推迟（不是失败也不是取消）：当前不满足启动条件，原样退回等待队列。
+
+    目前只有「暂停下载」用到：任务跑到下载阶段时发现下载被暂停，
+    就把任务退回 pending，等用户恢复下载后再从断点继续，绝不能落成 failed。
+    """
+    pass
+
+
+# ---------------------------------------------------------------------------
+# 全局「暂停下载」开关
+# - 语义：已经在下载的任务自然跑完；不再启动新的下载。
+# - 状态持久化到 config.json（DOWNLOAD_PAUSED），重启服务后保持暂停。
+# - 运行时用模块级变量缓存，避免每次调度/每个任务都去读一遍配置文件。
+# ---------------------------------------------------------------------------
+_DOWNLOAD_PAUSE_LOCK = threading.Lock()
+_download_paused = False
+_download_pause_state_loaded = False
+
+
+def _load_download_pause_state():
+    """首次访问时从配置文件读一次，避免依赖模块加载顺序。"""
+    global _download_paused, _download_pause_state_loaded
+    try:
+        from .config_manager import load_config
+        _download_paused = bool(load_config().get('DOWNLOAD_PAUSED', False))
+    except Exception as exc:  # 配置读不到时保持「未暂停」，不影响正常调度
+        logger.debug(f"读取 DOWNLOAD_PAUSED 失败，按未暂停处理: {exc}")
+    _download_pause_state_loaded = True
+
+
+def is_download_paused():
+    """当前是否处于「暂停下载」状态。"""
+    global _download_pause_state_loaded
+    if not _download_pause_state_loaded:
+        with _DOWNLOAD_PAUSE_LOCK:
+            if not _download_pause_state_loaded:
+                _load_download_pause_state()
+    return bool(_download_paused)
+
+
+def set_download_paused(paused, persist=True):
+    """切换「暂停下载」状态；persist=True 时同步写入 config.json。"""
+    global _download_paused, _download_pause_state_loaded
+    with _DOWNLOAD_PAUSE_LOCK:
+        _download_paused = bool(paused)
+        _download_pause_state_loaded = True
+    if persist:
+        try:
+            from .config_manager import update_config
+            update_config({'DOWNLOAD_PAUSED': bool(paused)})
+        except Exception as exc:
+            logger.warning(f"保存暂停下载状态失败（本次运行内存中的状态仍然生效）: {exc}")
+    logger.info("下载调度：%s", "已暂停（在跑的下载会自然结束，不再启动新的下载）" if _download_paused else "已恢复，继续启动下载任务")
+    return _download_paused
+
+
 _TASK_CANCEL_FLAGS = {}
 _TASK_CANCEL_LOCK = threading.Lock()
 _ACTIVE_TASK_IDS = set()
@@ -322,6 +380,38 @@ def clear_task_preempt(task_id):
         return
     with _TASK_CANCEL_LOCK:
         _TASK_PREEMPT_FLAGS.discard(task_id)
+
+
+# 最近一次执行「并发让位」的时间戳，用于给恢复逻辑一个短暂冷却期：
+# 刚让位的线程可能还在收尾（子进程没被立刻杀掉），马上恢复会叠加出
+# 「上限 1 却有好几个任务在跑」的假象，进而反复让位、反复恢复。
+_PREEMPT_LAST_TS = 0.0
+# 等待处理队列的排序指纹：顺序没变就不重复刷日志
+_LAST_PENDING_ORDER_SIG = None
+
+
+def task_has_downloaded_video(task):
+    """任务是否已经有下载完成的成品视频（决定中断后该回「准备上传」还是「等待处理」）。"""
+    path = (task or {}).get('video_path_local')
+    return bool(str(path or '').strip())
+
+
+def preempt_landing_status(task_id, task=None):
+    """并发让位后任务的落点。
+
+    已经下完成品 → 「准备上传」并插队，等配额恢复后直接上传；
+    还没下载完 → 回「等待处理」队首，等配额恢复后从断点继续下载。
+    不能让没视频的任务落到「准备上传」：那种任务永远传不上去，只会把上传队列塞满。
+    """
+    if task is None:
+        try:
+            task = get_task(task_id) or {}
+        except Exception:
+            task = {}
+    if task_has_downloaded_video(task):
+        return TASK_STATES['READY_FOR_UPLOAD']
+    return TASK_STATES['PENDING']
+
 
 def _mark_task_active(task_id: str) -> bool:
     if not task_id:
@@ -786,7 +876,11 @@ def recover_interrupted_tasks_to_pending():
     conn = get_db_connection()
     try:
         placeholders = ','.join(['?'] * len(processing_states))
-        cursor = conn.execute(f'SELECT id, status, upload_target, acfun_upload_response, bilibili_upload_response FROM tasks WHERE status IN ({placeholders})', tuple(processing_states))
+        cursor = conn.execute(
+            f'SELECT id, status, upload_target, acfun_upload_response, bilibili_upload_response, '
+            f'upload_progress, download_progress, video_path_local FROM tasks WHERE status IN ({placeholders})',
+            tuple(processing_states),
+        )
         rows = cursor.fetchall() or []
         if not rows: return 0
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -805,6 +899,15 @@ def recover_interrupted_tasks_to_pending():
             else:
                 has_upload_resp = has_acfun_resp
                 has_partial_upload_resp = False
+            # 把中断时的已下载比例固化下来：老任务只有 upload_progress 里的百分比文本，
+            # 一旦被后续流程清空就再也算不出「下载了多少」，重启后排序会退化成原始顺序。
+            progress_ratio = _download_progress_ratio({
+                'video_path_local': row['video_path_local'],
+                'download_progress': row['download_progress'],
+                'status': row['status'],
+                'upload_progress': row['upload_progress'],
+            })
+            ratio_value = progress_ratio if progress_ratio > 0 else None
             if has_upload_resp:
                 conn.execute('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?', (TASK_STATES['COMPLETED'], now_str, task_id))
                 recovered += 1
@@ -813,7 +916,7 @@ def recover_interrupted_tasks_to_pending():
                 conn.execute('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?', (TASK_STATES['FAILED'], now_str, task_id))
                 recovered += 1
                 continue
-            conn.execute('''UPDATE tasks SET status = ?, updated_at = ?, subtitle_qc_failed = 0, subtitle_qc_reason = NULL, subtitle_qc_score = NULL, subtitle_qc_checked_at = NULL, subtitle_quality_state = NULL, asr_warning_message = NULL, subtitle_warning_message = NULL WHERE id = ?''', (TASK_STATES['PENDING'], now_str, task_id))
+            conn.execute('''UPDATE tasks SET status = ?, updated_at = ?, download_progress = COALESCE(download_progress, ?), subtitle_qc_failed = 0, subtitle_qc_reason = NULL, subtitle_qc_score = NULL, subtitle_qc_checked_at = NULL, subtitle_quality_state = NULL, asr_warning_message = NULL, subtitle_warning_message = NULL WHERE id = ?''', (TASK_STATES['PENDING'], now_str, ratio_value, task_id))
             recovered += 1
         conn.commit()
         if recovered: logger.info(f"断点续跑：已恢复 {recovered} 个处理中任务为 pending")
@@ -921,10 +1024,12 @@ def init_db():
         metadata_json_path_local TEXT,
         moderation_result TEXT,
         error_message TEXT,
+        error_at TIMESTAMP,
         error_category TEXT,
         pipeline_checkpoint TEXT,
         upload_progress TEXT,
         progress_speed REAL,
+        download_progress REAL,
         preempted INTEGER DEFAULT 0,
         queue_priority INTEGER DEFAULT 0,
         acfun_upload_response TEXT,
@@ -935,6 +1040,13 @@ def init_db():
     )
     ''')
     conn.commit()
+    # 去重查询按 youtube_url 模糊匹配，建个索引让 500+ 条任务时也不至于全表扫
+    try:
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tasks_youtube_url ON tasks(youtube_url)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)')
+        conn.commit()
+    except Exception as e:
+        logger.debug(f"创建任务索引失败（忽略）: {e}")
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS schema_migrations (
         migration_key TEXT PRIMARY KEY,
@@ -965,6 +1077,48 @@ def init_db():
             cursor.execute("ALTER TABLE tasks ADD COLUMN progress_speed REAL")
             logger.info("数据库升级：添加progress_speed字段")
             conn.commit()
+        if 'download_progress' not in columns:
+            # 已下载比例（0~1）：重启后按「下载得最多的先继续」排序，避免每次重启都从头排队
+            cursor.execute("ALTER TABLE tasks ADD COLUMN download_progress REAL")
+            logger.info("数据库升级：添加download_progress字段（已下载比例，重启后按进度续跑）")
+            conn.commit()
+        # 老库回填（每次启动都补一遍缺的）：下载阶段把百分比写在 upload_progress 文本里
+        # （如「63.5%」），这里搬进数值列，避免后续进度文本被清空后算不出已下载多少。
+        try:
+            percent_re = re.compile(r'(\d+(?:\.\d+)?)\s*%')
+            updated = 0
+            backfill_rows = cursor.execute(
+                "SELECT id, upload_progress FROM tasks WHERE download_progress IS NULL "
+                "AND instr(upload_progress, '%') > 0 AND status IN (?, ?, ?)",
+                (TASK_STATES['PENDING'], TASK_STATES['PAUSED'], TASK_STATES['DOWNLOADING']),
+            ).fetchall()
+            for backfill in backfill_rows:
+                match = percent_re.search(str(backfill[1] or ''))
+                if not match:
+                    continue
+                try:
+                    ratio = max(0.0, min(1.0, float(match.group(1)) / 100.0))
+                except ValueError:
+                    continue
+                cursor.execute('UPDATE tasks SET download_progress = ? WHERE id = ?', (ratio, backfill[0]))
+                updated += 1
+            if updated:
+                conn.commit()
+                logger.info(f"数据库升级：回填 {updated} 个任务的已下载比例")
+        except Exception as backfill_error:
+            logger.debug(f"回填已下载比例失败（忽略）: {backfill_error}")
+        # 已完成的任务必然下载过视频（删了本地文件也算）：补成 100%，
+        # 这样任务列表里每条任务都能显示已下载比例，不会因为文件被删看起来像没下过。
+        try:
+            cursor.execute(
+                "UPDATE tasks SET download_progress = 1.0 WHERE download_progress IS NULL AND status = ?",
+                (TASK_STATES['COMPLETED'],),
+            )
+            if cursor.rowcount:
+                conn.commit()
+                logger.info(f"数据库升级：{cursor.rowcount} 个已完成任务标记为已下载 100%")
+        except Exception as completed_backfill_error:
+            logger.debug(f"回填已完成任务下载比例失败（忽略）: {completed_backfill_error}")
         if 'preempted' not in columns:
             # 并发让位标记：并发上限下调时被中断的任务，恢复时要先跑完处理流程再上传
             cursor.execute("ALTER TABLE tasks ADD COLUMN preempted INTEGER DEFAULT 0")
@@ -1065,6 +1219,14 @@ def init_db():
         if 'subtitle_quality_state' not in columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN subtitle_quality_state TEXT")
             conn.commit()
+        cursor.execute("PRAGMA table_info(tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'error_at' not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN error_at TIMESTAMP")
+            # 老数据没有独立的失败时间，用 updated_at 兜底回填，保证每条失败原因前都有时间可显示
+            cursor.execute("""UPDATE tasks SET error_at = updated_at WHERE error_message IS NOT NULL AND TRIM(error_message) <> '' AND error_at IS NULL""")
+            conn.commit()
+            logger.info("数据库升级：添加error_at字段（失败原因时间）")
         cursor.execute("SELECT 1 FROM schema_migrations WHERE migration_key = ? LIMIT 1", ('asr_warning_message_migrate_v1',))
         if cursor.fetchone() is None:
             try:
@@ -1098,7 +1260,84 @@ def get_db_connection():
         logger.debug(f"设置SQLite连接参数失败，将使用默认参数: {e}")
     return conn
 
+_YOUTUBE_VIDEO_ID_PATTERNS = (
+    re.compile(r'youtube\.com/(?:watch\?(?:[^#]*?&)?v=|shorts/|embed/|live/|v/)([A-Za-z0-9_-]{11})', re.IGNORECASE),
+    re.compile(r'youtu\.be/([A-Za-z0-9_-]{11})', re.IGNORECASE),
+)
+
+
+def extract_youtube_video_id(youtube_url):
+    """从各种 YouTube 链接里取出 11 位视频 ID，取不到返回空串。
+
+    支持 watch?v= / youtu.be/ / shorts/ / embed/ / live/，也接受直接粘贴的裸 ID。
+    去重靠它：同一个视频换个链接形式（带 t=、list= 参数或短链）也算同一个任务。
+    """
+    text = str(youtube_url or '').strip()
+    if not text:
+        return ''
+    if re.fullmatch(r'[A-Za-z0-9_-]{11}', text):
+        return text
+    for pattern in _YOUTUBE_VIDEO_ID_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(1)
+    return ''
+
+
+def normalize_task_url(youtube_url):
+    """把链接统一成 https://www.youtube.com/watch?v=<id>，作为任务列表里的标准写法。"""
+    video_id = extract_youtube_video_id(youtube_url)
+    if video_id:
+        return f'https://www.youtube.com/watch?v={video_id}'
+    return str(youtube_url or '').strip().rstrip('/')
+
+
+def find_duplicate_task(youtube_url, exclude_task_id=None):
+    """在任务列表（本地 sqlite）里查找同一个视频的已有任务，找到返回任务 dict。
+
+    已完成任务的记录会一直保留在库里，所以这里能拦住“同一个视频重复添加”。
+    """
+    video_id = extract_youtube_video_id(youtube_url)
+    normalized = normalize_task_url(youtube_url)
+    if not video_id and not normalized:
+        return None
+    conn = get_db_connection()
+    try:
+        if video_id:
+            rows = conn.execute(
+                'SELECT * FROM tasks WHERE youtube_url LIKE ?', (f'%{video_id}%',)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                'SELECT * FROM tasks WHERE TRIM(youtube_url) = ?', (normalized,)
+            ).fetchall()
+        for row in rows:
+            task = dict(row)
+            if exclude_task_id and task.get('id') == exclude_task_id:
+                continue
+            if video_id:
+                if extract_youtube_video_id(task.get('youtube_url')) == video_id:
+                    return task
+            elif str(task.get('youtube_url') or '').strip().rstrip('/') == normalized:
+                return task
+        return None
+    except Exception as e:
+        logger.warning(f"检查任务是否已存在失败（本次按新任务处理）: {e}")
+        return None
+    finally:
+        conn.close()
+
+
 def add_task(youtube_url, upload_target=None):
+    # 任务列表（sqlite）里已有同一个视频就不再添加，只补真正不存在的新任务
+    duplicate = find_duplicate_task(youtube_url)
+    if duplicate:
+        logger.info(
+            f"任务已存在，跳过添加: {youtube_url}（已有任务 {str(duplicate.get('id'))[:8]}，"
+            f"状态 {duplicate.get('status')}）"
+        )
+        return None
+    youtube_url = normalize_task_url(youtube_url)
     task_id = str(uuid.uuid4())
     normalized_target = normalize_upload_target(upload_target)
     conn = get_db_connection()
@@ -1248,30 +1487,45 @@ class SpeedEstimator:
 def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
     if not kwargs:
         return False
-    # 并发让位中的任务：各阶段在中断瞬间可能先把状态写成「失败」或继续写成
-    # 「下载中/转码中」，这里统一纠正为「准备上传」，避免让位的任务被重新
-    # 计入运行中、或让位被误报成失败。
-    _preempt_target_status = kwargs.get('status')
-    if is_task_preempt_requested(task_id) and (
-        _preempt_target_status == TASK_STATES['FAILED']
-        or _preempt_target_status in PREEMPTABLE_STATES
-    ):
-        kwargs['status'] = TASK_STATES['READY_FOR_UPLOAD']
+    # 并发让位中的任务如果当场报「失败」，按有没有下完成品决定落点：
+    # 有成品 → 准备上传插队；没成品 → 回等待处理队首重新排队，
+    # 绝不能落到「准备上传」——没有视频的任务永远传不上去。
+    if is_task_preempt_requested(task_id) and kwargs.get('status') == TASK_STATES['FAILED']:
+        if preempt_landing_status(task_id) == TASK_STATES['READY_FOR_UPLOAD']:
+            kwargs['status'] = TASK_STATES['READY_FOR_UPLOAD']
+            kwargs['preempted'] = 1
+            kwargs['queue_priority'] = 1
+            kwargs.setdefault('upload_progress', QUEUE_PREEMPT_MARK)
+        else:
+            kwargs['status'] = TASK_STATES['PENDING']
+            kwargs['preempted'] = 0
+            kwargs['queue_priority'] = 1
+            kwargs['upload_progress'] = None
         kwargs['error_message'] = None
-        kwargs['preempted'] = 1
-        kwargs['queue_priority'] = 1
-        kwargs.setdefault('upload_progress', QUEUE_PREEMPT_MARK)
+        # 这一轮让位已经落地，标记必须清掉：否则后续真正失败还会被改成排队，永远退不出来
+        clear_task_preempt(task_id)
     status_changed = 'status' in kwargs
     new_status = kwargs.get('status') if status_changed else None
     kwargs['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # 「失败原因」前面要显示日志生成时间：显式写入/清空错误信息时同步维护，
+    # 只把状态切到 failed 而没带错误文本时，用本次更新时间兜底。
+    if 'error_message' in kwargs:
+        _err_text = kwargs.get('error_message')
+        kwargs['error_at'] = kwargs['updated_at'] if (_err_text is not None and str(_err_text).strip()) else None
+    elif new_status == TASK_STATES['FAILED']:
+        kwargs['error_at'] = kwargs['updated_at']
     
     if kwargs.get('status') == TASK_STATES['COMPLETED']:
         kwargs['completed_at'] = kwargs['updated_at']
 
-    # 进度更新默认不带速度：只有下载/上传阶段会显式传 progress_speed，
-    # 其余阶段（转码、翻译等）自动清空，避免列表里残留上一个阶段的速度。
+    # 进度更新默认不带速度：只有下载/上传阶段会显式传 progress_speed。
+    # 只有状态明确切到「非传输阶段」时才清空，避免同一次上传里偶发的纯文本进度
+    # 更新（如「正在启动上传…」）把刚算出来的速度抹掉，导致界面上时有时无。
     if 'upload_progress' in kwargs and 'progress_speed' not in kwargs:
-        kwargs['progress_speed'] = None
+        new_status = kwargs.get('status')
+        if new_status is not None and new_status not in (TASK_STATES['DOWNLOADING'], TASK_STATES['UPLOADING']):
+            kwargs['progress_speed'] = None
 
     ALLOWED_COLUMNS = {
         'youtube_url': 'youtube_url = ?',
@@ -1303,6 +1557,7 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
         'metadata_json_path_local': 'metadata_json_path_local = ?',
         'moderation_result': 'moderation_result = ?',
         'error_message': 'error_message = ?',
+        'error_at': 'error_at = ?',
         'error_category': 'error_category = ?',
         'pipeline_checkpoint': 'pipeline_checkpoint = ?',
         'upload_progress': 'upload_progress = ?',
@@ -1310,6 +1565,7 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
         'queue_priority': 'queue_priority = ?',
         'queue_position': 'queue_position = ?',
         'progress_speed': 'progress_speed = ?',
+        'download_progress': 'download_progress = ?',
         'scheduled_upload_at': 'scheduled_upload_at = ?',
         'acfun_upload_response': 'acfun_upload_response = ?',
         'bilibili_upload_response': 'bilibili_upload_response = ?',
@@ -1336,7 +1592,7 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
                 event_type = 'task_updated'
                 event_payload = {'task_id': task_id, 'status': filtered_kwargs.get('status')}
                 changed_fields = {key for key in filtered_kwargs.keys() if key != 'updated_at'}
-                if changed_fields and changed_fields <= {'upload_progress', 'progress_speed'}:
+                if changed_fields and changed_fields <= {'upload_progress', 'progress_speed', 'download_progress'}:
                     current_status = filtered_kwargs.get('status')
                     if current_status is None:
                         try:
@@ -1349,6 +1605,7 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
                         'status': current_status,
                         'upload_progress': filtered_kwargs.get('upload_progress'),
                         'progress_speed': filtered_kwargs.get('progress_speed'),
+                        'download_progress': filtered_kwargs.get('download_progress'),
                         'updated_at': filtered_kwargs.get('updated_at'),
                     }
                 publish_task_event(event_type, event_payload)
@@ -1386,18 +1643,33 @@ def finalize_cancelled_task(task_id, message="任务已取消", silent=False):
     """
     if is_task_preempt_requested(task_id):
         clear_task_preempt(task_id)
-        update_task(
-            task_id,
-            status=TASK_STATES['READY_FOR_UPLOAD'],
-            error_message=None,
-            upload_progress=QUEUE_PREEMPT_MARK,
-            preempted=1,
-            queue_priority=1,
-            suppress_notification=True,
-            silent=silent,
-        )
-        logger.info(f"任务 {task_id} 因并发上限下调让位，已转入上传队列最前面")
-        return TASK_STATES['READY_FOR_UPLOAD']
+        landing = preempt_landing_status(task_id)
+        if landing == TASK_STATES['READY_FOR_UPLOAD']:
+            update_task(
+                task_id,
+                status=TASK_STATES['READY_FOR_UPLOAD'],
+                error_message=None,
+                upload_progress=QUEUE_PREEMPT_MARK,
+                preempted=1,
+                queue_priority=1,
+                suppress_notification=True,
+                silent=silent,
+            )
+            logger.info(f"任务 {task_id} 因并发上限下调让位，已转入上传队列最前面")
+        else:
+            # 还没下载完：不能进上传队列（没视频传不上去），回等待处理队首继续
+            update_task(
+                task_id,
+                status=TASK_STATES['PENDING'],
+                error_message=None,
+                upload_progress=None,
+                preempted=0,
+                queue_priority=1,
+                suppress_notification=True,
+                silent=silent,
+            )
+            logger.info(f"任务 {task_id} 因并发上限下调让位，已回到等待处理队首（未下载完成）")
+        return landing
     if is_task_pause_requested(task_id):
         clear_task_pause(task_id)
         update_task(
@@ -1459,6 +1731,9 @@ def preempt_excess_running_tasks(limit, reason='并发上限下调', only_active
                     continue
                 if only_active and tid not in active_ids:
                     continue
+                # 已经让位过的任务不要再让一次，否则会一直原地打转
+                if int(task.get('preempted') or 0) == 1:
+                    continue
                 seen.add(tid)
                 running.append(task)
     except Exception as e:
@@ -1469,12 +1744,14 @@ def preempt_excess_running_tasks(limit, reason='并发上限下调', only_active
     running.sort(key=lambda t: (t.get('created_at') or '', t.get('id') or ''))
     excess = running[limit:]
     moved = []
+    global _PREEMPT_LAST_TS
     for idx, task in enumerate(excess, start=1):
         tid = task.get('id')
         if not tid:
             continue
         try:
-            # 先打标记再取消：收尾时据此落「准备上传」而不是「失败」
+            landing = preempt_landing_status(tid, task)
+            # 先打标记再取消：收尾时据此落「准备上传 / 等待处理」而不是「失败」
             request_task_preempt(tid)
             request_task_cancel(tid)
             terminated = False
@@ -1482,25 +1759,40 @@ def preempt_excess_running_tasks(limit, reason='并发上限下调', only_active
                 terminated = bool(terminate_active_process(tid))
             except Exception:
                 pass
-            update_task(
-                tid,
-                status=TASK_STATES['READY_FOR_UPLOAD'],
-                error_message=None,
-                upload_progress=f"{QUEUE_PREEMPT_MARK}（第 {idx} 位）…",
-                preempted=1,
-                queue_priority=1,
-                queue_position=idx,
-                suppress_notification=True,
-            )
+            if landing == TASK_STATES['READY_FOR_UPLOAD']:
+                update_task(
+                    tid,
+                    status=landing,
+                    error_message=None,
+                    upload_progress=f"{QUEUE_PREEMPT_MARK}（第 {idx} 位）…",
+                    preempted=1,
+                    queue_priority=1,
+                    queue_position=idx,
+                    suppress_notification=True,
+                )
+            else:
+                # 还没下载完：回等待处理队首，配额恢复后从断点继续，别塞进上传队列
+                update_task(
+                    tid,
+                    status=landing,
+                    error_message=None,
+                    upload_progress=None,
+                    preempted=0,
+                    queue_priority=1,
+                    queue_position=None,
+                    suppress_notification=True,
+                )
             moved.append(tid)
             logger.info(
                 f"[并发让位] 任务 {tid[:8]}（原状态 {task.get('status')}）让出并发配额，"
-                f"转到准备上传队列第 {idx} 位，子进程终止={terminated}。原因：{reason}"
+                f"转入{('准备上传队列第 %d 位' % idx) if landing == TASK_STATES['READY_FOR_UPLOAD'] else '等待处理队首'}"
+                f"，子进程终止={terminated}。原因：{reason}"
             )
         except Exception as e:
             clear_task_preempt(tid)
             logger.warning(f"[并发让位] 任务 {tid} 让位失败: {e}")
     if moved:
+        _PREEMPT_LAST_TS = time.time()
         try:
             _refresh_queue_positions()
         except Exception:
@@ -1537,6 +1829,61 @@ def count_pending_preempted_tasks():
         ).fetchone()
         return int(row[0] or 0) if row else 0
     except Exception:
+        return 0
+    finally:
+        conn.close()
+
+
+def repair_video_less_ready_tasks():
+    """修掉「准备上传但没有本地视频」的历史垃圾任务。
+
+    这类任务多半是并发让位时把还没下载完的任务直接标成了准备上传：它们没有成品
+    视频，永远传不上去，却长期占着上传队列，导致真正下载好的任务排到几百位之后
+    迟迟不传（表现为「只下载不上传、下载完就没了」）。
+
+    - 有元数据翻译失败记录的 → 退回「等待人工审核」（本来就是它该去的地方）；
+    - 其余 → 退回「等待处理」，重新排队从断点继续下载。
+    """
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, COALESCE(error_category, ''), COALESCE(error_message, '') FROM tasks "
+            "WHERE status = ? AND (video_path_local IS NULL OR TRIM(video_path_local) = '')",
+            (TASK_STATES['READY_FOR_UPLOAD'],)
+        ).fetchall()
+        if not rows:
+            return 0
+        review_ids, pending_ids = [], []
+        for row in rows:
+            tid, category, message = row[0], row[1], row[2]
+            # 翻译失败（含历史写法）本来就是待审核任务，退回审核；其余回等待处理继续下载
+            is_translation_blocked = (
+                category == METADATA_TRANSLATION_ERROR_CATEGORY
+                or message.startswith('自动翻译失败')
+                or message.startswith('自动翻译未完成')
+            )
+            (review_ids if is_translation_blocked else pending_ids).append(tid)
+
+        def _move(ids, status):
+            for tid in ids:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, upload_progress = NULL, progress_speed = NULL, "
+                    "preempted = 0, queue_priority = 0, queue_position = NULL, updated_at = ? "
+                    "WHERE id = ?",
+                    (status, now_str, tid)
+                )
+
+        _move(review_ids, TASK_STATES['AWAITING_REVIEW'])
+        _move(pending_ids, TASK_STATES['PENDING'])
+        conn.commit()
+        logger.warning(
+            f"[数据修复] {len(rows)} 个「准备上传」任务没有本地视频："
+            f"{len(review_ids)} 个退回等待人工审核，{len(pending_ids)} 个退回等待处理"
+        )
+        return len(rows)
+    except Exception as e:
+        logger.warning(f"[数据修复] 清理无视频的准备上传任务失败: {e}")
         return 0
     finally:
         conn.close()
@@ -1591,14 +1938,41 @@ def get_tasks_paginated(page=1, per_page=20, status=None, search=None):
         total = cursor.fetchone()[0] or 0
         total_pages = math.ceil(total / per_page) if per_page > 0 else 0
         offset = (page - 1) * per_page
-        # 分层排序：上传中永远置顶 → 正在启动上传 → 排队任务按队列位次从小到大 → 其余按更新时间倒序
+        # 分层排序：
+        # 1~3. 上传中 / 正在启动上传 / 排队上传（功能性顺序，不能打乱上传队列）；
+        # 4. 下载比例 > 0 且未完成的任务（从第 1 页起置顶，按比例从大到小，重启后续跑的先看到）；
+        # 5. 等待处理/已暂停（比例都是 0，按手动继续 → 创建时间）；
+        # 6. 其余进行中/待审核/失败等按更新时间倒序；
+        # 7. 已完成永远排在整张表的最后（不参与前面的排序），内部按更新时间倒序。
+        _ratio_expr = (
+            "COALESCE(download_progress, CASE WHEN video_path_local IS NOT NULL "
+            "AND TRIM(video_path_local) != '' THEN 1.0 ELSE 0 END)"
+        )
         order_clause = f"""
             ORDER BY
                 CASE
+                    WHEN status = '{TASK_STATES['COMPLETED']}' THEN 7
                     WHEN status = '{TASK_STATES['UPLOADING']}' THEN 0
                     WHEN status = '{TASK_STATES['READY_FOR_UPLOAD']}' AND upload_progress LIKE '{QUEUE_STARTING_MARK}%' THEN 1
                     WHEN status = '{TASK_STATES['READY_FOR_UPLOAD']}' THEN 2
-                    ELSE 3
+                    WHEN {_ratio_expr} > 0 THEN 3
+                    WHEN status IN ('{TASK_STATES['PENDING']}', '{TASK_STATES['PAUSED']}') THEN 4
+                    ELSE 5
+                END ASC,
+                CASE
+                    WHEN status NOT IN ('{TASK_STATES['UPLOADING']}', '{TASK_STATES['READY_FOR_UPLOAD']}')
+                        THEN {_ratio_expr}
+                    ELSE 0
+                END DESC,
+                CASE
+                    WHEN status IN ('{TASK_STATES['PENDING']}', '{TASK_STATES['PAUSED']}')
+                        THEN COALESCE(queue_priority, 0)
+                    ELSE 0
+                END DESC,
+                CASE
+                    WHEN status IN ('{TASK_STATES['PENDING']}', '{TASK_STATES['PAUSED']}')
+                        THEN COALESCE(created_at, '')
+                    ELSE ''
                 END ASC,
                 CASE
                     WHEN status = '{TASK_STATES['READY_FOR_UPLOAD']}' AND upload_progress NOT LIKE '{QUEUE_STARTING_MARK}%'
@@ -1658,11 +2032,43 @@ def get_tasks_by_status(status):
     finally:
         conn.close()
 
-def delete_task(task_id, delete_files=True):
+def _clear_task_local_paths(task_id):
+    """文件删掉后把库里的本地路径清空，避免界面指向已不存在的文件。"""
+    try:
+        update_task(
+            task_id,
+            video_path_local=None,
+            cover_path_local=None,
+            subtitle_path_original=None,
+            subtitle_path_translated=None,
+            metadata_json_path_local=None,
+            upload_progress=FILES_DELETED_MARK,
+            download_progress=0.0,
+            silent=True,
+            suppress_notification=True,
+        )
+    except Exception as e:
+        logger.debug(f"清理任务 {task_id} 的本地文件路径失败: {e}")
+
+
+def delete_task(task_id, delete_files=True, delete_record=None):
+    """删除任务。
+
+    delete_record=None 时按状态自动决定：**已完成任务的数据库记录永远保留**，
+    只把下载目录里的文件删掉——记录留着，后续添加同一个视频才能被判成「已存在」。
+    其他状态（失败/未开始等）仍按原逻辑连记录一起删。
+    """
     task = get_task(task_id)
     if not task: return False
+    if delete_record is None:
+        delete_record = task.get('status') != TASK_STATES['COMPLETED']
     request_task_cancel(task_id)
     if delete_files: delete_task_files(task_id)
+    if not delete_record:
+        _clear_task_local_paths(task_id)
+        logger.info(f"任务 {task_id} 已删除文件，数据库记录保留（状态：{task.get('status')}）")
+        publish_task_event('task_files_deleted', {'task_id': task_id})
+        return True
     conn = get_db_connection()
     try:
         conn.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
@@ -1675,14 +2081,26 @@ def delete_task(task_id, delete_files=True):
     finally:
         conn.close()
 
-def clear_all_tasks(delete_files=True):
+def clear_all_tasks(delete_files=True, keep_completed=True):
+    """清空任务。
+
+    keep_completed=True（默认）时只删掉未完成任务，已完成任务的记录留在 sqlite 里，
+    作为「任务列表」用于后续去重；文件仍然按 delete_files 正常删除。
+    """
     tasks = get_all_tasks()
     for task in tasks: request_task_cancel(task['id'])
     if delete_files:
         for task in tasks: delete_task_files(task['id'])
+    if delete_files and keep_completed:
+        for task in tasks:
+            if task.get('status') == TASK_STATES['COMPLETED']:
+                _clear_task_local_paths(task['id'])
     conn = get_db_connection()
     try:
-        conn.execute('DELETE FROM tasks')
+        if keep_completed:
+            conn.execute('DELETE FROM tasks WHERE status <> ?', (TASK_STATES['COMPLETED'],))
+        else:
+            conn.execute('DELETE FROM tasks')
         conn.commit()
         publish_task_event('tasks_cleared', {})
         return True
@@ -2097,6 +2515,8 @@ QUEUE_STARTING_MARK = '正在启动上传…'
 QUEUE_RETIRED_MARK = '已退出上传队列'
 # 并发让位：任务因并发上限下调被中断，排在队列最前面等配额
 QUEUE_PREEMPT_MARK = '并发超限待继续'
+# 只删了任务文件、数据库记录仍保留（已完成任务用于后续去重）
+FILES_DELETED_MARK = '文件已删除（任务记录保留）'
 # schedule_task 的返回值：并发已满，任务保留原状态排队等空位（不是错误）
 TASK_WAITING_FOR_SLOT = 'waiting_for_slot'
 # 点了「停止」后，给上传线程多少秒自行退出；超时则强制交还配额让队列继续
@@ -2129,6 +2549,106 @@ def _download_data_priority(task_id):
         return 0
 
 
+# 文本里的百分比：「63.5%」「 12 %」都能认出来
+_PERCENT_IN_TEXT_RE = re.compile(r'(\d+(?:\.\d+)?)\s*%')
+# 只有这些状态下，upload_progress 里的百分比才代表「下载进度」
+# （上传阶段的百分比是上传进度，不能拿来当已下载比例）
+_DOWNLOAD_RATIO_TEXT_STATES = (
+    TASK_STATES['PENDING'], TASK_STATES['PAUSED'], TASK_STATES['DOWNLOADING'],
+)
+
+
+def _coerce_download_ratio(value):
+    """把已下载比例归一化到 0~1；判断不出来返回 None。"""
+    if value is None or value == '':
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ratio != ratio:  # NaN
+        return None
+    if ratio > 1.0:  # 兼容按 0~100 存进来的值
+        ratio = ratio / 100.0
+    if ratio < 0:
+        return None
+    return min(1.0, ratio)
+
+
+def _download_progress_ratio(task):
+    """任务的「已下载比例」0~1，用于重启后按进度从高到低续跑。
+
+    判断顺序：
+    1. 有成品视频（video_path_local 有值）→ 1.0，最快能接上后续流程；
+    2. download_progress 字段（下载时实时写库，暂停/重启都不丢）；
+    3. 历史任务兜底：从 upload_progress 的「63.5%」文本里取（仅限下载前阶段）；
+    4. 都没有 → 0.0，说明这个任务还没下载过。
+    """
+    if not isinstance(task, dict):
+        return 0.0
+    if str(task.get('video_path_local') or '').strip():
+        return 1.0
+    ratio = _coerce_download_ratio(task.get('download_progress'))
+    text_ratio = None
+    if str(task.get('status') or '') in _DOWNLOAD_RATIO_TEXT_STATES:
+        match = _PERCENT_IN_TEXT_RE.search(str(task.get('upload_progress') or ''))
+        if match:
+            try:
+                text_ratio = max(0.0, min(1.0, float(match.group(1)) / 100.0))
+            except ValueError:
+                text_ratio = None
+    if ratio is None:
+        return text_ratio if text_ratio is not None else 0.0
+    # 下载中的任务文本比字段更新（旧版本代码只写文本），取大的那个更接近真实进度
+    if text_ratio is not None and text_ratio > ratio:
+        return text_ratio
+    return ratio
+
+
+def task_download_ratio(task):
+    """列表展示用的「已下载比例」0~1，所有状态都给得出值。
+
+    排序用的 _download_progress_ratio 只关心「还没跑完的任务下了多少」；
+    展示时已完成的任务必然下载过（哪怕本地文件后来被删），按 100% 算；
+    取不到任何信息（比如从没开始下载）→ 0.0。
+    """
+    if task is None:
+        return 0.0
+    if not isinstance(task, dict):
+        try:
+            task = dict(task)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        ratio = _download_progress_ratio(task)
+    except Exception:
+        ratio = 0.0
+    if ratio <= 0 and str(task.get('status') or '') == TASK_STATES['COMPLETED']:
+        return 1.0
+    return ratio
+
+
+def _download_tier_for_task(task):
+    """有比例就不扫盘；没有比例时才看目录里有没有残留，避免几百个任务反复 listdir。"""
+    if _download_progress_ratio(task) > 0:
+        return 0
+    return _download_data_priority(task.get('id'))
+
+
+def pending_task_sort_key(task):
+    """等待处理队列排序：手动继续优先 → 已下载比例从大到小 → 有无下载数据 → 创建时间。
+
+    重启后 yt-dlp 能从 .part 续传，所以下载得最多的先跑完、最快腾出并发；
+    没下载过的任务比例都是 0，排序结果和原来完全一致（按创建时间排队）。
+    """
+    return (
+        -int(task.get('queue_priority') or 0),
+        -_download_progress_ratio(task),
+        -_download_tier_for_task(task),
+        task.get('created_at') or '',
+    )
+
+
 def _list_queued_upload_tasks(limit=200):
     """数据库里仍在「上传队列」中的任务：状态=准备上传（除「已退出队列」外）。
 
@@ -2143,6 +2663,7 @@ def _list_queued_upload_tasks(limit=200):
         # 它们由调度器恢复流程，所以这里排除掉。
         rows = conn.execute(
             "SELECT id, created_at FROM tasks WHERE status = ? AND COALESCE(preempted, 0) = 0 "
+            "AND video_path_local IS NOT NULL AND TRIM(video_path_local) != '' "
             "AND (upload_progress IS NULL OR upload_progress = '' OR upload_progress NOT LIKE ?) LIMIT ?",
             (TASK_STATES['READY_FOR_UPLOAD'], QUEUE_RETIRED_MARK + '%', int(limit) * 2)
         ).fetchall()
@@ -2168,7 +2689,9 @@ def _refresh_queue_positions():
         conn.execute("UPDATE tasks SET queue_position = NULL WHERE status = ?", (TASK_STATES['READY_FOR_UPLOAD'],))
         rows = conn.execute(
             "SELECT id, created_at, COALESCE(preempted, 0) AS preempted, COALESCE(queue_priority, 0) AS queue_priority "
-            "FROM tasks WHERE status = ? AND (upload_progress IS NULL OR upload_progress = '' OR (upload_progress NOT LIKE ? AND upload_progress != ?))",
+            "FROM tasks WHERE status = ? "
+            "AND video_path_local IS NOT NULL AND TRIM(video_path_local) != '' "
+            "AND (upload_progress IS NULL OR upload_progress = '' OR (upload_progress NOT LIKE ? AND upload_progress != ?))",
             (TASK_STATES['READY_FOR_UPLOAD'], QUEUE_RETIRED_MARK + '%', QUEUE_STARTING_MARK)
         ).fetchall()
         # 位次与实际取任务顺序一致：并发让位的插到最前 → 有下载数据优先 → 其余按创建时间
@@ -2529,6 +3052,9 @@ class TaskProcessor:
         if not _RESUME_RECOVERY_DONE:
             try: recover_interrupted_tasks_to_pending()
             finally: _RESUME_RECOVERY_DONE = True
+        # 启动时修一次：没有视频却停在「准备上传」的任务会把上传队列堵死
+        try: repair_video_less_ready_tasks()
+        except Exception as _e: logger.debug(f"启动数据修复失败（忽略）: {_e}")
         self._register_periodic_jobs()
 
     def _register_periodic_jobs(self):
@@ -2602,6 +3128,9 @@ class TaskProcessor:
     def _resume_preempted_tasks(self, free_slots):
         """把「并发让位」的任务按队列位次恢复，优先于 pending 任务。"""
         if free_slots <= 0:
+            return 0
+        # 刚让位完给线程一点收尾时间：立刻恢复会叠加出「上限 1 却在跑好几个」的假象
+        if time.time() - _PREEMPT_LAST_TS < 10:
             return 0
         try:
             conn = get_db_connection()
@@ -2885,6 +3414,17 @@ class TaskProcessor:
                     task_logger.info("任务当前处于人工审核状态，保留待审核状态")
                 elif task['status'] != TASK_STATES['COMPLETED'] and task['status'] != TASK_STATES['FAILED']:
                     if not self.config.get('AUTO_MODE_ENABLED', False) or not _task_has_upload_response(task, upload_target):
+                        if not task_has_downloaded_video(task):
+                            # 没有成品视频却标成准备上传 → 永远传不上去，还会堵住上传队列
+                            update_task(
+                                task_id,
+                                status=TASK_STATES['FAILED'],
+                                error_message='处理流程结束但没有生成本地视频文件，无法上传',
+                                upload_progress=None,
+                                suppress_notification=True,
+                            )
+                            task_logger.error("处理流程结束但没有生成本地视频文件，已标记失败（不再进入上传队列）")
+                            return
                         update_task(task_id, status=TASK_STATES['READY_FOR_UPLOAD'])
                         task_logger.info("任务处理完成，标记为准备上传")
                     else:
@@ -2892,6 +3432,13 @@ class TaskProcessor:
                         task_logger.info("任务处理并上传完成")
             else:
                 update_task(task_id, status=TASK_STATES['READY_FOR_UPLOAD'])
+        except TaskDeferredError:
+            # 下载被暂停：任务退回等待队列，已完成的阶段存在 checkpoint 里，恢复后从下载这一步接着走
+            task_logger.info("任务已推迟（下载已暂停），退回等待队列")
+            try:
+                update_task(task_id, status=TASK_STATES['PENDING'], error_message=None)
+            except Exception as _defer_err:
+                task_logger.warning(f"推迟任务时写库失败: {_defer_err}")
         except TaskCancelledError:
             task_logger.info("任务已取消，停止后续处理")
             finalize_cancelled_task(task_id, "任务已取消")
@@ -2917,6 +3464,24 @@ class TaskProcessor:
                 self._check_and_start_next_pending_task()
             threading.Thread(target=delayed_check, daemon=True).start()
 
+    def _log_pending_order(self, candidates):
+        """等待处理队列的顺序只在变化时打一次日志，便于确认重启后按进度排了序。"""
+        global _LAST_PENDING_ORDER_SIG
+        try:
+            head = candidates[:8]
+            signature = tuple(
+                (t.get('id'), round(_download_progress_ratio(t), 4)) for t in head
+            ) + (len(candidates),)
+            if signature == _LAST_PENDING_ORDER_SIG:
+                return
+            _LAST_PENDING_ORDER_SIG = signature
+            preview = ' → '.join(
+                f"{str(t.get('id'))[:8]}({_download_progress_ratio(t) * 100:.1f}%)" for t in head
+            )
+            logger.info(f"等待处理队列顺序（按已下载比例从高到低）: {preview}（共 {len(candidates)} 个）")
+        except Exception as e:
+            logger.debug(f"输出等待队列顺序失败（忽略）: {e}")
+
     def _check_and_start_next_pending_task(self):
         # 上传队列补位：进程启动恢复后、以及每 30 秒扫描时，把排队的上传任务接上
         try:
@@ -2936,27 +3501,22 @@ class TaskProcessor:
             logger.debug(f"读取最新配置失败，沿用当前配置: {e}")
         
         self._refresh_runtime_limits(force=False)
+
+        # 「暂停下载」只拦下载：上传队列在上面已经补过位了，这里直接收手，
+        # 不启动任何新任务；已经在跑的下载不会被中断，会自然跑完。
+        if is_download_paused():
+            logger.debug("下载已暂停：跳过本轮待处理任务启动（上传队列不受影响）")
+            return
+
         max_concurrent = _as_int(self.config.get('MAX_CONCURRENT_TASKS', 2), 2, minimum=1)
         if _should_reduce_concurrency():
             max_concurrent = max(1, max_concurrent // 2)
             logger.info(f"检测到高内存使用，降低并发数至 {max_concurrent}")
 
-        # 自愈：如果实际还有工作线程在跑的任务比上限多（历史遗留、启动恢复、
-        # 或上一次并发下调时没来得及收尾），先把多出来的转入「准备上传」最前面。
-        # 只统计真正活动的线程，避免把数据库里的僵尸状态当成正在运行。
-        try:
-            active_processing = count_active_processing_tasks()
-            if active_processing > max_concurrent:
-                moved = preempt_excess_running_tasks(
-                    max_concurrent, reason='实际运行数超过并发上限', only_active=True
-                )
-                if moved:
-                    logger.info(
-                        f"检测到 {active_processing} 个任务在跑、并发上限 {max_concurrent}，"
-                        f"已将 {len(moved)} 个超出的任务转入准备上传队列最前面"
-                    )
-        except Exception as e:
-            logger.debug(f"并发自愈检查失败（忽略）: {e}")
+        # 这里不再做「实际运行数超过上限就自动让位」的自愈：
+        # 刚让位的线程可能还没真正退出，扫描会把它们再次判定为「在跑」，
+        # 于是每 5 秒让位一次、再恢复一次，任务永远在下载和排队之间来回跳，
+        # 既下载不完也传不上去。并发收紧只在设置真正下调时处理一次。
 
         active_task_ids = _get_active_task_ids()
         pending_tasks = [
@@ -2999,12 +3559,10 @@ class TaskProcessor:
             )
             return
 
-        # 手动继续（queue_priority=1）优先 → 有下载数据优先 → 创建时间
-        candidates.sort(key=lambda x: (
-            -int(x.get('queue_priority') or 0),
-            -_download_data_priority(x.get('id')),
-            x.get('created_at') or '',
-        ))
+        # 手动继续（queue_priority=1）优先 → 已下载比例高的优先（重启后能续传）
+        # → 有下载数据优先 → 创建时间
+        candidates.sort(key=pending_task_sort_key)
+        self._log_pending_order(candidates)
         started = 0
         for next_task in candidates:
             if started >= free_slots:
@@ -3014,7 +3572,8 @@ class TaskProcessor:
             tid = next_task['id']
             logger.info(
                 f"准备启动任务: {tid[:8]}... "
-                f"(状态={next_task.get('status')}, 优先级={int(next_task.get('queue_priority') or 0)})"
+                f"(状态={next_task.get('status')}, 优先级={int(next_task.get('queue_priority') or 0)}, "
+                f"已下载={_download_progress_ratio(next_task) * 100:.1f}%)"
             )
             job_id = self.schedule_task(tid)
             if job_id == f"thread_{tid}":
@@ -3095,6 +3654,11 @@ class TaskProcessor:
     def _download_video_file(self, task_id, youtube_url, task_logger):
         """下载视频本体。返回 True 表示视频已就绪；False 表示失败（状态与原因已写入任务）。"""
         from modules.youtube_handler import download_video_data
+        if is_download_paused():
+            # 暂停下载期间绝不新开下载：任务原样退回等待队列（进度/checkpoint 都保留），
+            # 恢复下载后会从断点接着跑，既不算失败也不丢已完成的阶段。
+            task_logger.info("下载已暂停：本任务推迟下载，退回等待队列")
+            raise TaskDeferredError("下载已暂停")
         task_logger.info(f"审核通过，开始下载视频文件: {youtube_url}")
         update_task(task_id, status=TASK_STATES['DOWNLOADING'])
         _raise_if_cancelled(task_id, task_logger)
@@ -3110,7 +3674,18 @@ class TaskProcessor:
             task_logger.debug(f"下载进度: {progress_msg}")
             # yt-dlp 会直接给出速度文本（如 "1.23MiB/s"），转成 bytes/s 存库供列表展示
             speed_bps = parse_speed_text(progress_info.get('speed'))
-            update_task(task_id, upload_progress=progress_msg, progress_speed=speed_bps, silent=True)
+            # 已下载比例落库：重启后据此把下载得最多的任务排到前面续跑
+            try:
+                ratio = max(0.0, min(1.0, float(percent) / 100.0))
+            except (TypeError, ValueError):
+                ratio = None
+            update_task(
+                task_id,
+                upload_progress=progress_msg,
+                progress_speed=speed_bps,
+                download_progress=ratio,
+                silent=True,
+            )
 
         last_error = ''
         for attempt in (1, 2):
@@ -3125,7 +3700,7 @@ class TaskProcessor:
             if success:
                 task_logger.info("视频文件下载成功")
                 task = get_task(task_id)
-                update_data = {'status': TASK_STATES['DOWNLOADED'], 'video_path_local': result.get('video_path', ''), 'upload_progress': None}
+                update_data = {'status': TASK_STATES['DOWNLOADED'], 'video_path_local': result.get('video_path', ''), 'upload_progress': None, 'download_progress': 1.0}
                 if task is not None:
                     if result.get('metadata_path') and not task.get('metadata_json_path_local'): update_data['metadata_json_path_local'] = result.get('metadata_path')
                     if result.get('cover_path') and not task.get('cover_path_local'): update_data['cover_path_local'] = result.get('cover_path')
@@ -3134,9 +3709,13 @@ class TaskProcessor:
             last_error = str(result)
             task_logger.error(f"视频文件下载失败（第 {attempt} 次）: {last_error}")
             if attempt == 1:
+                if is_download_paused():
+                    # 第一次失败恰好赶上用户按了暂停：不再重试，退回队列等恢复
+                    task_logger.info("下载已暂停：不再重试下载，任务退回等待队列")
+                    raise TaskDeferredError("下载已暂停")
                 # 续传失败多半是碎片损坏，清掉碎片再整段重下一次
                 if self._clean_partial_downloads(task_id, task_logger) > 0:
-                    update_task(task_id, status=TASK_STATES['DOWNLOADING'], upload_progress='0.0%')
+                    update_task(task_id, status=TASK_STATES['DOWNLOADING'], upload_progress='0.0%', download_progress=0.0)
                     continue
             break
         update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"下载视频失败: {last_error}")
@@ -5763,6 +6342,8 @@ def force_upload_task(task_id, config=None):
     if not task: return False
     allowed_states = [TASK_STATES['AWAITING_REVIEW'], TASK_STATES['COMPLETED'], TASK_STATES['PENDING'], TASK_STATES['READY_FOR_UPLOAD']]
     if task['status'] not in allowed_states: return False
+    # 没有成品视频就没有可上传的东西，别把任务塞进上传队列
+    if not task_has_downloaded_video(task): return False
     if not config:
         try:
             from flask import current_app

@@ -1406,6 +1406,26 @@ html.dark .selection-bar.all-mode { background: linear-gradient(135deg, rgba(52,
 .tasks-table tbody tr.row-selected > td { background-color: rgba(13, 110, 253, .06) !important; }
 html.dark .tasks-table tbody tr.row-selected > td { background-color: rgba(77, 148, 255, .12) !important; }
 
+/* 跨页批量选择只允许同一状态：状态锁徽标 + 不可勾选行淡化 */
+.selection-bar .sel-status-lock {
+    display: inline-flex; align-items: center; gap: .3rem;
+    padding: 2px 9px; border-radius: 999px;
+    font-size: .78rem; font-weight: 600; line-height: 1.5;
+    white-space: nowrap;
+    color: #8a5a00;
+    background: rgba(255, 193, 7, .16);
+    border: 1px solid rgba(255, 193, 7, .38);
+}
+html.dark .selection-bar .sel-status-lock {
+    color: #ffd675;
+    background: rgba(255, 193, 7, .14);
+    border-color: rgba(255, 193, 7, .3);
+}
+.tasks-table tbody tr.row-status-locked > td,
+.task-card.row-status-locked { opacity: .55; }
+.tasks-table tbody tr.row-status-locked .task-checkbox,
+.task-card.row-status-locked .task-checkbox { cursor: not-allowed; }
+
 /* ---- 模态框头部图标气泡（人工审核等页面） ---- */
 .modal-head-flex { display: flex; align-items: flex-start; gap: 14px; width: 100%; }
 .modal-head-icon {
@@ -1529,6 +1549,26 @@ html.dark .tasks-head-sticky::after {
     background-color: color-mix(in srgb, var(--y2a-text-muted) 14%, transparent);
 }
 .task-speed::selection { background-color: transparent; }
+
+/* 下载速度用蓝色 ↓，上传速度用紫色 ↑，和状态徽章一起看更直观 */
+.task-speed.task-speed-down { color: #0a58ca; background-color: rgba(13, 110, 253, .14); }
+.task-speed.task-speed-up { color: #6f42c1; background-color: rgba(111, 66, 193, .14); }
+html.dark .task-speed.task-speed-down { color: #8ab4ff; background-color: rgba(13, 110, 253, .26); }
+html.dark .task-speed.task-speed-up { color: #cbb2ff; background-color: rgba(150, 110, 240, .24); }
+
+/* 失败原因前面的日志生成时间：等宽小字，排在原因文本最前面 */
+.fail-reason-time {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    margin-inline-end: .4em;
+    font-size: .92em;
+    font-weight: 500;
+    line-height: 1.35;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    color: var(--y2a-text-muted);
+}
+.fail-reason-time::selection { background-color: transparent; }
 
 /* 已暂停任务：整行淡灰底，和「失败」的红色区分开，一眼能看出是用户主动暂停 */
 tr.status-paused td { background-color: rgba(108, 117, 125, .045); }

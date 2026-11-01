@@ -212,12 +212,8 @@
                                                                 <input type="checkbox" name="UPLOAD_APPEND_REPOST_NOTICE" {% if config.get('UPLOAD_APPEND_REPOST_NOTICE', True) %}checked{% endif %}>
                                                                 自动追加转载声明
                                                             </label>
-                                                            <label class="checkbox-label">
-                                                                <input type="checkbox" name="DELETE_DOWNLOAD_FILES_AFTER_UPLOAD" {% if config.get('DELETE_DOWNLOAD_FILES_AFTER_UPLOAD', False) %}checked{% endif %}>
-                                                                上传成功后不保留下载文件
-                                                            </label>
                                                         </div>
-                                                        <p class="help-text mt-2 mb-0">开启后，仅在任务的所有目标平台均上传成功时立即删除该任务的本地视频、封面和字幕；关闭时保留下载文件。</p>
+                                                        <p class="help-text mt-2 mb-0">「上传成功后是否保留下载文件」已统一到 <a href="#vtab-network" data-bs-toggle="tab" data-bs-target="#vtab-network" role="tab">网络与下载 › 文件维护</a>。</p>
                                                     </div>
                                                     <div class="col-md-6">
                                                         <div class="form-group">
@@ -739,11 +735,16 @@
                                                 </div>
                                             </div>
                                             <div class="settings-card-body">
-                                                <label class="checkbox-label mb-3">
-                                                    <input type="checkbox" name="DOWNLOAD_CLEANUP_ENABLED" {% if config.get('DOWNLOAD_CLEANUP_ENABLED', False) %}checked{% endif %}>
+                                                <label class="checkbox-label mb-2">
+                                                    <input type="checkbox" id="download-cleanup-enabled" name="DOWNLOAD_CLEANUP_ENABLED" {% if config.get('DOWNLOAD_CLEANUP_ENABLED', False) %}checked{% endif %}>
                                                     启用自动下载内容清理
                                                 </label>
-                                                <div class="row g-3">
+                                                <label class="checkbox-label mb-3">
+                                                    <input type="checkbox" id="delete-download-after-upload" name="DELETE_DOWNLOAD_FILES_AFTER_UPLOAD" {% if config.get('DELETE_DOWNLOAD_FILES_AFTER_UPLOAD', False) %}checked{% endif %}>
+                                                    上传完就删除下载的文件
+                                                </label>
+                                                <div class="alert alert-info py-2 px-3 mb-3" id="download-cleanup-mode-hint" role="status"></div>
+                                                <div class="row g-3" id="download-cleanup-time-settings">
                                                     <div class="col-md-6">
                                                         <div class="form-group">
                                                             <label for="download-cleanup-hours" class="form-label">保留下载内容小时数</label>
@@ -761,8 +762,12 @@
                                                     <button type="button" id="manual-download-cleanup-btn" class="btn btn-warning">
                                                         <i class="bi bi-trash"></i> 按时间清理下载内容
                                                     </button>
-                                                    <span class="help-text">将删除 <span class="text-primary">{{ config.get('DOWNLOAD_CLEANUP_HOURS', 72) }}</span> 小时前的下载文件和目录。</span>
+                                                    <span class="help-text">将删除 <span class="text-primary">{{ config.get('DOWNLOAD_CLEANUP_HOURS', 72) }}</span> 小时前的下载文件和目录（未完成任务不会被删）。</span>
                                                 </div>
+                                                <p class="help-text mt-2 mb-0">
+                                                    两个都勾选时以「上传完就删除下载的文件」为准：任务在所有目标平台上传成功后立即删除本地视频、封面和字幕，下方的时间设置与定时清理不再执行；
+                                                    只勾选「启用自动下载内容清理」时，按下方的保留时长和清理间隔定时执行。
+                                                </p>
                                             </div>
                                         </article>
                                     </div>

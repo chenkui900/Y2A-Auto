@@ -167,6 +167,62 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 }); 
 // ==========================================================
+// 设置页：下载内容清理 / 上传完就删除 的互斥说明
+//  - 两个都勾选 → 以上传完就删为准，时间设置（保留时长/间隔）停用
+//  - 只勾选自动清理 → 按时间设置执行
+// ==========================================================
+document.addEventListener('DOMContentLoaded', function () {
+    const cleanupToggle = document.getElementById('download-cleanup-enabled');
+    const deleteAfterUpload = document.getElementById('delete-download-after-upload');
+    const hint = document.getElementById('download-cleanup-mode-hint');
+    if (!cleanupToggle || !deleteAfterUpload || !hint) return;
+
+    const timeSettings = document.getElementById('download-cleanup-time-settings');
+    const hoursField = document.getElementById('download-cleanup-hours');
+    const intervalField = document.getElementById('download-cleanup-interval');
+
+    function readNumber(field, fallback) {
+        const value = field ? parseInt(field.value, 10) : NaN;
+        return (!isNaN(value) && value > 0) ? value : fallback;
+    }
+
+    function renderDownloadCleanupMode() {
+        const cleanupOn = cleanupToggle.checked;
+        const deleteOn = deleteAfterUpload.checked;
+        let tone = 'alert-info';
+        let text = '';
+
+        if (cleanupOn && deleteOn) {
+            tone = 'alert-success';
+            text = '当前模式：上传完就删除。任务在所有目标平台上传成功后立即删除本地视频、封面和字幕；下方的时间设置与定时清理不生效。';
+        } else if (cleanupOn) {
+            text = '当前模式：按时间清理。每 ' + readNumber(intervalField, 24) + ' 小时清理一次 '
+                + readNumber(hoursField, 72) + ' 小时前的下载内容（未完成任务的目录不会被删）。';
+        } else if (deleteOn) {
+            text = '当前模式：上传完就删除。任务上传成功后立即删除本地文件；未开启自动清理，失败任务的残留需手动清理。';
+        } else {
+            tone = 'alert-secondary';
+            text = '当前未启用任何自动清理：下载文件会一直保留，直到手动删除任务文件。';
+        }
+
+        hint.className = 'alert ' + tone + ' py-2 px-3 mb-3';
+        hint.textContent = text;
+
+        // 上传完就删已生效时，时间设置没有意义：置灰并停用（停用后不会提交，保存时保留原值）
+        if (timeSettings) timeSettings.classList.toggle('opacity-50', deleteOn);
+        [hoursField, intervalField].forEach(function (field) {
+            if (field) field.disabled = deleteOn;
+        });
+    }
+
+    cleanupToggle.addEventListener('change', renderDownloadCleanupMode);
+    deleteAfterUpload.addEventListener('change', renderDownloadCleanupMode);
+    [hoursField, intervalField].forEach(function (field) {
+        if (field) field.addEventListener('input', renderDownloadCleanupMode);
+    });
+    renderDownloadCleanupMode();
+});
+// ==========================================================
 // 通用提示对话框（美化版）：y2aAlert / y2aConfirm
 //  - Promise 风格：await y2aConfirm('确定吗？')  -> true / false
 //  - 支持标题、图标类型、补充说明、深浅色主题、ESC/点击遮罩关闭

@@ -56,7 +56,7 @@ from modules.utils import get_app_subdir
 from modules.config_manager import load_config, update_config, reset_specific_config, DEFAULT_CONFIG
 from modules.whisper_languages import WHISPER_LANGUAGE_LIST
 from modules.subtitle_style import normalize_hex_color
-from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_task_ids_filtered, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path, is_task_active, format_speed
+from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_task_ids_filtered, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path, is_task_active, format_speed, task_has_downloaded_video, find_duplicate_task
 from modules.acfun_auth import AcfunQrLoginSession
 from modules.bilibili_auth import BilibiliQrLoginSession
 from queue import Empty, Queue
@@ -1870,6 +1870,35 @@ app.jinja_env.filters['friendly_error'] = _friendly_error
 # 传输速度格式化：bytes/s -> "3.4 MB/s"（任务列表显示下载/上传速度）
 app.jinja_env.filters['format_speed'] = format_speed
 
+
+def format_log_time(value):
+    """失败原因前的日志时间：本年显示「MM-DD HH:MM」，跨年补全年份；解析失败原样返回。"""
+    if value is None:
+        return ''
+    text = str(value).strip()
+    if not text:
+        return ''
+    dt = None
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f',
+                '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            dt = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return text
+    if dt.year == datetime.now().year:
+        return dt.strftime('%m-%d %H:%M')
+    return dt.strftime('%Y-%m-%d %H:%M')
+
+
+app.jinja_env.filters['format_log_time'] = format_log_time
+
+# 已下载比例（0~1）：任务列表所有状态都显示，已完成按 100% 算
+from modules.task_manager import task_download_ratio as _task_download_ratio
+app.jinja_env.filters['download_ratio'] = _task_download_ratio
+
 ALIYUN_LABEL_MAP = {
     "pornographic_adult": "疑似色情内容",
     "sexual_terms": "疑似性健康内容",
@@ -2071,9 +2100,20 @@ def index():
         )
         created_today = cur.fetchone()[0] or 0
 
-        # 最近任务（按更新时间倒序）
+        # 最近任务：已下载比例 > 0 的排最前（从大到小，和任务列表同一套规则），
+        # 其余按更新时间倒序；已完成永远排在这 10 条的最后。
+        _recent_ratio_expr = (
+            "COALESCE(download_progress, CASE WHEN video_path_local IS NOT NULL "
+            "AND TRIM(video_path_local) != '' THEN 1.0 ELSE 0 END)"
+        )
         cur.execute(
-            "SELECT id, video_title_translated, video_title_original, status, updated_at, upload_target, acfun_upload_response, bilibili_upload_response FROM tasks ORDER BY updated_at DESC LIMIT 10"
+            "SELECT id, video_title_translated, video_title_original, status, updated_at, upload_target, "
+            "acfun_upload_response, bilibili_upload_response, "
+            f"{_recent_ratio_expr} AS dl_ratio, upload_progress, progress_speed "
+            "FROM tasks "
+            f"ORDER BY CASE WHEN status = ? THEN 2 WHEN {_recent_ratio_expr} > 0 THEN 0 ELSE 1 END ASC, "
+            f"{_recent_ratio_expr} DESC, updated_at DESC LIMIT 10",
+            (TASK_STATES['COMPLETED'],),
         )
         rows = cur.fetchall()
         recent_tasks = []
@@ -2108,7 +2148,11 @@ def index():
                 'status': r[3],
                 'updated_at': r[4],
                 'upload_target': upload_target,
-                'upload_id': upload_id
+                'upload_id': upload_id,
+                # 首页也显示已下载比例（SQL 里已按同一口径算好，已完成按 100%）
+                'download_ratio': 1.0 if r[3] == TASK_STATES['COMPLETED'] else float(r[8] or 0.0),
+                'upload_progress': r[9],
+                'progress_speed': r[10],
             })
 
         conn.close()
@@ -2184,14 +2228,6 @@ def _build_processing_states():
     )
 
 
-def _build_download_stage_states():
-    """「进行中」里上传之前的所有阶段（下载/翻译/压制…），与「上传中」互斥。"""
-    return ','.join(
-        s for s in _build_processing_states().split(',')
-        if s and s != TASK_STATES['UPLOADING']
-    )
-
-
 @app.route('/tasks/filtered_ids')
 @login_required
 def tasks_filtered_ids():
@@ -2200,8 +2236,6 @@ def tasks_filtered_ids():
     processing_states = _build_processing_states()
     if status_filter == 'processing':
         status_filter = processing_states
-    elif status_filter == 'download_stage':
-        status_filter = _build_download_stage_states()
     search_keyword = (request.args.get('q') or '').strip()
     ids = get_task_ids_filtered(status=status_filter, search=search_keyword)
     return jsonify({'success': True, 'ids': ids, 'total': len(ids)})
@@ -2225,9 +2259,6 @@ def tasks():
 
     if status_filter == 'processing':
         status_filter = processing_states
-    elif status_filter == 'download_stage':
-        # 首页「进行中」卡片的「下载中」分区：上传前的所有处理阶段
-        status_filter = _build_download_stage_states()
 
     # 关键词搜索：标题/URL/任务ID/上传结果（AcFun、B站投稿响应）
     search_keyword = (request.args.get('q') or '').strip()
@@ -2243,15 +2274,13 @@ def tasks():
     bilibili_partition_mapping = _build_bilibili_partition_mapping()
     
     # 构建筛选下拉框选项
-    # 注：不单列「上传中」——它包含在「进行中」里，避免筛选内容重复
+    # 「下载中」「上传中」不再单独列出来——它们都属于「进行中」，避免同一个任务
+    # 在多个筛选里重复出现；单独想看某一段时仍可用 URL 参数，但下拉只保留「进行中」。
     status_options = [
         {'value': '', 'label': '全部任务'},
         {'value': TASK_STATES['PENDING'], 'label': '等待处理'},
         {'value': TASK_STATES['READY_FOR_UPLOAD'], 'label': '准备上传'},
         {'value': 'processing', 'label': '进行中（含上传中）'},
-        {'value': 'download_stage', 'label': '下载中（含处理阶段）'},
-        {'value': TASK_STATES['DOWNLOADING'], 'label': '下载中'},
-        {'value': TASK_STATES['UPLOADING'], 'label': '上传中'},
         {'value': TASK_STATES['AWAITING_REVIEW'], 'label': '等待人工审核'},
         {'value': TASK_STATES['SCHEDULED_UPLOAD'], 'label': '定时上传'},
         {'value': TASK_STATES['PAUSED'], 'label': '已暂停'},
@@ -2273,6 +2302,12 @@ def tasks():
     except Exception:
         scheduled_count = 0
 
+    try:
+        from modules.task_manager import is_download_paused
+        download_paused = bool(is_download_paused())
+    except Exception:
+        download_paused = False
+
     return render_template(
         'tasks.html', 
         tasks=pagination_data['tasks'],
@@ -2283,7 +2318,8 @@ def tasks():
         current_search=search_keyword,
         acfun_partition_mapping=acfun_partition_mapping,
         bilibili_partition_mapping=bilibili_partition_mapping,
-        scheduled_count=scheduled_count
+        scheduled_count=scheduled_count,
+        download_paused=download_paused
     )
 
 
@@ -2741,8 +2777,12 @@ def add_task_via_extension():
                 return jsonify({'success': False, 'message': '未能提取到播放列表中的视频'}), 400
             
             added_count = 0
+            duplicate_count = 0
             task_ids = []
             for url in video_urls:
+                if find_duplicate_task(url):
+                    duplicate_count += 1
+                    continue
                 task_id = add_task(url, upload_target=upload_target)
                 if task_id:
                     added_count += 1
@@ -2751,14 +2791,26 @@ def add_task_via_extension():
                     if config.get('AUTO_MODE_ENABLED', False):
                         start_task(task_id, config)
             
+            message = f'已批量添加 {added_count} 个视频任务（来自播放列表）'
+            if duplicate_count:
+                message += f'，跳过 {duplicate_count} 个已存在的视频'
             return jsonify({
                 'success': True,
-                'message': f'已批量添加 {added_count} 个视频任务（来自播放列表）',
+                'message': message,
                 'task_ids': task_ids,
-                'count': added_count
+                'count': added_count,
+                'duplicates': duplicate_count
             }), 200
         else:
             # 单个视频
+            duplicate = find_duplicate_task(youtube_url)
+            if duplicate:
+                return jsonify({
+                    'success': False,
+                    'duplicate': True,
+                    'message': f'该视频已在任务列表中（状态：{task_status_display(duplicate.get("status"))}）',
+                    'task_id': duplicate.get('id')
+                }), 409
             task_id = add_task(youtube_url, upload_target=upload_target)
             if task_id:
                 if config.get('AUTO_MODE_ENABLED', False):
@@ -2806,13 +2858,28 @@ def add_task_route():
             flash('未能提取到播放列表中的视频', 'danger')
             return redirect(url_for('tasks'))
         added_count = 0
+        duplicate_count = 0
         for url in video_urls:
+            if find_duplicate_task(url):
+                duplicate_count += 1
+                continue
             task_id = add_task(url, upload_target=upload_target)
             if task_id:
                 added_count += 1
-        flash(f'已批量添加 {added_count} 个视频任务（来自播放列表）', 'success')
+        message = f'已批量添加 {added_count} 个视频任务（来自播放列表）'
+        if duplicate_count:
+            message += f'，跳过 {duplicate_count} 个已存在的视频'
+        flash(message, 'success' if added_count else 'info')
         return redirect(url_for('tasks'))
     else:
+        duplicate = find_duplicate_task(youtube_url)
+        if duplicate:
+            flash(
+                f'该视频已在任务列表中（状态：{task_status_display(duplicate.get("status"))}），'
+                f'未重复添加',
+                'warning'
+            )
+            return redirect(url_for('tasks'))
         task_id = add_task(youtube_url, upload_target=upload_target)
         if task_id:
             if config.get('AUTO_MODE_ENABLED', False):
@@ -2872,44 +2939,36 @@ def import_tasks_from_excel():
         flash(f'解析文件失败: {e}', 'danger')
         return redirect(url_for('tasks'))
 
-    # 只保留 YouTube 视频链接，排除播放列表链接
-    urls, skipped_invalid, skipped_playlist = [], 0, 0
+    # 只保留 YouTube 视频链接，排除播放列表链接；同一文件里重复的链接也只留一条
+    urls, skipped_invalid, skipped_playlist, seen_video_ids = [], 0, 0, set()
+    from modules.task_manager import extract_youtube_video_id
     for u in raw_urls:
         low = u.lower()
         if 'youtube.com/watch' not in low and 'youtu.be/' not in low:
             skipped_invalid += 1
         elif 'list=' in low:
             skipped_playlist += 1
-        elif u not in urls:
+        else:
+            video_id = extract_youtube_video_id(u)
+            key = video_id or u
+            if key in seen_video_ids:
+                continue
+            seen_video_ids.add(key)
             urls.append(u)
 
     if not urls:
         flash('文件中没有找到有效的 YouTube 视频链接', 'danger')
         return redirect(url_for('tasks'))
 
-    # 2. 与任务库中已有任务去重
-    existing_urls = set()
-    try:
-        from modules.task_manager import get_db_connection
-        conn = get_db_connection()
-        try:
-            for (u,) in conn.execute('SELECT youtube_url FROM tasks'):
-                if u:
-                    existing_urls.add(u.strip())
-        finally:
-            conn.close()
-    except Exception as e:
-        logger.warning(f"查询已有任务网址失败（跳过去重）: {e}")
-
+    # 2. 与任务列表（本地 sqlite）去重：按视频 ID 比，已完成任务的记录也参与比较
     added, duplicates = 0, 0
     for u in urls:
-        if u in existing_urls:
+        if find_duplicate_task(u):
             duplicates += 1
             continue
         task_id = add_task(u, upload_target=upload_target)
         if task_id:
             added += 1
-            existing_urls.add(u)
         else:
             logger.warning(f"Excel 导入添加任务失败: {u}")
 
@@ -2974,6 +3033,16 @@ def start_task_route(task_id):
     except Exception as exc:
         logger.debug(f"清除任务 {task_id} 的取消标记失败: {exc}")
 
+    # 暂停下载期间不启动「还没下完」的任务：否则任务会马上被退回等待队列，看起来像按钮失灵。
+    # 已经有成品视频的任务（只差上传）不受影响。
+    try:
+        from modules.task_manager import is_download_paused, task_has_downloaded_video
+        if is_download_paused() and not task_has_downloaded_video(get_task(task_id)):
+            flash('下载已暂停：请先点任务列表上方的「开始下载」，再继续这个任务', 'warning')
+            return _back_to_tasks()
+    except Exception as exc:
+        logger.debug(f"检查暂停下载状态失败（继续按原逻辑启动）: {exc}")
+
     # 获取当前配置
     config = load_config()
     
@@ -3001,16 +3070,28 @@ def start_task_route(task_id):
 @app.route('/tasks/<task_id>/delete', methods=['POST'])
 @login_required
 def delete_task_route(task_id):
-    """删除任务"""
+    """删除任务
+
+    delete_record 不传时按状态自动决定：已完成任务只删除文件、保留 sqlite 记录，
+    这样后续添加同一个视频时还能被判为「已存在」；其他状态连记录一起删。
+    """
     delete_files = request.form.get('delete_files', 'true').lower() in ('true', 'yes', '1', 'on')
-    
-    success = delete_task(task_id, delete_files)
-    
+    delete_record_raw = (request.form.get('delete_record') or '').strip().lower()
+    delete_record = None
+    if delete_record_raw:
+        delete_record = delete_record_raw in ('true', 'yes', '1', 'on')
+
+    task = get_task(task_id)
+    success = delete_task(task_id, delete_files=delete_files, delete_record=delete_record)
+
     if success:
-        flash('任务已删除', 'success')
+        if task and task.get('status') == TASK_STATES['COMPLETED'] and not delete_record:
+            flash('已删除任务文件，已完成任务的记录保留（下次添加同一视频会被自动跳过）', 'success')
+        else:
+            flash('任务已删除', 'success')
     else:
         flash('删除任务失败', 'danger')
-    
+
     return redirect(url_for('tasks'))
 
 # ==================== 批量上传队列（并发数 = 设置里的「最大并发上传数」） ====================
@@ -3099,6 +3180,7 @@ def batch_upload_tasks_route():
     valid_tasks = []
     skipped_status = {}   # 不可上传任务的状态分布，用于给出可读提示
     skipped_partition = 0
+    skipped_no_video = 0  # 还没有成品视频（下载/处理没完成），传不上去
 
     # 校验哪些任务处于可上传状态
     for task_id in task_ids:
@@ -3108,6 +3190,9 @@ def batch_upload_tasks_route():
         if task['status'] not in [TASK_STATES['READY_FOR_UPLOAD'], TASK_STATES['AWAITING_REVIEW'], TASK_STATES['COMPLETED'], TASK_STATES['FAILED']]:
             status_label = task_status_display(task['status'])
             skipped_status[status_label] = skipped_status.get(status_label, 0) + 1
+            continue
+        if not task_has_downloaded_video(task):
+            skipped_no_video += 1
             continue
         # 指定了目标平台时，先覆盖投稿目标，再按新目标校验分区
         if upload_target:
@@ -3128,6 +3213,8 @@ def batch_upload_tasks_route():
             reasons.append('、'.join(parts))
         if skipped_partition:
             reasons.append(f'{skipped_partition} 个缺少分区设置')
+        if skipped_no_video:
+            reasons.append(f'{skipped_no_video} 个还没有生成视频文件（需先完成下载）')
         reason_text = ('：' + '；'.join(reasons)) if reasons else ''
         return jsonify({'success': False,
                         'message': f'选中的 {len(task_ids)} 个任务中没有可上传的任务{reason_text}'}), 400
@@ -3208,7 +3295,13 @@ def batch_approve_tasks_route():
         task = get_task(task_id)
         # 仅对待审核状态的任务进行操作
         if task and task['status'] == TASK_STATES['AWAITING_REVIEW']:
-            update_task(task_id, status=TASK_STATES['READY_FOR_UPLOAD'], silent=True)
+            if task_has_downloaded_video(task):
+                update_task(task_id, status=TASK_STATES['READY_FOR_UPLOAD'], silent=True)
+            else:
+                # 还没下载到成品视频就审核通过：先回等待处理把视频下下来，
+                # 否则会变成「准备上传」却没有文件，永远传不上去
+                update_task(task_id, status=TASK_STATES['PENDING'], queue_priority=1,
+                            upload_progress=None, silent=True)
             success_count += 1
 
     return jsonify({'success': True, 'message': f'成功审核 {success_count} 个任务'})
@@ -3499,15 +3592,69 @@ def batch_stop_tasks_route():
 
 
 
+@app.route('/tasks/download_pause', methods=['POST'])
+@login_required
+def download_pause_route():
+    """「暂停下载 / 开始下载」全局开关。
+
+    - 暂停：不再启动新的下载任务；已经在下载的任务会自然跑完（不打断），上传队列不受影响。
+    - 开始：恢复调度，等待队列里的任务从断点继续。
+    状态持久化到 config.json 的 DOWNLOAD_PAUSED，重启服务后保持不变。
+    """
+    from modules.task_manager import is_download_paused, set_download_paused, _get_active_task_ids
+
+    payload = request.get_json(silent=True) or {}
+    target = payload.get('paused')
+    if target is None:
+        current = is_download_paused()
+    else:
+        if isinstance(target, str):
+            current = target.strip().lower() in ('1', 'true', 'on', 'yes', '暂停')
+        else:
+            current = bool(target)
+
+    try:
+        paused = set_download_paused(current)
+    except Exception as exc:
+        logger.error(f"切换暂停下载状态失败: {exc}")
+        return jsonify({'success': False, 'message': f'切换失败: {exc}'}), 500
+
+    # 暂停/恢复都不碰上传：立刻补一次上传队列，保证「已下载完、等待上传」的任务
+    # 不会因为暂停而卡在队列里（上传通道与下载调度完全独立）。
+    try:
+        from modules.task_manager import pump_upload_queue
+        pump_upload_queue('暂停下载开关')
+    except Exception as exc:
+        logger.debug(f"切换暂停后补位上传队列失败（忽略）: {exc}")
+
+    try:
+        active_count = len(_get_active_task_ids() or [])
+    except Exception:
+        active_count = 0
+
+    if paused:
+        message = '已暂停下载：当前下载会自然跑完，不再开始新的下载；上传队列照常进行'
+    else:
+        message = '已恢复下载：等待队列里的任务会继续从断点下载'
+    if active_count:
+        message += f'（当前 {active_count} 个任务正在运行）'
+
+    return jsonify({'success': True, 'paused': paused, 'active_count': active_count, 'message': message})
+
+
 @app.route('/tasks/clear_all', methods=['POST'])
 @login_required
 def clear_all_tasks_route():
     """清空所有任务（可选择同时删除任务文件）"""
     try:
         delete_files = request.form.get('delete_files', 'true').lower() in ['true', '1', 'on']
-        success = clear_all_tasks(delete_files=delete_files)
+        keep_completed = request.form.get('keep_completed', 'true').lower() in ['true', '1', 'on']
+        success = clear_all_tasks(delete_files=delete_files, keep_completed=keep_completed)
         if success:
-            flash('所有任务已清空', 'success')
+            if keep_completed:
+                flash('已清空未完成任务；已完成任务的记录保留，后续添加同一视频会被自动跳过', 'success')
+            else:
+                flash('所有任务已清空', 'success')
         else:
             flash('清空任务失败，请查看日志', 'danger')
     except Exception as e:
@@ -3630,6 +3777,10 @@ def force_upload_task_route(task_id):
         flash('任务不存在', 'danger')
         return redirect(url_for('manual_review'))
     
+    if not task_has_downloaded_video(task):
+        flash('该任务还没有下载到视频文件，无法上传。请先点「继续处理」把视频下载完成。', 'warning')
+        return redirect(url_for('manual_review'))
+
     # 获取当前配置
     config = load_config()
     upload_target = str(task.get('upload_target') or 'acfun').lower()
@@ -4669,7 +4820,10 @@ def cleanup_downloads_route():
     result = cleanup_downloads(hours)
     
     if result.get('success'):
-        flash(f"下载内容清理成功，删除了{result['dirs_removed']}个目录、{result['files_removed']}个文件，释放了{result['bytes_freed_readable']}空间", 'success')
+        msg = f"下载内容清理成功，删除了{result['dirs_removed']}个目录、{result['files_removed']}个文件，释放了{result['bytes_freed_readable']}空间"
+        if result.get('skipped'):
+            msg += f"；跳过 {result['skipped']} 个未完成任务目录（仍需用于续传/上传）"
+        flash(msg, 'success')
     else:
         flash(f"下载内容清理失败: {result.get('error', '未知错误')}", 'danger')
     
@@ -4764,22 +4918,45 @@ def clear_specific_logs():
         return {'success': False, 'error': str(e)}
 
 
+def _protected_download_task_ids():
+    """按时间清理时必须跳过的任务ID：除「已完成」以外的所有任务。
+
+    下载目录以任务ID命名（downloads/<task_id>）。只要任务还没完成，本地文件就还有用
+    （等待处理要续传、准备上传/上传中要用、失败待重试也要用）。以前只看目录 mtime，
+    把「还在排队但已经放了两天」的任务目录直接删掉，就成了「下载完就消失」。
+    """
+    try:
+        from modules.task_manager import get_task_ids_filtered
+        all_ids = set(get_task_ids_filtered() or [])
+        completed_ids = set(get_task_ids_filtered(status=TASK_STATES['COMPLETED']) or [])
+        return all_ids - completed_ids
+    except Exception as exc:
+        logger.debug(f"读取需要保护的下载目录失败（本次不跳过任何目录）: {exc}")
+        return set()
+
+
 def cleanup_downloads(hours: int):
-    """清理下载目录中指定hours之前的任务目录"""
+    """清理下载目录中指定hours之前的任务目录（跳过仍未完成的任务）"""
     try:
         downloads_dir = get_app_subdir('downloads')
         if not os.path.exists(downloads_dir):
-            return {'success': True, 'dirs_removed': 0, 'files_removed': 0, 'bytes_freed': 0, 'bytes_freed_readable': '0B'}
+            return {'success': True, 'dirs_removed': 0, 'files_removed': 0, 'bytes_freed': 0, 'bytes_freed_readable': '0B', 'skipped': 0}
 
         cutoff = time.time() - float(hours) * 3600
         dirs_removed = 0
         files_removed = 0
         bytes_freed = 0
+        skipped = 0
+        protected_ids = _protected_download_task_ids()
 
         for entry in os.listdir(downloads_dir):
             path = os.path.join(downloads_dir, entry)
             try:
                 if os.path.isdir(path):
+                    # 未完成任务的目录不能删：删了就得重新下载/重新上传
+                    if entry in protected_ids:
+                        skipped += 1
+                        continue
                     # check last modification
                     mtime = os.path.getmtime(path)
                     if mtime < cutoff:
@@ -4795,7 +4972,16 @@ def cleanup_downloads(hours: int):
             except Exception:
                 continue
 
-        return {'success': True, 'dirs_removed': dirs_removed, 'files_removed': files_removed, 'bytes_freed': bytes_freed, 'bytes_freed_readable': _human_readable_size(bytes_freed)}
+        if skipped:
+            logger.info(f"下载内容清理：跳过 {skipped} 个未完成任务目录（仍需用于续传/上传）")
+        return {
+            'success': True,
+            'dirs_removed': dirs_removed,
+            'files_removed': files_removed,
+            'bytes_freed': bytes_freed,
+            'bytes_freed_readable': _human_readable_size(bytes_freed),
+            'skipped': skipped,
+        }
     except Exception as e:
         logger.warning(f"下载内容清理失败: {e}")
         return {'success': False, 'error': str(e)}
@@ -4854,14 +5040,25 @@ def auto_start_pending_tasks(config):
         if not processor:
             return
 
-        # 循环尝试启动下一个pending任务，直到并发数或没有更多pending
-        # 我们设置一个上限避免无限循环
+        from modules import task_manager as _tm
+        if _tm.is_download_paused():
+            # 暂停下载期间不自动拉起待处理任务，等用户点「开始下载」再从断点继续
+            logger.info("下载已暂停：启动时不自动开始待处理任务")
+            return
+
+        # 循环尝试启动下一个pending任务，直到没有更多pending 或 并发配额已经用满。
+        # 以前只判断 pending，配额满了也照样空转 200 次（每次 0.05 秒），
+        # 启动日志里会刷出几百行「当前并发配额已满」，看着像卡死。
         attempts = 0
         while attempts < 200:
             attempts += 1
             try:
                 processor._check_and_start_next_pending_task()
             except Exception:
+                break
+            # 并发配额已满：后面的扫描也启动不了，直接收手等下一次定时扫描
+            sem = getattr(_tm, 'task_semaphore', None)
+            if sem is not None and sem.limit - sem.active <= 0:
                 break
             # 如果没有pending则退出
             pending = get_tasks_by_status(TASK_STATES['PENDING'])
@@ -4896,6 +5093,11 @@ def schedule_download_cleanup():
         config = load_config()
         interval_hours = int(config.get('DOWNLOAD_CLEANUP_INTERVAL', 24))
         if not config.get('DOWNLOAD_CLEANUP_ENABLED', False):
+            return None
+        if config.get('DELETE_DOWNLOAD_FILES_AFTER_UPLOAD', False):
+            # 两个开关同时打开时以「上传完就删」为准：文件在上传成功那一刻就删掉了，
+            # 再跑按时间的清理只会误伤还没上传的任务（下方的时间设置此时不生效）。
+            logger.info("已启用「上传完就删除下载的文件」：跳过按时间的自动下载清理")
             return None
 
         scheduler = BackgroundScheduler()

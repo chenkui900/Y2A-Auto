@@ -52,6 +52,14 @@
             </button>
             {% endif %}
 
+            <button type="button" class="btn {{ 'btn-warning' if download_paused|default(false) else 'btn-outline-warning' }}"
+                    id="downloadPauseToggleBtn" data-paused="{{ '1' if download_paused|default(false) else '0' }}"
+                    onclick="toggleDownloadPause()"
+                    title="暂停后不再开始新的下载任务，已经在下载的任务会自然跑完；上传队列不受影响。再点一次即可恢复">
+                <i class="bi bi-{{ 'play-circle' if download_paused|default(false) else 'pause-circle' }}"></i>
+                <span id="downloadPauseToggleText">{{ '开始下载' if download_paused|default(false) else '暂停下载' }}</span>
+            </button>
+
             {% if tasks %}
             <!-- 批量操作组 -->
             <div class="btn-group me-2">
@@ -97,9 +105,18 @@
         </div>
     </div>
 
+    <!-- 下载暂停提示条 -->
+    <div class="alert alert-warning d-flex align-items-center gap-2 py-2 mb-3 {{ '' if download_paused|default(false) else 'd-none' }}" id="downloadPausedBanner" role="status">
+        <i class="bi bi-pause-circle-fill"></i>
+        <span>下载已暂停：当前正在下载的任务会自然跑完，之后不再开始新的下载（上传队列照常进行）。点上方「开始下载」恢复。</span>
+    </div>
+
     <!-- 跨页批量选择工具条 -->
     <div class="selection-bar d-none" id="selectionBar">
         <span class="sel-count"><i class="bi bi-check2-square"></i> 已选择 <span class="badge bg-primary" id="selCountNum">0</span> 个任务</span>
+        <span class="sel-status-lock d-none" id="selStatusLock" title="跨页批量选择只允许同一状态；要改选其他状态请先清空选择">
+            <i class="bi bi-lock-fill"></i><span id="selStatusLockLabel"></span>
+        </span>
         <span class="sel-hint" id="selScopeHint"></span>
         <button type="button" class="btn btn-sm btn-outline-primary" id="selectAllFilteredBtn" onclick="selectAllFiltered()">
             <i class="bi bi-layers"></i> 选中当前筛选的全部 <span id="filterTotalNum">0</span> 个（跨页）
@@ -191,7 +208,7 @@
                     <div class="mb-3">
                         <label for="youtube_url" class="form-label">YouTube视频URL</label>
                         <input type="text" class="form-control" id="youtube_url" name="youtube_url" required placeholder="https://www.youtube.com/watch?v=...">
-                        <div class="form-text">支持标准YouTube视频链接</div>
+                        <div class="form-text">支持标准YouTube视频链接、短链（youtu.be）、shorts；任务列表里已存在的视频会自动跳过</div>
                     </div>
                     <div class="mb-3">
                         <label for="upload_target" class="form-label">目标平台</label>
@@ -471,12 +488,17 @@
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
             </div>
             <div class="modal-body">
-                <p class="text-danger fw-bold">此操作将清除所有任务，且无法恢复！</p>
-                <p>确定要清除所有任务吗？</p>
+                <p class="text-danger fw-bold">此操作将清除所有未完成任务，且无法恢复！</p>
                 <div class="form-check">
                     <input class="form-check-input" type="checkbox" id="clearAllFiles" checked>
                     <label class="form-check-label" for="clearAllFiles">
                         同时删除所有任务文件
+                    </label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="clearAllKeepCompleted" checked>
+                    <label class="form-check-label" for="clearAllKeepCompleted">
+                        保留已完成任务记录（用于避免重复添加同一视频）
                     </label>
                 </div>
             </div>
@@ -486,6 +508,7 @@
                 </button>
                 <form id="clearAllTasksForm" method="post" action="{{ url_for('clear_all_tasks_route') }}">
                     <input type="hidden" name="delete_files" id="clearAllFilesInput" value="true">
+                    <input type="hidden" name="keep_completed" id="clearAllKeepCompletedInput" value="true">
                     <button type="submit" class="btn btn-danger">
                         <i class="bi bi-trash"></i> 确认清除
                     </button>
@@ -494,12 +517,65 @@
         </div>
     </div>
 </div>
-<!-- 请确保将您之前的 <div class="modal fade" id="deleteTaskModal"> 等一整块代码粘贴在这里 -->
+
+<!-- 删除单个任务 -->
+<div class="modal fade" id="deleteTaskModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-trash"></i> 删除任务</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-2">确定要删除任务 “<span id="deleteTaskTitle" class="fw-semibold"></span>” 吗？</p>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="deleteFiles" checked>
+                    <label class="form-check-label" for="deleteFiles">
+                        删除任务文件（视频、字幕、封面等）
+                    </label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="deleteRecord">
+                    <label class="form-check-label" for="deleteRecord">
+                        同时删除数据库记录
+                        <span class="text-muted small d-block">已完成任务的记录默认保留，下次添加同一视频会被自动跳过</span>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                <form id="deleteTaskForm" method="post" action="">
+                    <input type="hidden" name="delete_files" id="deleteFilesInput" value="true">
+                    <input type="hidden" name="delete_record" id="deleteRecordInput" value="false">
+                    <button type="submit" class="btn btn-danger">
+                        <i class="bi bi-trash"></i> 确认删除
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
 <!-- ==================== 模态框结束 ==================== -->
 {% endblock %}
 
+{# 任务列表页：底部页码与版权文字之间不留大片空白，收紧到最小 #}
+{% block footer_class %}footer-tight{% endblock %}
+
 {% block extra_css %}
 <style>
+/* 底部页码紧贴表格，页码与版权之间几乎不留空 */
+nav.tasks-pagination-bottom {
+    margin-top: 0.25rem !important;
+}
+nav.tasks-pagination-bottom > .d-flex {
+    margin-bottom: 0 !important;
+}
+footer.footer-tight {
+    margin-top: 0;
+    padding-top: 0.25rem;
+    padding-bottom: 0.5rem;
+}
+
 /* 一般单元格：垂直居中，避免内容溢出 */
 .tasks-table td, .tasks-table th {
     vertical-align: middle;
@@ -791,7 +867,16 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         const deleteFilesCheckbox = document.getElementById('deleteFiles');
         const deleteFilesInput = document.getElementById('deleteFilesInput');
         if (deleteFilesCheckbox && deleteFilesInput) {
+            deleteFilesInput.value = deleteFilesCheckbox.checked ? 'true' : 'false';
             deleteFilesCheckbox.onchange = function() { deleteFilesInput.value = this.checked ? 'true' : 'false'; };
+        }
+        const deleteRecordCheckbox = document.getElementById('deleteRecord');
+        const deleteRecordInput = document.getElementById('deleteRecordInput');
+        if (deleteRecordCheckbox && deleteRecordInput) {
+            // 默认不删记录：已完成任务的记录要留着做去重比对
+            deleteRecordCheckbox.checked = false;
+            deleteRecordInput.value = 'false';
+            deleteRecordCheckbox.onchange = function() { deleteRecordInput.value = this.checked ? 'true' : 'false'; };
         }
         new bootstrap.Modal(document.getElementById('deleteTaskModal')).show();
     }
@@ -810,6 +895,11 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         const clearAllFilesInput = document.getElementById('clearAllFilesInput');
         if (clearAllFilesCheckbox && clearAllFilesInput) {
             clearAllFilesCheckbox.onchange = function() { clearAllFilesInput.value = this.checked ? 'true' : 'false'; };
+        }
+        const keepCompletedCheckbox = document.getElementById('clearAllKeepCompleted');
+        const keepCompletedInput = document.getElementById('clearAllKeepCompletedInput');
+        if (keepCompletedCheckbox && keepCompletedInput) {
+            keepCompletedCheckbox.onchange = function() { keepCompletedInput.value = this.checked ? 'true' : 'false'; };
         }
         new bootstrap.Modal(document.getElementById('clearAllTasksModal')).show();
     }
@@ -958,19 +1048,26 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         const progressText = typeof payload.upload_progress === 'string' ? payload.upload_progress : '';
         const dateTimeValue = payload.updated_at;
         const speedText = formatSpeed(payload.progress_speed);
-        const speedArrow = payload.status === 'downloading' ? '↓' : '↑';
+        const isDownloadStatus = payload.status === 'downloading';
+        const isUploadStatus = payload.status === 'uploading';
 
         document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-progress]`).forEach(el => {
             el.textContent = progressText;
+            el.classList.toggle('d-none', !progressText.trim());
             const wrap = el.closest('[data-task-progress-wrap]');
-            if (wrap) wrap.classList.toggle('d-none', !progressText.trim());
+            // 下载/上传中即使暂时没有百分比文字，也要保留这一块（用来挂速度）
+            if (wrap) wrap.classList.toggle('d-none', !progressText.trim() && !speedText);
             else el.classList.toggle('d-none', !progressText.trim());
         });
 
-        // 速度：下载阶段显示 ↓，其余（上传/转码为上传阶段）显示 ↑；无速度时整块隐藏
+        // 速度：下载阶段显示 ↓（蓝色），上传阶段显示 ↑（紫色）；无速度时只隐藏速度标签
         document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-speed]`).forEach(el => {
-            el.textContent = speedText ? `${speedArrow} ${speedText}` : '';
+            const direction = isDownloadStatus ? 'down' : (isUploadStatus ? 'up' : (el.getAttribute('data-speed-direction') || 'up'));
+            el.setAttribute('data-speed-direction', direction);
+            el.textContent = speedText ? `${direction === 'down' ? '↓' : '↑'} ${speedText}` : '';
             el.classList.toggle('d-none', !speedText);
+            el.classList.toggle('task-speed-down', direction === 'down');
+            el.classList.toggle('task-speed-up', direction !== 'down');
         });
 
         // 进度条宽度也随 SSE 实时推进，不用等整行 fragment 刷新
@@ -982,6 +1079,13 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 el.style.width = pct + '%';
                 el.setAttribute('aria-valuenow', String(pct));
             });
+            // 下载阶段的百分比就是「已下载比例」，同步刷新那行小字，不用等整页刷新
+            if (payload.status === 'downloading') {
+                const dlPct = Math.round(pct * 10) / 10;
+                document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-download]`).forEach(el => {
+                    el.textContent = `已下载 ${dlPct}%`;
+                });
+            }
         }
 
         if (dateTimeValue) {
@@ -1313,11 +1417,15 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
     let selectAllFilteredMode = false;   // 是否处于「选中当前筛选全部」模式
     let allFilteredIds = [];             // 该模式下的全部任务ID
     let filterTotal = {{ pagination.total if pagination else 0 }};  // 当前筛选条件下的任务总数
+    // 跨页批量选择只允许同一状态：记住第一次勾选的任务状态，其他状态一律不可选
+    let selectionStatus = null;
+    let selectionStatusLabel = '';
 
     function persistSelection() {
         try {
             sessionStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify({
-                ids: getSelectedIds(), all: selectAllFilteredMode, allIds: allFilteredIds
+                ids: getSelectedIds(), all: selectAllFilteredMode, allIds: allFilteredIds,
+                status: selectionStatus, statusLabel: selectionStatusLabel
             }));
         } catch (e) { /* 忽略 */ }
     }
@@ -1331,6 +1439,10 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             if (data.all && Array.isArray(data.allIds) && data.allIds.length) {
                 selectAllFilteredMode = true;
                 allFilteredIds = data.allIds;
+            }
+            if (data.status) {
+                selectionStatus = data.status;
+                selectionStatusLabel = data.statusLabel || data.status;
             }
         } catch (e) { /* 忽略 */ }
     }
@@ -1348,13 +1460,64 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         persistSelection();
     }
 
+    function checkboxStatus(cb) {
+        return cb ? (cb.dataset.taskStatus || '') : '';
+    }
+    function checkboxStatusLabel(cb) {
+        return cb ? (cb.dataset.statusLabel || cb.dataset.taskStatus || '') : '';
+    }
+    function selectionStatusText() {
+        return selectionStatusLabel || selectionStatus || '';
+    }
+    // 当前页找不到对应状态时，用同状态任务的中文名兜底
+    function labelForStatus(status) {
+        if (!status) return '';
+        const hit = Array.from(document.querySelectorAll('.task-checkbox'))
+            .find(cb => checkboxStatus(cb) === status);
+        return hit ? checkboxStatusLabel(hit) : status;
+    }
+
+    // 任务自身状态发生变化（如 下载中 → 翻译中）时，让「已选状态」跟着唯一已选任务走，避免锁死在旧状态
+    function refreshSelectionStatusFromChecked() {
+        const checkedBoxes = Array.from(document.querySelectorAll('.task-checkbox'))
+            .filter(cb => selectedTaskIds.has(cb.value));
+        if (checkedBoxes.length !== 1) return;
+        const status = checkboxStatus(checkedBoxes[0]);
+        if (status && status !== selectionStatus) {
+            selectionStatus = status;
+            selectionStatusLabel = checkboxStatusLabel(checkedBoxes[0]);
+        }
+    }
+
+    // 跨页选择只允许同一状态：不同状态的任务复选框禁用并淡化
+    function syncStatusLock() {
+        const locked = !!selectionStatus;
+        const label = selectionStatusText();
+        document.querySelectorAll('.task-checkbox').forEach(cb => {
+            const sameStatus = !locked || checkboxStatus(cb) === selectionStatus;
+            cb.disabled = !sameStatus;
+            cb.title = sameStatus ? '' : `跨页批量选择只能选同一状态（当前已选：${label}）`;
+            const holder = cb.closest('tr, .task-card');
+            if (holder) holder.classList.toggle('row-status-locked', !sameStatus);
+        });
+        const selectAll = document.getElementById('selectAllTasks');
+        if (selectAll) {
+            const boxes = Array.from(document.querySelectorAll('.tasks-table tbody .task-checkbox'));
+            const sameCount = boxes.filter(cb => !locked || checkboxStatus(cb) === selectionStatus).length;
+            selectAll.disabled = locked && sameCount === 0;
+            selectAll.title = locked ? `只选择「${label}」状态的任务` : '';
+        }
+    }
+
     function restoreSelectionState() {
+        refreshSelectionStatusFromChecked();
         document.querySelectorAll('.task-checkbox').forEach(cb => {
             const checked = selectAllFilteredMode || selectedTaskIds.has(cb.value);
             cb.checked = checked;
-            const row = cb.closest('tr');
-            if (row) row.classList.toggle('row-selected', checked);
+            const holder = cb.closest('tr, .task-card');
+            if (holder) holder.classList.toggle('row-selected', checked);
         });
+        syncStatusLock();
         updateSelectAllState();
     }
 
@@ -1364,10 +1527,29 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             selectAllFilteredMode = false;
             allFilteredIds = [];
         }
-        if (cb.checked) selectedTaskIds.add(cb.value);
-        else selectedTaskIds.delete(cb.value);
-        const row = cb.closest('tr');
-        if (row) row.classList.toggle('row-selected', cb.checked);
+        const status = checkboxStatus(cb);
+        if (cb.checked && selectionStatus && status && status !== selectionStatus) {
+            cb.checked = false;
+            syncStatusLock();
+            y2aAlert(`跨页批量选择只支持同一状态的任务。\n已选的是「${selectionStatusText()}」，不能再选「${checkboxStatusLabel(cb) || status}」。\n如需改选其他状态，请先点“清空选择”。`, { type: 'info', title: '只能选择相同状态的任务' });
+            return;
+        }
+        if (cb.checked) {
+            selectedTaskIds.add(cb.value);
+            if (!selectionStatus && status) {
+                selectionStatus = status;
+                selectionStatusLabel = checkboxStatusLabel(cb);
+            }
+        } else {
+            selectedTaskIds.delete(cb.value);
+            if (selectedTaskIds.size === 0 && !selectAllFilteredMode) {
+                selectionStatus = null;
+                selectionStatusLabel = '';
+            }
+        }
+        const holder = cb.closest('tr, .task-card');
+        if (holder) holder.classList.toggle('row-selected', cb.checked);
+        syncStatusLock();
         selectionChanged();
     }
 
@@ -1376,18 +1558,54 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             selectAllFilteredMode = false;
             allFilteredIds = [];
         }
-        document.querySelectorAll('.task-checkbox').forEach(cb => {
-            cb.checked = source.checked;
-            if (source.checked) selectedTaskIds.add(cb.value);
-            else selectedTaskIds.delete(cb.value);
-            const row = cb.closest('tr');
-            if (row) row.classList.toggle('row-selected', cb.checked);
-        });
+        const boxes = Array.from(document.querySelectorAll('.tasks-table tbody .task-checkbox'));
+        if (source.checked) {
+            // 本页混有多种状态时，以第一个任务的状态为准，只勾选同状态任务
+            if (!selectionStatus && boxes.length) {
+                selectionStatus = checkboxStatus(boxes[0]) || null;
+                selectionStatusLabel = checkboxStatusLabel(boxes[0]);
+            }
+            boxes.forEach(cb => {
+                const selectable = !selectionStatus || checkboxStatus(cb) === selectionStatus;
+                cb.checked = selectable;
+                if (selectable) selectedTaskIds.add(cb.value);
+                else selectedTaskIds.delete(cb.value);
+                const holder = cb.closest('tr, .task-card');
+                if (holder) holder.classList.toggle('row-selected', selectable);
+            });
+            const skipped = boxes.filter(cb => !cb.checked).length;
+            if (skipped > 0) {
+                y2aAlert(`本页有 ${skipped} 个任务与「${selectionStatusText()}」状态不同，已跳过（跨页批量选择只允许同一状态）。`, { type: 'info', title: '只选中了相同状态的任务' });
+            }
+        } else {
+            boxes.forEach(cb => {
+                cb.checked = false;
+                selectedTaskIds.delete(cb.value);
+                const holder = cb.closest('tr, .task-card');
+                if (holder) holder.classList.remove('row-selected');
+            });
+            if (selectedTaskIds.size === 0) {
+                selectionStatus = null;
+                selectionStatusLabel = '';
+            }
+        }
+        syncStatusLock();
         selectionChanged();
     }
 
-    // 选中当前筛选条件下的全部任务（跨页）
+    // 选中当前筛选条件下的全部任务（跨页）——同样只能选同一状态
     async function selectAllFiltered() {
+        // 当前筛选与已选状态冲突时拒绝：否则会选到当前页根本看不到的其他状态任务
+        if (selectionStatus) {
+            if (CURRENT_STATUS_FILTER && CURRENT_STATUS_FILTER !== 'processing' && CURRENT_STATUS_FILTER !== selectionStatus) {
+                await y2aAlert(`当前筛选是「${labelForStatus(CURRENT_STATUS_FILTER)}」，而已选任务的状态是「${selectionStatusText()}」。\n跨页全选只能选同一状态，请先清空选择，或切回相同状态的筛选。`, { type: 'info', title: '筛选与已选状态不一致' });
+                return;
+            }
+        } else if (!CURRENT_STATUS_FILTER || CURRENT_STATUS_FILTER === 'processing') {
+            await y2aAlert('当前没有按单一状态筛选。请先手动勾选任意一个任务，再点跨页全选——这样只会选中与它相同状态的任务。', { type: 'info', title: '请先勾选一个任务' });
+            return;
+        }
+        const effectiveStatus = selectionStatus || CURRENT_STATUS_FILTER;
         const btn = document.getElementById('selectAllFilteredBtn');
         const oldHtml = btn ? btn.innerHTML : '';
         if (btn) {
@@ -1396,7 +1614,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         }
         try {
             const params = new URLSearchParams();
-            if (CURRENT_STATUS_FILTER) params.set('status', CURRENT_STATUS_FILTER);
+            if (effectiveStatus) params.set('status', effectiveStatus);
             if (CURRENT_SEARCH) params.set('q', CURRENT_SEARCH);
             const res = await fetch('/tasks/filtered_ids?' + params.toString(), { headers: { 'Accept': 'application/json' } });
             const data = await res.json();
@@ -1409,11 +1627,17 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             filterTotal = data.total || data.ids.length;
             selectAllFilteredMode = true;
             selectedTaskIds.clear();
+            if (!selectionStatus) {
+                selectionStatus = effectiveStatus;
+                selectionStatusLabel = labelForStatus(effectiveStatus);
+            }
             document.querySelectorAll('.task-checkbox').forEach(cb => {
-                cb.checked = true;
-                const row = cb.closest('tr');
-                if (row) row.classList.add('row-selected');
+                const selectable = !selectionStatus || checkboxStatus(cb) === selectionStatus;
+                cb.checked = selectable;
+                const holder = cb.closest('tr, .task-card');
+                if (holder) holder.classList.toggle('row-selected', selectable);
             });
+            syncStatusLock();
             selectionChanged();
         } catch (e) {
             await y2aAlert('获取筛选任务失败：' + (e.message || e), { type: 'danger' });
@@ -1426,11 +1650,14 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         selectedTaskIds.clear();
         selectAllFilteredMode = false;
         allFilteredIds = [];
+        selectionStatus = null;
+        selectionStatusLabel = '';
         document.querySelectorAll('.task-checkbox').forEach(cb => {
             cb.checked = false;
-            const row = cb.closest('tr');
-            if (row) row.classList.remove('row-selected');
+            const holder = cb.closest('tr, .task-card');
+            if (holder) holder.classList.remove('row-selected');
         });
+        syncStatusLock();
         selectionChanged();
     }
 
@@ -1450,6 +1677,17 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         }
 
         const count = getSelectedCount();
+        // 状态锁提示：跨页批量选择只允许同一状态
+        const lockEl = document.getElementById('selStatusLock');
+        const lockLabel = document.getElementById('selStatusLockLabel');
+        if (lockEl) {
+            if (count > 0 && selectionStatus) {
+                if (lockLabel) lockLabel.textContent = `仅可选：${selectionStatusText()}`;
+                lockEl.classList.remove('d-none');
+            } else {
+                lockEl.classList.add('d-none');
+            }
+        }
         const badge = document.getElementById('selectedCount');
         if (badge) {
             if (count > 0) {
@@ -1874,6 +2112,65 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         }
     }
 
+    // --- 暂停下载 / 开始下载（全局开关，暂停期间不启动新下载，上传不受影响） ---
+    function applyDownloadPauseState(paused) {
+        const btn = document.getElementById('downloadPauseToggleBtn');
+        const banner = document.getElementById('downloadPausedBanner');
+        if (banner) banner.classList.toggle('d-none', !paused);
+        if (!btn) return;
+        btn.dataset.paused = paused ? '1' : '0';
+        btn.classList.toggle('btn-warning', paused);
+        btn.classList.toggle('btn-outline-warning', !paused);
+        btn.innerHTML = paused
+            ? '<i class="bi bi-play-circle"></i> <span id="downloadPauseToggleText">开始下载</span>'
+            : '<i class="bi bi-pause-circle"></i> <span id="downloadPauseToggleText">暂停下载</span>';
+    }
+
+    async function toggleDownloadPause() {
+        const btn = document.getElementById('downloadPauseToggleBtn');
+        if (!btn) return;
+        const currentlyPaused = btn.dataset.paused === '1';
+        const targetPaused = !currentlyPaused;
+
+        if (targetPaused) {
+            const ok = await y2aConfirm('确定要暂停下载吗？', {
+                title: '暂停下载',
+                type: 'warning',
+                confirmText: '暂停下载',
+                detail: '正在下载的任务会自然跑完（不中断、不丢进度），之后不会开始新的下载；上传队列照常进行。恢复后任务会从断点继续。'
+            });
+            if (!ok) return;
+        }
+
+        const restoreButton = setButtonBusy(btn, targetPaused ? '暂停中...' : '恢复中...');
+        let restored = false;
+        try {
+            const res = await fetch('/tasks/download_pause', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ paused: targetPaused })
+            });
+            let data = {};
+            try { data = await res.json(); } catch (e) { /* 非 JSON 响应 */ }
+            if (!res.ok || !data.success) {
+                await y2aAlert(data.message || '切换下载状态失败，请稍后重试', { type: 'warning', title: '未能切换' });
+                return;
+            }
+            restoreButton();
+            restored = true;
+            applyDownloadPauseState(!!data.paused);
+            await y2aAlert(data.message, {
+                type: 'success',
+                title: data.paused ? '下载已暂停' : '下载已恢复'
+            });
+            refreshTasksData(true);
+        } catch (e) {
+            await y2aAlert('切换下载状态时出错：' + (e.message || e), { type: 'danger', title: '出错了' });
+        } finally {
+            if (!restored) restoreButton();
+        }
+    }
+
     function confirmBatchDelete() {
         if (getSelectedCount() === 0) { y2aAlert('请先勾选要删除的任务'); return; }
         document.getElementById('batchDeleteCount').textContent = getSelectedCount();
@@ -1897,14 +2194,16 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 selectedTaskIds.delete(id);
             } catch (e) { console.error('删除失败', id, e); }
         }
+        // 已删除的任务不应在刷新后被 sessionStorage 恢复出来，连带清掉状态锁
+        clearSelection();
         window.location.reload();
     }
 
     // --- 初始化 ---
     document.addEventListener('DOMContentLoaded', function() {
-        // 恢复上一页/上次的勾选状态（跨页选择保留）
+        // 恢复上一页/上次的勾选状态（跨页选择保留），并同步「只选同状态」的锁定
         restoreSelectionFromStorage();
-        updateSelectAllState();
+        restoreSelectionState();
 
         // 导入Excel：提交时显示导入中状态，防止重复提交
         var importForm = document.querySelector('#importExcelModal form');

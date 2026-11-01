@@ -9,7 +9,7 @@
     <!-- 使用本地Bootstrap Icons -->
     <link rel="stylesheet" href="{{ url_for('static', filename='lib/icons/bootstrap-icons.css') }}">
     <!-- 自定义样式 -->
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=20261104">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=20261108">
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/favicon.png') }}">
     <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='img/favicon.ico') }}">
     <script>
@@ -90,9 +90,9 @@
         {% block content %}{% endblock %}
     </main>
     
-    <footer class="footer mt-5 py-3">
+    <footer class="footer {% block footer_class %}mt-5 py-3{% endblock %}">
         <div class="container text-center">
-            <p class="text-muted">&copy; {% block year %}{{ now.year }}{% endblock %} Y2A-Auto</p>
+            <p class="text-muted mb-0">&copy; {% block year %}{{ now.year }}{% endblock %} Y2A-Auto</p>
         </div>
     </footer>
     
@@ -128,7 +128,7 @@
     <!-- 使用本地Bootstrap JS Bundle -->
     <script src="{{ url_for('static', filename='lib/bootstrap/bootstrap.bundle.min.js') }}"></script>
     <!-- 自定义JS -->
-    <script src="{{ url_for('static', filename='js/main.js') }}?v=20261104"></script>
+    <script src="{{ url_for('static', filename='js/main.js') }}?v=20261106"></script>
 
     {% block extra_js %}{% endblock %}
 </body>

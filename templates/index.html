@@ -66,26 +66,27 @@
         </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100">
-            <div class="card-body py-2 d-flex flex-column">
-                <div class="d-flex align-items-center justify-content-between">
-                    <span class="text-muted small">进行中</span>
-                    <span class="home-kpi-icon info"><i class="bi bi-lightning-charge"></i></span>
+        <a href="{{ url_for('tasks', status='processing') }}" class="text-decoration-none text-reset d-block h-100">
+            <div class="card h-100 hover-card">
+                <div class="card-body py-2">
+                    <div class="d-flex align-items-center justify-content-between">
+                        <span class="text-muted small">进行中</span>
+                        <span class="home-kpi-icon info"><i class="bi bi-lightning-charge"></i></span>
+                    </div>
+                    <div class="d-flex align-items-center text-center mt-1">
+                        <div class="flex-fill">
+                            <div class="home-progress-count text-info">{{ stats.downloading_total }}<span class="home-progress-unit">个</span></div>
+                            <div class="home-progress-label text-muted"><i class="bi bi-cloud-download me-1"></i>下载中</div>
+                        </div>
+                        <div class="vr mx-1 opacity-25"></div>
+                        <div class="flex-fill">
+                            <div class="home-progress-count text-primary">{{ stats.uploading_total }}<span class="home-progress-unit">个</span></div>
+                            <div class="home-progress-label text-muted"><i class="bi bi-cloud-upload me-1"></i>上传中</div>
+                        </div>
+                    </div>
                 </div>
-                <div class="d-flex align-items-stretch text-center mt-1 flex-grow-1">
-                    <a href="{{ url_for('tasks', status='download_stage') }}" class="flex-fill text-decoration-none text-reset home-progress-part" title="下载、翻译、压制等上传前的处理阶段">
-                        <div class="home-progress-count text-info">{{ stats.downloading_total }}<span class="home-progress-unit">个</span></div>
-                        <div class="small text-muted"><i class="bi bi-cloud-download me-1"></i>下载中</div>
-                    </a>
-                    <div class="vr mx-1 opacity-25"></div>
-                    <a href="{{ url_for('tasks', status='uploading') }}" class="flex-fill text-decoration-none text-reset home-progress-part" title="正在上传到投稿平台">
-                        <div class="home-progress-count text-primary">{{ stats.uploading_total }}<span class="home-progress-unit">个</span></div>
-                        <div class="small text-muted"><i class="bi bi-cloud-upload me-1"></i>上传中</div>
-                    </a>
-                </div>
-                <div class="text-muted small mt-1">合计 <span class="fw-semibold text-body">{{ stats.in_progress }}</span> 个处理中</div>
             </div>
-        </div>
+        </a>
     </div>
 </div>
 
@@ -189,7 +190,10 @@
 <div class="card mt-3">
     <div class="card-header bg-light">
         <div class="d-flex align-items-center justify-content-between">
-            <h5 class="mb-0"><i class="bi bi-broadcast-pin me-1"></i> 最近动态</h5>
+            <div>
+                <h5 class="mb-0"><i class="bi bi-broadcast-pin me-1"></i> 最近动态</h5>
+                <div class="small text-muted mt-1">已下载比例 &gt; 0 的任务排最前（从大到小），其余按更新时间倒序，已完成始终排在最后</div>
+            </div>
             <a class="btn btn-sm btn-outline-primary" href="{{ url_for('tasks') }}"><i class="bi bi-arrow-right"></i> 前往任务</a>
         </div>
     </div>
@@ -199,7 +203,7 @@
             <table class="table table-hover align-middle mb-0">
                 <thead class="table-light">
                     <tr>
-                        <th class="col-narrow">#</th>
+                        <th class="col-narrow text-center">序号</th>
                         <th>标题</th>
                         <th class="text-center">状态</th>
                         <th class="text-center">更新时间</th>
@@ -209,9 +213,20 @@
                 <tbody>
                     {% for t in recent_tasks %}
                     <tr>
-                        <td class="text-monospace">{{ t.id[:6] }}…</td>
+                        <td class="text-center text-muted">{{ loop.index }}</td>
                         <td class="title-clamp title-clamp-2">{{ t.title }}</td>
-                        <td class="text-center"><span class="badge bg-{{ task_status_color(t.status) }}">{{ task_status_display(t.status) }}</span></td>
+                        <td class="text-center">
+                            <span class="badge bg-{{ task_status_color(t.status) }}">{{ task_status_display(t.status) }}</span>
+                            <div class="small text-muted mt-1">已下载 {{ '%g'|format((t.download_ratio * 100)|round(1)) }}%</div>
+                            {% set spd = t.progress_speed|format_speed %}
+                            {% if spd %}
+                            {% set is_dl = t.status == 'downloading' %}
+                            <div class="mt-1">
+                                <span class="task-speed {{ 'task-speed-down' if is_dl else 'task-speed-up' }}"
+                                      title="{{ '实时下载速度' if is_dl else '实时上传速度' }}">{{ '↓' if is_dl else '↑' }} {{ spd }}</span>
+                            </div>
+                            {% endif %}
+                        </td>
                         <td class="text-center"><span class="task-datetime" data-datetime="{{ t.updated_at }}">{{ t.updated_at }}</span></td>
                         <td class="text-end">
                             {% if t.upload_id %}
@@ -286,7 +301,7 @@
 {% block extra_css %}
 <style>
     .title-clamp-2 { -webkit-line-clamp: 2; line-clamp: 2; max-height: 2.8em; }
-    .col-narrow { width: 32px; }
+    .col-narrow { width: 52px; }
     
     /* 添加卡片悬浮动效 */
     .hover-card {
@@ -297,27 +312,22 @@
         transform: translateY(-3px);
         box-shadow: 0 .5rem 1rem rgba(0,0,0,.15)!important;
     }
-    /* 进行中卡片：下载中 / 上传中 两个可点击分区 */
-    .home-progress-part {
-        border-radius: .5rem;
-        padding: .25rem .15rem;
-        transition: background-color .15s ease;
-    }
-    .home-progress-part:hover {
-        background-color: rgba(13, 110, 253, .08);
-    }
-    /* 分区数量：数字加粗放大，后缀「个」缩小，避免窄卡片里挤成一行 */
+    /* 进行中卡片：左侧下载中 / 右侧上传中，整张卡片点击进入「进行中（含上传中）」 */
     .home-progress-count {
-        font-size: 1.6rem;
+        font-size: 1.35rem;
         font-weight: 700;
-        line-height: 1.15;
+        line-height: 1.1;
         font-variant-numeric: tabular-nums;
     }
     .home-progress-unit {
-        font-size: .72rem;
+        font-size: .7rem;
         font-weight: 500;
         margin-left: .1rem;
         opacity: .65;
+    }
+    .home-progress-label {
+        font-size: .72rem;
+        line-height: 1.2;
     }
 </style>
 {% endblock %}

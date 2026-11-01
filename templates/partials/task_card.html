@@ -75,7 +75,9 @@
     <div class="card-body p-3">
         <!-- 新增下面这个复选框 -->
         <div class="position-absolute start-0 top-0 p-2 z-1">
-            <input type="checkbox" class="form-check-input task-checkbox" value="{{ task.id }}" onchange="handleCheckboxChange(this)">
+            <input type="checkbox" class="form-check-input task-checkbox" value="{{ task.id }}"
+                   data-task-status="{{ task.status }}" data-status-label="{{ task_status_display(task.status) }}"
+                   onchange="handleCheckboxChange(this)">
         </div>
         <!-- 新增结束 -->
 
@@ -90,8 +92,11 @@
                 
                 <!-- 【新增】显示失败原因 -->
                 {% if task.status == 'failed' and task.error_message %}
+                {% set fail_log_time = (task.error_at or task.updated_at)|format_log_time %}
                 <div class="small text-danger mt-1 text-truncate" title="{{ task.error_message|friendly_error }}">
-                    <i class="bi bi-exclamation-circle-fill"></i> {{ task.error_message|friendly_error }}
+                    <i class="bi bi-exclamation-circle-fill"></i>
+                    {% if fail_log_time %}<span class="fail-reason-time" title="日志生成时间：{{ task.error_at or task.updated_at }}">{{ fail_log_time }}</span>{% endif %}
+                    {{ task.error_message|friendly_error }}
                 </div>
                 {% endif %}
             </div>
@@ -101,11 +106,19 @@
                 <span class="badge rounded-pill bg-{{ task_status_color(task.status) }} mt-1 task-status-badge" data-task-status-badge>
                     <i class="bi bi-{{ icon }} me-1"></i>{{ task_status_display(task.status) }}
                 </span>
+                {# 所有状态都显示已下载比例 #}
+                {% set dl_pct = (task|download_ratio * 100)|round(1) %}
+                <div class="small text-muted mt-1" data-task-download title="已下载比例">已下载 {{ '%g'|format(dl_pct) }}%</div>
                 {% set speed_text = task.progress_speed|format_speed %}
-                {% set speed_arrow = '↓' if task.status == 'downloading' else '↑' %}
-                <div class="d-flex align-items-center flex-wrap gap-1 mt-1{% if not show_progress %} d-none{% endif %}" data-task-progress-wrap>
-                    <span class="small text-muted" data-task-progress>{{ task.upload_progress or '' }}</span>
-                    <span class="task-speed{% if not speed_text %} d-none{% endif %}" data-task-speed>{{ speed_arrow }} {{ speed_text }}</span>
+                {% set is_downloading = task.status == 'downloading' %}
+                {% set is_uploading = task.status == 'uploading' %}
+                {% set show_transfer = show_progress or speed_text %}
+                {% set speed_arrow = '↓' if is_downloading else '↑' %}
+                <div class="d-flex align-items-center flex-wrap gap-1 mt-1{% if not show_transfer %} d-none{% endif %}" data-task-progress-wrap>
+                    <span class="small text-muted{% if not task.upload_progress %} d-none{% endif %}" data-task-progress>{{ task.upload_progress or '' }}</span>
+                    <span class="task-speed {% if is_downloading %}task-speed-down{% else %}task-speed-up{% endif %}{% if not speed_text %} d-none{% endif %}"
+                          data-task-speed data-speed-direction="{{ 'down' if is_downloading else 'up' }}"
+                          title="{% if is_downloading %}实时下载速度{% else %}实时上传速度{% endif %}">{{ speed_arrow }} {{ speed_text }}</span>
                 </div>
                 
                 {% if task.subtitle_qc_failed or task.asr_warning_message %}

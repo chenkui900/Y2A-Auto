@@ -54,6 +54,9 @@ DEFAULT_CONFIG = {
     "DOWNLOAD_CLEANUP_ENABLED": False, # 是否启用下载内容自动清理
     "DOWNLOAD_CLEANUP_HOURS": 72, # 保留最近多少小时的下载内容
     "DOWNLOAD_CLEANUP_INTERVAL": 24, # 下载内容清理间隔（小时）
+    # 任务列表「暂停下载」开关的持久化状态：True 时不再启动新的下载（在跑的下载会自然跑完），
+    # 重启服务后保持暂停，避免一重启就又满速下载。
+    "DOWNLOAD_PAUSED": False,
     # 主动消息推送
     "NOTIFY_ENABLED": False,
     "NOTIFY_EVENT_TASK_ADDED": True,

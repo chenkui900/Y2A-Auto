@@ -1,7 +1,8 @@
 <tr data-task-id="{{ task.id }}" data-status="{{ task.status }}" class="status-{{ task.status }}">
     <!-- 1. 复选框 -->
     <td class="col-check">
-        <input type="checkbox" class="form-check-input task-checkbox" value="{{ task.id }}" 
+        <input type="checkbox" class="form-check-input task-checkbox" value="{{ task.id }}"
+               data-task-status="{{ task.status }}" data-status-label="{{ task_status_display(task.status) }}"
                onchange="handleCheckboxChange(this)" {% if task.id in selected_task_ids %}checked{% endif %}>
     </td>
 
@@ -33,15 +34,24 @@
         <span class="badge bg-{{ task_status_color(task.status) }} task-status-badge">
             {{ task_status_display(task.status) }}
         </span>
+        {# 所有状态都显示已下载比例：既是重启后续跑顺序的依据，也能一眼看出这条任务下到哪了 #}
+        {% set dl_pct = (task|download_ratio * 100)|round(1) %}
+        <div class="small text-muted mt-1" data-task-download title="已下载比例（重启后按此比例从高到低继续）">已下载 {{ '%g'|format(dl_pct) }}%</div>
         {% set speed_text = task.progress_speed|format_speed %}
-        {% set speed_arrow = '↓' if task.status == 'downloading' else '↑' %}
-        <div class="progress progress-thin mt-1 mx-auto{% if not task.upload_progress %} d-none{% endif %}" style="width: 80%;">
+        {% set is_downloading = task.status == 'downloading' %}
+        {% set is_uploading = task.status == 'uploading' %}
+        {# 有百分比或有速度就显示这一块；下载/上传开始时 SSE 会把它自动展开 #}
+        {% set show_transfer = task.upload_progress or speed_text %}
+        {% set speed_arrow = '↓' if is_downloading else '↑' %}
+        <div class="progress progress-thin mt-1 mx-auto{% if not show_transfer %} d-none{% endif %}" style="width: 80%;">
             <div class="progress-bar progress-bar-striped progress-bar-animated" 
                  data-pct="{{ (task.upload_progress or '')|replace('%','') }}"></div>
         </div>
-        <div class="d-flex align-items-center justify-content-center flex-wrap gap-1 mt-1{% if not task.upload_progress %} d-none{% endif %}" data-task-progress-wrap>
-            <span class="small text-muted" data-task-progress>{{ task.upload_progress or '' }}</span>
-            <span class="task-speed{% if not speed_text %} d-none{% endif %}" data-task-speed>{{ speed_arrow }} {{ speed_text }}</span>
+        <div class="d-flex align-items-center justify-content-center flex-wrap gap-1 mt-1{% if not show_transfer %} d-none{% endif %}" data-task-progress-wrap>
+            <span class="small text-muted{% if not task.upload_progress %} d-none{% endif %}" data-task-progress>{{ task.upload_progress or '' }}</span>
+            <span class="task-speed {% if is_downloading %}task-speed-down{% else %}task-speed-up{% endif %}{% if not speed_text %} d-none{% endif %}"
+                  data-task-speed data-speed-direction="{{ 'down' if is_downloading else 'up' }}"
+                  title="{% if is_downloading %}实时下载速度{% else %}实时上传速度{% endif %}">{{ speed_arrow }} {{ speed_text }}</span>
         </div>
     </td>
 
@@ -163,12 +173,16 @@
     <!-- 10. 失败原因 -->
     <td class="col-failreason">
         {% if task.error_message %}
+        {% set fail_log_time = (task.error_at or task.updated_at)|format_log_time %}
         <div class="fail-reason-cell">
             <span class="badge bg-danger-subtle text-danger border border-danger-subtle error-message-trigger fail-reason-badge"
                   data-task-id="{{ task.id }}" data-task-title="{{ task.video_title_translated or task.video_title_original }}"
                   data-error-message="{{ task.error_message }}"
                   title="{{ task.error_message|friendly_error }}">
                 <i class="bi bi-exclamation-triangle-fill"></i>
+                {% if fail_log_time %}
+                <span class="fail-reason-time" title="日志生成时间：{{ task.error_at or task.updated_at }}">{{ fail_log_time }}</span>
+                {% endif %}
                 <span class="fail-reason-text">{{ task.error_message|friendly_error }}</span>
             </span>
         </div>

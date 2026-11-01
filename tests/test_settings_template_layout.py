@@ -90,7 +90,7 @@ FIELD_TAB_MAP = {
     'COOKIECLOUD_SERVER_URL': 'vtab-accounts',
     'COOKIECLOUD_UUID': 'vtab-accounts',
     'COVER_PROCESSING_MODE': 'vtab-publish',
-    'DELETE_DOWNLOAD_FILES_AFTER_UPLOAD': 'vtab-publish',
+    'DELETE_DOWNLOAD_FILES_AFTER_UPLOAD': 'vtab-network',
     'DOWNLOAD_CLEANUP_ENABLED': 'vtab-network',
     'DOWNLOAD_CLEANUP_HOURS': 'vtab-network',
     'DOWNLOAD_CLEANUP_INTERVAL': 'vtab-network',

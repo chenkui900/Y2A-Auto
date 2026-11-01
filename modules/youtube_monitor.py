@@ -1805,7 +1805,8 @@ class YouTubeMonitor:
                 
                 return task_id  # 返回任务ID而不是布尔值
             else:
-                logger.error("添加任务失败，未返回任务ID")
+                # add_task 遇到任务列表里已存在的视频会返回 None，这属于正常跳过
+                logger.info(f"视频已在任务列表中，跳过添加: {video_info['title']}")
                 return None
                 
         except Exception as e:

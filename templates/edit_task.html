@@ -180,8 +180,9 @@
                         </div>
                         <div class="card-body">
                             {% if task.error_message %}
+                                {% set fail_log_time = (task.error_at or task.updated_at)|format_log_time %}
                                 <div class="alert alert-warning">
-                                    <i class="bi bi-exclamation-triangle me-1"></i>{{ task.error_message }}
+                                    <i class="bi bi-exclamation-triangle me-1"></i>{% if fail_log_time %}<span class="fail-reason-time" title="日志生成时间：{{ task.error_at or task.updated_at }}">{{ fail_log_time }}</span>{% endif %}{{ task.error_message }}
                                 </div>
                             {% endif %}
                             <div class="mb-3">
