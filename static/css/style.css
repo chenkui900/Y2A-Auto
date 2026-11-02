@@ -819,6 +819,14 @@ body {
     min-width: 0;
 }
 
+/* input-group 内的输入框不参与上面的 width:100%，避免把右侧单位标签挤换行 */
+.settings-card-body .form-group .input-group > .form-control,
+.settings-option-card .form-group .input-group > .form-control {
+    width: 1%;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
 .settings-card-body .form-label {
     margin-bottom: 0;
     font-weight: 600;
@@ -963,6 +971,13 @@ body {
     transition: all 0.3s ease-in-out;
 }
 
+/* 状态列：上传中「已耗时 · 剩余约」允许在列宽内换行，避免被截断 */
+.tasks-table td.col-status [data-upload-timing] {
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.3;
+}
+
 /* 平台徽章品牌色 */
 .badge-platform {
     display: inline-flex;
@@ -992,16 +1007,16 @@ body {
     text-shadow: 0 1px 2px rgba(0,0,0,.15);
 }
 
-/* 表格列宽设置（总和≤100%，避免出现横向滚动条） */
+/* 表格列宽设置（总和≤100%，避免出现横向滚动条）；实际宽度由 adjustTableColumns 按容器像素覆盖 */
 .tasks-table th.col-id { width: 7%; }
 .tasks-table th.col-title { width: 20%; }
 .tasks-table th.col-status { width: 10%; }
-.tasks-table th.col-time { width: 10%; }
-.tasks-table th.col-platform { width: 6%; }
-.tasks-table th.col-partition { width: 11%; }
+.tasks-table th.col-time { width: 7%; }
+.tasks-table th.col-platform { width: 4%; }
+.tasks-table th.col-partition { width: 7%; }
 .tasks-table th.col-tags { width: 10%; }
-.tasks-table th.col-result { width: 10%; }
-.tasks-table th.col-actions { width: 16%; }
+.tasks-table th.col-result { width: 7%; }
+.tasks-table th.col-actions { width: 20%; }
 
 /* 防止首列内容外溢覆盖后续列（例如复制按钮与标题行重叠） */
 .tasks-table td.col-id, .tasks-table th.col-id {

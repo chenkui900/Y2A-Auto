@@ -271,6 +271,25 @@
 
 <!-- ==================== 操作确认模态框 ==================== -->
 
+<!-- 上传结果详情（点击列表中的「完成」弹出） -->
+<div class="modal fade" id="uploadResultModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-cloud-check"></i> 上传结果</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-2 text-muted small text-truncate" id="uploadResultTaskTitle" title=""></p>
+                <div id="uploadResultBody"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- 重试所有失败任务 -->
 <div class="modal fade" id="retryFailedTasksModal" tabindex="-1">
     <div class="modal-dialog">
@@ -679,15 +698,6 @@ footer.footer-tight {
     to { transform: rotate(360deg); }
 }
 
-.upload-result-container {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 4px;
-    max-width: 180px;
-    overflow: hidden;
-}
-
 .error-message-badge {
     max-width: 300px;
     cursor: pointer;
@@ -819,11 +829,12 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         const compact = containerWidth < 1200;
 
         // 各固定宽度列的取值（0 表示该列被隐藏，仅兜底）
+        // 更新时间/平台/分区收窄，省出的宽度给操作列，保证 4 个按钮一行全部显示
         const w = wide
-            ? { check: 40, status: 130, time: 120, platform: 80, partition: 120, tags: 160, result: 70,  actions: 110, fail: 300 }
+            ? { check: 40, status: 130, time: 96,  platform: 64, partition: 96,  tags: 160, result: 70,  actions: 164, fail: 300 }
             : (compact
-                ? { check: 40, status: 110, time: 106, platform: 72, partition: 96,  tags: 0,   result: 0,   actions: 100, fail: 190 }
-                : { check: 40, status: 120, time: 112, platform: 76, partition: 104, tags: 0,   result: 66,  actions: 106, fail: 240 });
+                ? { check: 40, status: 110, time: 92,  platform: 60, partition: 80,  tags: 0,   result: 0,   actions: 156, fail: 190 }
+                : { check: 40, status: 120, time: 94,  platform: 62, partition: 88,  tags: 0,   result: 66,  actions: 158, fail: 240 });
 
         // 切换表格上的响应式 class（配合 CSS 隐藏对应的 th/td 单元格）
         table.classList.toggle('cw-1500', !wide);
@@ -947,6 +958,51 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         new bootstrap.Modal(modalEl).show();
     }
 
+    // 点击「完成」显示上传结果详情（AC 号 / BV 号及投稿链接）
+    function showUploadResultModal(trigger) {
+        const modalEl = document.getElementById('uploadResultModal');
+        const titleEl = document.getElementById('uploadResultTaskTitle');
+        const bodyEl = document.getElementById('uploadResultBody');
+        if (!modalEl || !bodyEl) return;
+        if (titleEl) {
+            titleEl.textContent = trigger.dataset.taskTitle || '';
+            titleEl.title = trigger.dataset.taskTitle || '';
+        }
+
+        const acNumber = trigger.dataset.acNumber || '';
+        const bvid = trigger.dataset.bvid || '';
+        const biliUrl = trigger.dataset.biliUrl || ('https://www.bilibili.com/video/' + bvid);
+        const rows = [];
+        if (bvid) {
+            rows.push(
+                '<div class="d-flex align-items-center justify-content-between gap-2 mb-2">' +
+                '<div><span class="badge bg-info text-dark me-1">bilibili</span>' +
+                '<a href="' + biliUrl + '" target="_blank" rel="noopener">' + bvid + '</a></div>' +
+                '<button type="button" class="btn btn-sm btn-outline-success" data-copy-text="' + bvid + '" title="复制BV号"><i class="bi bi-clipboard"></i></button>' +
+                '</div>'
+            );
+        }
+        if (acNumber) {
+            const acUrl = 'https://www.acfun.cn/v/ac' + acNumber;
+            rows.push(
+                '<div class="d-flex align-items-center justify-content-between gap-2 mb-2">' +
+                '<div><span class="badge bg-danger me-1">AcFun</span>' +
+                '<a href="' + acUrl + '" target="_blank" rel="noopener">AC' + acNumber + '</a></div>' +
+                '<button type="button" class="btn btn-sm btn-outline-success" data-copy-text="AC' + acNumber + '" title="复制AC号"><i class="bi bi-clipboard"></i></button>' +
+                '</div>'
+            );
+        }
+        if (!rows.length) {
+            rows.push('<p class="mb-0 text-muted">未获取到投稿结果</p>');
+        }
+        bodyEl.innerHTML = rows.join('');
+
+        bodyEl.querySelectorAll('[data-copy-text]').forEach(btn => {
+            btn.addEventListener('click', function() { copyToClipboard(this.dataset.copyText || ''); });
+        });
+        new bootstrap.Modal(modalEl).show();
+    }
+
     // --- SSE 实时刷新逻辑 ---
     const REFRESH_INTERVAL_ACTIVE = 2000;
     const REFRESH_INTERVAL_IDLE = 8000;
@@ -1016,6 +1072,7 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         initTooltips(newElement);
         updateTaskDateTimes(newElement);
         updateProgressBars(newElement);
+        updateUploadTiming(newElement);
     }
 
     function replaceTaskFragments(taskId, fragments) {
@@ -1091,6 +1148,14 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                     el.textContent = `已下载 ${dlPct}%`;
                 });
             }
+        }
+
+        // 上传阶段：按最新速度实时修正「剩余约 xx」
+        if (isUploadStatus) {
+            const etaPct = pctMatch ? parseFloat(pctMatch[1]) : null;
+            document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-upload-timing]`).forEach(box => {
+                updateUploadEta(box, payload.progress_speed, etaPct);
+            });
         }
 
         if (dateTimeValue) {
@@ -1349,6 +1414,12 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             btn.dataset.bindErrorMessage = '1';
             btn.addEventListener('click', function() { showTaskErrorMessage(this.dataset.taskId || '', this.dataset.taskTitle || '', this.dataset.errorMessage || ''); });
         });
+
+        queryAllWithin(root, '.upload-result-trigger').forEach(btn => {
+            if (btn.dataset.bindUploadResult === '1') return;
+            btn.dataset.bindUploadResult = '1';
+            btn.addEventListener('click', function() { showUploadResultModal(this); });
+        });
     }
 
     function disposeTooltips(root = document) {
@@ -1380,6 +1451,47 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             const d = new Date(dt);
             el.title = isNaN(d.getTime()) ? dt : d.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'long' });
         });
+    }
+
+    // 秒数 -> 人类可读时长（与后端 _human_duration 口径一致）
+    function formatDuration(seconds) {
+        let sec = Math.floor(Number(seconds));
+        if (!isFinite(sec) || sec < 0) sec = 0;
+        if (sec < 60) return sec + ' 秒';
+        const m = Math.floor(sec / 60), s = sec % 60;
+        if (m < 60) return s ? `${m} 分 ${s} 秒` : `${m} 分钟`;
+        const h = Math.floor(m / 60), mm = m % 60;
+        if (h < 24) return `${h} 小时 ${mm} 分`;
+        const d = Math.floor(h / 24), hh = h % 24;
+        return `${d} 天 ${hh} 小时`;
+    }
+
+    // 上传中任务：每秒刷新「已耗时」（按 data-start-epoch 计算，页面刷新不丢起点）
+    function updateUploadTiming(root = document) {
+        queryAllWithin(root, '[data-upload-timing]').forEach(box => {
+            const startEpoch = parseInt(box.getAttribute('data-start-epoch'), 10);
+            const elapsedEl = box.querySelector('[data-upload-elapsed]');
+            if (elapsedEl && startEpoch) {
+                elapsedEl.textContent = formatDuration(Math.max(0, Math.floor(Date.now() / 1000) - startEpoch));
+            }
+        });
+    }
+
+    // 上传中：按最新速度与百分比实时修正「剩余约 xx」；速度缺失时隐藏
+    function updateUploadEta(box, progressSpeedBytesPerSec, progressPct) {
+        const etaWrap = box.querySelector('[data-upload-eta-wrap]');
+        if (!etaWrap) return;
+        const etaEl = box.querySelector('[data-upload-eta]');
+        const totalBytes = parseFloat(box.getAttribute('data-total-bytes')) || 0;
+        const speed = Number(progressSpeedBytesPerSec);
+        const pct = Number(progressPct);
+        if (etaEl && totalBytes > 0 && speed > 0 && isFinite(pct) && pct >= 0 && pct < 100) {
+            const remaining = totalBytes * (100 - pct) / 100;
+            etaEl.textContent = formatDuration(remaining / speed);
+            etaWrap.classList.remove('d-none');
+        } else {
+            etaWrap.classList.add('d-none');
+        }
     }
 
     async function refreshTasksData(forceImmediate = false) {
@@ -2299,7 +2411,9 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         initTooltips();
         updateTaskDateTimes();
         updateProgressBars();
+        updateUploadTiming();
         setInterval(updateTaskDateTimes, 60000);
+        setInterval(updateUploadTiming, 1000);
 
         initTasksEventStream();
         setTimeout(() => refreshTasksData(true), 400);

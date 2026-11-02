@@ -89,6 +89,13 @@
                 {% if task.video_title_translated and task.video_title_original %}
                     <div class="small text-muted text-truncate mt-1" title="原标题: {{ task.video_title_original }}">原标题: {{ task.video_title_original }}</div>
                 {% endif %}
+
+                {% set total_size = (task.total_file_size or 0)|format_file_size %}
+                {% if total_size %}
+                <div class="small text-muted mt-1" title="任务本地文件总大小（视频、封面、字幕等，含下载目录内全部文件）">
+                    <i class="bi bi-file-earmark-arrow-down"></i> 文件总大小 {{ total_size }}
+                </div>
+                {% endif %}
                 
                 <!-- 【新增】显示失败原因 -->
                 {% if task.status == 'failed' and task.error_message %}
@@ -106,9 +113,17 @@
                 <span class="badge rounded-pill bg-{{ task_status_color(task.status) }} mt-1 task-status-badge" data-task-status-badge>
                     <i class="bi bi-{{ icon }} me-1"></i>{{ task_status_display(task.status) }}
                 </span>
-                {# 所有状态都显示已下载比例 #}
                 {% set dl_pct = (task|download_ratio * 100)|round(1) %}
+                {% if task.status == 'uploading' and task.upload_timing %}
+                <div class="small text-muted mt-1" data-upload-timing
+                     data-start-epoch="{{ task.upload_timing.start_epoch or '' }}"
+                     data-total-bytes="{{ task.total_file_size or 0 }}"
+                     title="本次上传已耗时；剩余时间按当前上传速度估算，仅供参考">
+                    已耗时 <span data-upload-elapsed>{{ task.upload_timing.elapsed_text or '—' }}</span>{% if task.upload_timing.eta_text %}<span data-upload-eta-wrap> · 剩余约 <span data-upload-eta>{{ task.upload_timing.eta_text }}</span></span>{% endif %}
+                </div>
+                {% else %}
                 <div class="small text-muted mt-1" data-task-download title="已下载比例">已下载 {{ '%g'|format(dl_pct) }}%</div>
+                {% endif %}
                 {% set speed_text = task.progress_speed|format_speed %}
                 {% set is_downloading = task.status == 'downloading' %}
                 {% set is_uploading = task.status == 'uploading' %}
@@ -366,12 +381,24 @@
                 {% endif %}
             {% endif %}
             <a href="{{ url_for('edit_task', task_id=task.id) }}" class="btn btn-sm btn-outline-primary"><i class="bi bi-pencil me-1"></i> 编辑</a>
-            <button type="button" class="btn btn-sm btn-outline-danger"
-                data-task-id="{{ task.id }}"
-                data-task-title="{{ display_title }}"
-                onclick="confirmDelete(this.dataset.taskId, this.dataset.taskTitle)">
-                <i class="bi bi-trash me-1"></i> 删除
-            </button>
+            {# 从数据库删除：只删记录，保留本地文件 #}
+            <form method="post" action="{{ url_for('delete_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                <input type="hidden" name="delete_record" value="true">
+                <input type="hidden" name="delete_files" value="false">
+                <button type="submit" class="btn btn-sm btn-outline-danger w-100" title="从数据库删除记录（保留本地文件）"
+                        onclick="return confirm('确定从数据库删除该任务的记录吗？\n本地文件会保留，删除后任务将从列表中消失。')">
+                    <i class="bi bi-database-x me-1"></i> 从数据库删除
+                </button>
+            </form>
+            {# 删除列表任务：连记录和本地文件一起删除，不可恢复 #}
+            <form method="post" action="{{ url_for('delete_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                <input type="hidden" name="delete_record" value="true">
+                <input type="hidden" name="delete_files" value="true">
+                <button type="submit" class="btn btn-sm btn-danger w-100" title="删除任务并清除本地文件（不可恢复）"
+                        onclick="return confirm('确定删除该任务并清除本地文件吗？\n数据库记录和已下载的视频/封面/字幕等文件都会被删除，无法恢复！')">
+                    <i class="bi bi-trash me-1"></i> 删除任务和文件
+                </button>
+            </form>
         </div>
     </div>
 </div>

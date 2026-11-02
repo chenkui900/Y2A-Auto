@@ -720,21 +720,23 @@ def test_video_availability(youtube_url, yt_dlp_cmd, cookies_path=None, logger=N
     return False, None, last_error or "格式检查失败"
 
 def _download_pacing(config):
-    """计算「每条连接的 --limit-rate」（= 每个任务的分到的配额）。
+    """按「配置的下载并发数量」静态摊分总限速（兼容/预览用途）。
 
     返回 ``(per_task, per_connection)``；不限速时两项均为 None。
 
-    yt-dlp 的 ``--limit-rate`` 是按连接生效的（每条连接各自 slow_down），而我们把
-    ``--concurrent-fragments`` 固定为 1（单任务只有 1 条连接），因此每个任务的限额
-    就等于每条连接的限额。总限速只按「下载并发数量」一级摊分：每个任务分到
-    ``总限速 / 下载并发数量``，N 个任务同时跑时总速率恰好等于设定值，不会超标，
-    且单连接限额足够大、yt-dlp 能稳定约束。
+    注意：真正的运行时限速已改为「动态分配」——由 ``download_rate_controller``
+    按「此刻实际在下载的任务数」实时计算（并发设 4 但只有 1 个在下载时，
+    那 1 个任务吃满全部带宽）。本函数只按配置的并发数量静态摊分，
+    供单元测试与设置页预览使用。
+
+    yt-dlp 的 ``--limit-rate`` 是按连接生效的，而我们把 ``--concurrent-fragments``
+    固定为 1（单任务只有 1 条连接），因此每任务限额 = 每条连接限额。
     """
     total = get_download_limit(config)
     if not total:
         return None, None
-        per_task, per_connection = split_download_rate(total, config)
-        return per_task, per_connection
+    per_task, per_connection = split_download_rate(total, config)
+    return per_task, per_connection
 
 
 def _apply_limit_rate(cmd, rate_bytes):

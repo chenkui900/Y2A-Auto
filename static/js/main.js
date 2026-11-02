@@ -260,16 +260,17 @@ document.addEventListener('DOMContentLoaded', function () {
     const timeSettings = document.getElementById('rate-limit-time-settings');
     const UNIT_FACTORS = {K: 1024, M: 1024 * 1024, G: 1024 * 1024 * 1024};
 
-    function rateUnit(field) {
-        const unit = field && field.unit && field.unit.value ? String(field.unit.value).toUpperCase() : 'K';
-        return UNIT_FACTORS[unit] ? unit : 'K';
-    }
-
-    // 数值 + 单位 -> "1.5M"；数值为空表示不限速
+    // 数值（可带 K/M/G 后缀）-> 规范化文本；裸数字默认按 KB/s，
+    // 保存时后端 normalize_rate_limit 会自动换成合适单位（如 2048K -> 2M）
     function composeRate(field) {
         const raw = field && field.value && field.value.value !== null ? String(field.value.value).trim() : '';
-        if (!raw || Number(raw) <= 0) return '';
-        return raw + rateUnit(field);
+        if (!raw) return '';
+        const match = /^(\d+(?:\.\d+)?)\s*([KMG]?)$/i.exec(raw);
+        if (!match) return '';
+        const num = parseFloat(match[1]);
+        if (!isFinite(num) || num <= 0) return '';
+        if (match[2]) return num + match[2].toUpperCase();
+        return num + 'K';
     }
 
     function parseRateText(text) {
@@ -420,6 +421,16 @@ document.addEventListener('DOMContentLoaded', function () {
         renderRateLimitState();
         syncHiddenRate();
         renderSplitHints();
+        updateUnitLabels();
+    }
+
+    // 单位标签自动切换：按输入值实时显示 KB/s / MB/s / GB/s（不再手动选单位）
+    function updateUnitLabels() {
+        rateFields.forEach(function (field) {
+            if (!field.unit) return;
+            const total = parseRateText(composeRate(field));
+            field.unit.textContent = total > 0 ? formatRate(total) : '自动单位';
+        });
     }
 
     [enabledToggle, scheduleToggle, startField, endField].forEach(function (field) {

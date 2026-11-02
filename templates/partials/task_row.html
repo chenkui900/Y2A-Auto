@@ -25,6 +25,13 @@
                     <i class="bi bi-youtube text-danger"></i> {{ task.video_title_original }}
                 </div>
                 {% endif %}
+
+                {% set total_size = (task.total_file_size or 0)|format_file_size %}
+                {% if total_size %}
+                <div class="text-muted small mt-1" title="任务本地文件总大小（视频、封面、字幕等，含下载目录内全部文件）">
+                    <i class="bi bi-file-earmark-arrow-down"></i> 文件总大小 {{ total_size }}
+                </div>
+                {% endif %}
             </div>
         </div>
     </td>
@@ -36,7 +43,16 @@
         </span>
         {# 所有状态都显示已下载比例：既是重启后续跑顺序的依据，也能一眼看出这条任务下到哪了 #}
         {% set dl_pct = (task|download_ratio * 100)|round(1) %}
+        {% if task.status == 'uploading' and task.upload_timing %}
+        <div class="small text-muted mt-1" data-upload-timing
+             data-start-epoch="{{ task.upload_timing.start_epoch or '' }}"
+             data-total-bytes="{{ task.total_file_size or 0 }}"
+             title="本次上传已耗时；剩余时间按当前上传速度估算，仅供参考">
+            已耗时 <span data-upload-elapsed>{{ task.upload_timing.elapsed_text or '—' }}</span>{% if task.upload_timing.eta_text %}<span data-upload-eta-wrap> · 剩余约 <span data-upload-eta>{{ task.upload_timing.eta_text }}</span></span>{% endif %}
+        </div>
+        {% else %}
         <div class="small text-muted mt-1" data-task-download title="已下载比例（重启后按此比例从高到低继续）">已下载 {{ '%g'|format(dl_pct) }}%</div>
+        {% endif %}
         {% set speed_text = task.progress_speed|format_speed %}
         {% set is_downloading = task.status == 'downloading' %}
         {% set is_uploading = task.status == 'uploading' %}
@@ -111,21 +127,21 @@
         {% endif %}
     </td>
 
-    <!-- 8. 上传结果 -->
+    <!-- 8. 上传结果：完成后显示「完成」，点击弹窗查看 AC 号 / BV 号等详情 -->
     <td class="col-result text-center">
-        <div class="upload-result-container">
-            {% if task.acfun_upload_response %}
-                {% set acfun_res = parse_json(task.acfun_upload_response) %}
-                <span class="badge bg-danger" title="AcFun AC号">AC{{ acfun_res.get('ac_number', '?') }}</span>
-            {% endif %}
-            {% if task.bilibili_upload_response %}
-                {% set bili_res = parse_json(task.bilibili_upload_response) %}
-                <span class="badge bg-info text-dark" title="bilibili BV号">{{ bili_res.get('bvid', '?') }}</span>
-            {% endif %}
-            {% if not task.acfun_upload_response and not task.bilibili_upload_response %}
-                <span class="text-muted small">-</span>
-            {% endif %}
-        </div>
+        {% set ac_res = parse_json(task.acfun_upload_response) if task.acfun_upload_response else none %}
+        {% set bili_res = parse_json(task.bilibili_upload_response) if task.bilibili_upload_response else none %}
+        {% if ac_res or bili_res %}
+        <button type="button" class="badge bg-success border-0 upload-result-trigger"
+                data-task-id="{{ task.id }}"
+                data-task-title="{{ task.video_title_translated or task.video_title_original or '' }}"
+                data-ac-number="{{ ac_res.ac_number if ac_res else '' }}"
+                data-bvid="{{ bili_res.bvid if bili_res else '' }}"
+                data-bili-url="{{ bili_res.url if bili_res and bili_res.url else ('https://www.bilibili.com/video/' ~ bili_res.bvid) if bili_res and bili_res.bvid else '' }}"
+                title="上传完成，点击查看结果详情">完成</button>
+        {% else %}
+        <span class="text-muted small">-</span>
+        {% endif %}
     </td>
 
     <!-- 9. 操作 -->
@@ -162,11 +178,24 @@
                     <i class="bi bi-stop-fill"></i>
                 </button>
             {% endif %}
-            <button type="button" class="btn btn-sm btn-outline-danger" title="删除任务"
-                    data-task-id="{{ task.id }}" data-task-title="{{ task.video_title_translated or task.video_title_original }}"
-                    onclick="confirmDelete(this.dataset.taskId, this.dataset.taskTitle)">
-                <i class="bi bi-trash"></i>
-            </button>
+            {# 从数据库删除：只删记录，保留本地文件（下次添加同一视频仍会被判为已存在） #}
+            <form method="post" action="{{ url_for('delete_task_route', task_id=task.id) }}" class="d-inline">
+                <input type="hidden" name="delete_record" value="true">
+                <input type="hidden" name="delete_files" value="false">
+                <button type="submit" class="btn btn-sm btn-outline-danger" title="从数据库删除记录（保留本地文件）"
+                        onclick="return confirm('确定从数据库删除该任务的记录吗？\n本地文件会保留，删除后任务将从列表中消失。')">
+                    <i class="bi bi-database-x"></i>
+                </button>
+            </form>
+            {# 删除列表任务：连数据库记录和本地文件一起删除，不可恢复 #}
+            <form method="post" action="{{ url_for('delete_task_route', task_id=task.id) }}" class="d-inline">
+                <input type="hidden" name="delete_record" value="true">
+                <input type="hidden" name="delete_files" value="true">
+                <button type="submit" class="btn btn-sm btn-danger" title="删除任务并清除本地文件（不可恢复）"
+                        onclick="return confirm('确定删除该任务并清除本地文件吗？\n数据库记录和已下载的视频/封面/字幕等文件都会被删除，无法恢复！')">
+                    <i class="bi bi-trash"></i>
+                </button>
+            </form>
         </div>
     </td>
 

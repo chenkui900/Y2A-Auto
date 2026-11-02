@@ -1098,6 +1098,11 @@ def init_db():
             cursor.execute("ALTER TABLE tasks ADD COLUMN download_progress REAL")
             logger.info("数据库升级：添加download_progress字段（已下载比例，重启后按进度续跑）")
             conn.commit()
+        if 'upload_started_at' not in columns:
+            # 上传开始时间：任务列表上传中显示「已耗时/剩余时间」用
+            cursor.execute("ALTER TABLE tasks ADD COLUMN upload_started_at TIMESTAMP")
+            logger.info("数据库升级：添加upload_started_at字段（上传开始时间）")
+            conn.commit()
         # 老库回填（每次启动都补一遍缺的）：下载阶段把百分比写在 upload_progress 文本里
         # （如「63.5%」），这里搬进数值列，避免后续进度文本被清空后算不出已下载多少。
         try:
@@ -1577,6 +1582,7 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
         'error_category': 'error_category = ?',
         'pipeline_checkpoint': 'pipeline_checkpoint = ?',
         'upload_progress': 'upload_progress = ?',
+        'upload_started_at': 'upload_started_at = ?',
         'preempted': 'preempted = ?',
         'queue_priority': 'queue_priority = ?',
         'queue_position': 'queue_position = ?',
@@ -1603,6 +1609,16 @@ def update_task(task_id, silent=False, suppress_notification=False, **kwargs):
                 existing_row = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
                 existing_task = dict(existing_row) if existing_row else None
                 previous_status = existing_task.get('status') if existing_task else None
+                # 首次进入上传阶段时记录上传开始时间（任务列表「已耗时/剩余时间」展示用）；
+                # 已在上传中（如纯进度更新）不重置；离开上传阶段时清掉，避免残留误导下次统计
+                if new_status == TASK_STATES['UPLOADING'] and previous_status != TASK_STATES['UPLOADING'] and 'upload_started_at' not in filtered_kwargs:
+                    filtered_kwargs['upload_started_at'] = kwargs['updated_at']
+                    set_clause += ', upload_started_at = ?'
+                    values.insert(-1, kwargs['updated_at'])
+                elif new_status is not None and new_status != TASK_STATES['UPLOADING'] and previous_status == TASK_STATES['UPLOADING'] and 'upload_started_at' not in filtered_kwargs:
+                    filtered_kwargs['upload_started_at'] = None
+                    set_clause += ', upload_started_at = ?'
+                    values.insert(-1, None)
                 conn.execute(f'UPDATE tasks SET {set_clause} WHERE id = ?', values)
                 conn.commit()
                 event_type = 'task_updated'

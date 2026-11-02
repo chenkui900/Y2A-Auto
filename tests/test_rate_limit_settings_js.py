@@ -94,30 +94,46 @@ class RateLimitSettingsRuntimeTests(unittest.TestCase):
         self.assertIn('视为全天限速', self.scenarios['sameStartEnd']['hint'])
 
     def test_unit_toggle_rebuilds_hidden_rate(self):
-        # 单位下拉从 M 换到 K 后，隐藏域必须变成 "1024K"，否则保存的还是旧字符串
+        # 裸数字 1024 默认按 KB/s：隐藏域 "1024K"；标签自动切到 1 MB/s
         case = self.scenarios['unitK']
         self.assertEqual(case['downloadHidden'], '1024K')
+        self.assertEqual(case['downloadUnitLabel'], '1 MB/s')
 
-    def test_download_split_follows_thread_count(self):
-        # 1M 总限速 / 2 个下载任务 = 每任务 512K（单任务固定 1 条连接）
+    def test_auto_unit_switches_label_by_value(self):
+        # 裸数字 2048（KB/s）= 2 MB/s：隐藏域 "2048K"，标签自动切到 2 MB/s
+        case = self.scenarios['autoUnitSwitch']
+        self.assertEqual(case['downloadHidden'], '2048K')
+        self.assertEqual(case['downloadUnitLabel'], '2 MB/s')
+
+    def test_download_split_uses_dynamic_allocation(self):
+        # 下载限速按「实际在下载的任务数」动态分配：不按并发数量死板平分，
+        # 单任务吃满、多任务均分，改限速/并发无需重启（运行中自动以新速率续传）
         case = self.scenarios['threadsChanged']
         # dataset 里写的是数字，JSON 序列化后可能带引号也可能不带，统一按整数比
         self.assertEqual(int(case['downloadSplitTasks']), 2)
-        self.assertIn('每个下载任务', case['downloadSplit'])
-        self.assertIn('512 KB/s', case['downloadSplit'])
-        self.assertIn('1 条连接', case['downloadSplit'])
+        self.assertIn('动态分配', case['downloadSplit'])
+        self.assertIn('实际在下载', case['downloadSplit'])
+        self.assertIn('吃满全部带宽', case['downloadSplit'])
+        self.assertIn('自动均分', case['downloadSplit'])
         self.assertIn('不会超过设定值', case['downloadSplit'])
+        self.assertIn('无需重启', case['downloadSplit'])
 
     def test_upload_unit_and_shared_budget_hint(self):
         case = self.scenarios['uploadUnitM']
         self.assertEqual(case['uploadHidden'], '2M')
         self.assertIn('2 MB/s', case['uploadSplit'])
         self.assertIn('共享', case['uploadSplit'])
+        self.assertEqual(case['uploadUnitLabel'], '2 MB/s')
 
     def test_disabled_switch_also_disables_unit_select(self):
         case = self.scenarios['disabled']
         self.assertTrue(case['downloadUnitDisabled'])
         self.assertTrue(case['uploadUnitDisabled'])
+
+    def test_empty_value_label_shows_auto(self):
+        case = self.scenarios['emptyRate']
+        self.assertEqual(case['downloadUnitLabel'], '自动单位')
+        self.assertEqual(case['uploadUnitLabel'], '自动单位')
 
 
 if __name__ == '__main__':

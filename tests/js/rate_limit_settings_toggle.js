@@ -52,17 +52,15 @@ scheduleToggle.type = 'checkbox';
 const hint = reg('rate-limit-status-hint', 'div');
 hint.className = 'alert alert-info py-2 px-3 mb-0 mt-3';
 
-// 限速控件：数值 + 单位（K/M）+ 隐藏域 + 摊分提示
+// 限速控件：数值输入（裸数字默认 KB/s，也可带 K/M/G 后缀）+ 自动单位标签 + 隐藏域 + 摊分提示
 const downloadValue = reg('download-rate-value');
-const downloadUnit = reg('download-rate-unit', 'select');
-downloadUnit.value = 'K';
+const downloadUnit = reg('download-rate-unit', 'span');
 const downloadHidden = reg('download-rate-limit');
 const downloadSplit = reg('download-rate-split-hint', 'div');
 downloadSplit.dataset = { tasks: '4' };
 
 const uploadValue = reg('upload-rate-value');
-const uploadUnit = reg('upload-rate-unit', 'select');
-uploadUnit.value = 'K';
+const uploadUnit = reg('upload-rate-unit', 'span');
 const uploadHidden = reg('upload-rate-limit');
 const uploadSplit = reg('upload-rate-split-hint', 'div');
 uploadSplit.dataset = { tasks: '1' };
@@ -138,20 +136,22 @@ function snapshot(name) {
         timeDimmed: timeSettings.classList.contains('opacity-50'),
         downloadHidden: String(downloadHidden.value || ''),
         uploadHidden: String(uploadHidden.value || ''),
+        downloadUnitLabel: String(downloadUnit.textContent || '').trim(),
+        uploadUnitLabel: String(uploadUnit.textContent || '').trim(),
         downloadSplit: String(downloadSplit.textContent || '').replace(/\s+/g, ' ').trim(),
         uploadSplit: String(uploadSplit.textContent || '').replace(/\s+/g, ' ').trim(),
         downloadSplitTasks: downloadSplit.dataset.tasks,
     };
 }
 
+const fireInput = (el) => (el.listeners.input || []).forEach((fn) => fn());
+
 try {
     // 1. 总开关关闭：所有输入停用
     enabledToggle.checked = false;
     scheduleToggle.checked = true;
     downloadValue.value = '1';
-    downloadUnit.value = 'M';
     uploadValue.value = '500';
-    uploadUnit.value = 'K';
     startField.value = '22:00';
     endField.value = '06:00';
     run();
@@ -191,34 +191,35 @@ try {
     snapshot('emptyRate');
 
     // 8. 起止时间相同 → 视为全天
-    downloadValue.value = '1';
-    downloadUnit.value = 'M';
+    downloadValue.value = '1M';
     uploadValue.value = '500';
-    uploadUnit.value = 'K';
     startField.value = '09:00';
     endField.value = '09:00';
     fakeNow = { hour: 3, minute: 0 };
     run();
     snapshot('sameStartEnd');
 
-    // 9. 单位切换：1024K 与 1M 等价，隐藏域应跟着变
+    // 9. 自动单位：裸数字 1024（KB/s）→ 隐藏域 1024K，标签自动切到 1.0 MB/s
     downloadValue.value = '1024';
-    downloadUnit.value = 'K';
-    (downloadValue.listeners.input || []).forEach((fn) => fn());
+    downloadUnit.textContent = '';
+    fireInput(downloadValue);
     snapshot('unitK');
 
-    // 10. 改小下载并发数量：摊分提示按新任务数重算（1M / 2 任务）
-    downloadValue.value = '1';
-    downloadUnit.value = 'M';
+    // 10. 改下载并发数量：下载提示是「动态分配」语义，不随并发数改写每任务配额
+    downloadValue.value = '1M';
     downloadThreads.value = '2';
-    (downloadThreads.listeners.input || []).forEach((fn) => fn());
+    fireInput(downloadThreads);
     snapshot('threadsChanged');
 
-    // 11. 上传限速单位切到 M，提示里应显示总速率与并发上传任务数
-    uploadValue.value = '2';
-    uploadUnit.value = 'M';
-    (uploadUnit.listeners.change || []).forEach((fn) => fn());
+    // 11. 上传限速带单位输入 2M：提示显示总速率与并发上传任务数，标签显示 2.00 MB/s
+    uploadValue.value = '2M';
+    fireInput(uploadValue);
     snapshot('uploadUnitM');
+
+    // 12. 裸数字 2048（KB/s）→ 隐藏域 2048K，标签自动切到 2.00 MB/s（不再手动选单位）
+    downloadValue.value = '2048';
+    fireInput(downloadValue);
+    snapshot('autoUnitSwitch');
 } catch (exc) {
     report.errors.push(String(exc && exc.stack ? exc.stack : exc));
 }

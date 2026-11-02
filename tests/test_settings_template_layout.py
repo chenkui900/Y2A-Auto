@@ -234,9 +234,8 @@ FIELD_TAB_MAP = {
     'YOUTUBE_DOWNLOAD_THREADS': 'vtab-network',
     'UPLOAD_THREADS': 'vtab-network',
     'DOWNLOAD_RATE_LIMIT_VALUE': 'vtab-network',
-    'DOWNLOAD_RATE_LIMIT_UNIT': 'vtab-network',
+    # 限速单位下拉已移除（自动切换单位），不再登记 UNIT 字段
     'UPLOAD_RATE_LIMIT_VALUE': 'vtab-network',
-    'UPLOAD_RATE_LIMIT_UNIT': 'vtab-network',
     'YOUTUBE_PROXY_ENABLED': 'vtab-network',
     'YOUTUBE_PROXY_PASSWORD': 'vtab-network',
     'YOUTUBE_PROXY_URL': 'vtab-network',
@@ -451,9 +450,9 @@ ALL_FIELD_NAMES = frozenset([
     'YOUTUBE_DOWNLOAD_THREADS',
     'UPLOAD_THREADS',
     'DOWNLOAD_RATE_LIMIT_VALUE',
-    'DOWNLOAD_RATE_LIMIT_UNIT',
+    # 限速单位已改为「按输入值自动切换」（input-group 内的展示标签，无 name、不提交），
+    # 旧版 DOWNLOAD_RATE_LIMIT_UNIT / UPLOAD_RATE_LIMIT_UNIT 下拉已移除。
     'UPLOAD_RATE_LIMIT_VALUE',
-    'UPLOAD_RATE_LIMIT_UNIT',
     'YOUTUBE_PROXY_ENABLED',
     'YOUTUBE_PROXY_PASSWORD',
     'YOUTUBE_PROXY_URL',

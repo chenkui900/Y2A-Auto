@@ -1067,12 +1067,12 @@ def _rate_limit_preview(config):
         pass
     per_task, per_connection = split_download_rate(download_total, cfg, active_count=active)
     return {
-        'download_total': format_rate_limit(download_total) if download_total else '',
-        'download_per_task': format_rate_limit(per_task) if per_task else '',
-        'download_per_connection': format_rate_limit(per_connection) if per_connection else '',
+        'download_total': _human_rate_limit(download_total),
+        'download_per_task': _human_rate_limit(per_task),
+        'download_per_connection': _human_rate_limit(per_connection),
         'download_tasks': active,
         'download_max_tasks': max_tasks,
-        'upload_total': format_rate_limit(upload_total) if upload_total else '',
+        'upload_total': _human_rate_limit(upload_total),
         'upload_tasks': get_upload_concurrency(cfg),
     }
 
@@ -1373,9 +1373,10 @@ def _perform_settings_save(form_data: dict, uploads: dict, operation_id: str | N
                     '已勾选「使用预设标签」但没有填写任何标签，当前等同于未启用。'
                 )
 
-        # 上传/下载限速：页面是「数值 + 单位（K/M）」两个控件，这里先拼成 500K / 1M。
-        # 隐藏域 _VALUE 存在说明控件可用（总开关关掉时控件被 disabled，不会提交），
-        # 此时以页面上的数值为准；数值清空即恢复「不限速」。
+        # 上传/下载限速：输入框支持两种写法——裸数字（默认按 KB/s）或自带单位（2M / 500K）。
+        # 兼容旧版「数值 + 单位下拉」提交：仍带 UNIT 字段时拼在裸数字后面。
+        # 后续 normalize_rate_limit 会自动换成合适的单位（如 2048K -> 2M）。
+        _rate_suffix_re = re.compile(r'^\d+(?:\.\d+)?\s*[KMG]$', re.IGNORECASE)
         for _rate_key in ('DOWNLOAD_RATE_LIMIT', 'UPLOAD_RATE_LIMIT'):
             _value_key = f'{_rate_key}_VALUE'
             _unit_key = f'{_rate_key}_UNIT'
@@ -1384,8 +1385,10 @@ def _perform_settings_save(form_data: dict, uploads: dict, operation_id: str | N
             _raw_unit = str(form_data.pop(_unit_key, '') or '').strip().upper()
             if _raw_unit not in ('K', 'M'):
                 _raw_unit = 'K'
+            if _raw_value and not _rate_suffix_re.match(_raw_value.replace(' ', '')):
+                _raw_value = f'{_raw_value}{_raw_unit}'
             if _value_submitted:
-                form_data[_rate_key] = f'{_raw_value}{_raw_unit}' if _raw_value else ''
+                form_data[_rate_key] = _raw_value if _raw_value else ''
 
         # 上传/下载限速：规范成 500K / 1M 这种写法；非法输入不落盘，直接回退为「不限速」并提示
         for _rate_key, _rate_label in (('DOWNLOAD_RATE_LIMIT', '下载限速'), ('UPLOAD_RATE_LIMIT', '上传限速')):
@@ -2390,12 +2393,152 @@ def tasks_filtered_ids():
     return jsonify({'success': True, 'ids': ids, 'total': len(ids)})
 
 
+def _task_total_file_size(task) -> int:
+    """任务本地文件总大小（bytes）。
+
+    统计任务下载目录（downloads/<task_id>）里的全部文件（视频、合并残留、
+    封面、字幕、元数据等）；若视频文件在下载目录之外，则单独补计。
+    目录不存在（如纯采集失败的任务）返回 0。
+    """
+    try:
+        from modules.task_manager import DOWNLOADS_DIR
+        import pathlib as _pathlib
+
+        total = 0
+        task_id = str(task.get('id') or '')
+        if not task_id:
+            return 0
+        task_dir = _pathlib.Path(DOWNLOADS_DIR) / task_id
+        if task_dir.is_dir():
+            for f in task_dir.rglob('*'):
+                try:
+                    if f.is_file():
+                        total += f.stat().st_size
+                except OSError:
+                    continue
+        # 视频文件在下载目录之外时单独补计（避免重复统计）
+        video_path = str(task.get('video_path_local') or '')
+        if video_path:
+            try:
+                vp = _pathlib.Path(video_path)
+                if vp.is_file() and task_dir not in vp.parents:
+                    total += vp.stat().st_size
+            except OSError:
+                pass
+        return total
+    except Exception:
+        return 0
+
+
+def _human_file_size(num_bytes) -> str:
+    """字节数转人类可读文本：0/空返回空串，>=1024 用 KB/MB/GB/TB，保留 1 位小数。"""
+    try:
+        num = float(num_bytes or 0)
+    except (TypeError, ValueError):
+        return ''
+    if num <= 0:
+        return ''
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if num < 1024 or unit == 'TB':
+            return f'{int(num)} {unit}' if unit == 'B' else f'{num:.1f} {unit}'
+        num /= 1024
+    return f'{num:.1f} TB'
+
+
+def _human_rate_limit(num_bytes) -> str:
+    """速率自动单位文本：512000 -> '500.0 KB/s'，2097152 -> '2.0 MB/s'；0/空返回空串。"""
+    text = _human_file_size(num_bytes)
+    return f'{text}/s' if text else ''
+
+
+app.jinja_env.filters['format_file_size'] = _human_file_size
+
+
+_DB_TIME_FORMATS = ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S')
+
+
+def _parse_db_time(value):
+    """解析数据库里的时间戳文本（兼容 datetime 对象与微秒后缀）。"""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    for fmt in _DB_TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _human_duration(seconds) -> str:
+    """秒数转人类可读时长：45 秒 / 3 分 20 秒 / 2 小时 5 分 / 1 天 3 小时。"""
+    try:
+        sec = int(float(seconds))
+    except (TypeError, ValueError):
+        return ''
+    if sec < 0:
+        sec = 0
+    if sec < 60:
+        return f'{sec} 秒'
+    minutes, s = divmod(sec, 60)
+    if minutes < 60:
+        return f'{minutes} 分 {s} 秒' if s else f'{minutes} 分钟'
+    hours, m = divmod(minutes, 60)
+    if hours < 24:
+        return f'{hours} 小时 {m} 分'
+    days, h = divmod(hours, 24)
+    return f'{days} 天 {h} 小时'
+
+
+def _upload_timing_info(task) -> dict | None:
+    """上传中任务的「已耗时 / 预计剩余」信息；非上传中返回 None。
+
+    - 已耗时 = 当前时间 - upload_started_at（进入上传状态时由 update_task 自动记录）；
+    - 预计剩余 = 剩余字节数 / 当前上传速度（按 upload_progress 百分比与 progress_speed 估算，
+      双平台同时上传时速度口径可能偏大，结果仅供参考，前端会随 SSE 实时修正）。
+    """
+    if str(task.get('status') or '') != 'uploading':
+        return None
+    start = _parse_db_time(task.get('upload_started_at'))
+    elapsed_seconds = None
+    start_epoch = None
+    if start:
+        elapsed_seconds = max(0, int((datetime.now() - start).total_seconds()))
+        start_epoch = int(time.mktime(start.timetuple()))
+    total_bytes = int(task.get('total_file_size') or 0)
+    try:
+        speed = float(task.get('progress_speed') or 0)
+    except (TypeError, ValueError):
+        speed = 0.0
+    pct = None
+    match = re.search(r'(\d+(?:\.\d+)?)\s*%', str(task.get('upload_progress') or ''))
+    if match:
+        try:
+            pct = float(match.group(1))
+        except ValueError:
+            pct = None
+    eta_seconds = None
+    if total_bytes > 0 and speed > 0 and pct is not None:
+        remaining_bytes = total_bytes * max(0.0, (100.0 - pct) / 100.0)
+        if remaining_bytes > 0:
+            eta_seconds = remaining_bytes / speed
+    return {
+        'elapsed_seconds': elapsed_seconds,
+        'elapsed_text': _human_duration(elapsed_seconds) if elapsed_seconds is not None else '',
+        'start_epoch': start_epoch,
+        'eta_seconds': eta_seconds,
+        'eta_text': _human_duration(eta_seconds) if eta_seconds else '',
+    }
+
+
 @app.route('/tasks')
 @login_required
 def tasks():
     """任务列表页面"""
     logger.info("访问任务列表页面")
-    
+
     page = request.args.get('page', 1, type=int)
     per_page = 20
     
@@ -2457,6 +2600,11 @@ def tasks():
     except Exception:
         download_paused = False
 
+    # 附加每个任务的本地文件总大小（供列表显示「文件总大小」）与上传耗时信息
+    for _task in pagination_data.get('tasks') or []:
+        _task['total_file_size'] = _task_total_file_size(_task)
+        _task['upload_timing'] = _upload_timing_info(_task)
+
     return render_template(
         'tasks.html', 
         tasks=pagination_data['tasks'],
@@ -2475,6 +2623,10 @@ def tasks():
 def _render_task_fragments(task: dict, config: dict | None = None) -> dict:
     if config is None:
         config = load_config()
+
+    # SSE 局部刷新与整页渲染保持一致：带上本地文件总大小与上传耗时信息
+    task['total_file_size'] = _task_total_file_size(task)
+    task['upload_timing'] = _upload_timing_info(task)
 
     return {
         'task_id': task.get('id'),

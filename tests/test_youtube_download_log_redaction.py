@@ -64,6 +64,9 @@ class _FakeProcess:
     def wait(self, timeout=None):
         return self.returncode
 
+    def poll(self):
+        return self.returncode
+
     def kill(self):
         self.returncode = -9
 
@@ -91,6 +94,14 @@ class DownloadLogRedactionTests(unittest.TestCase):
         return logs
 
     def _base_patches(self):
+        # 下载限速现在由 download_rate_controller 动态计算（实时读 config.json），
+        # 测试里固定为「不限速」，避免断言依赖开发机的真实配置
+        no_limit_controller = mock.Mock(name='download_rate_controller')
+        no_limit_controller.per_task_rate_bytes.return_value = None
+        no_limit_controller.active_count.return_value = 0
+        no_limit_controller.generation = 0
+        no_limit_controller.rebalance_event = mock.Mock()
+        no_limit_controller.rebalance_event.wait.return_value = False
         return [
             mock.patch.object(youtube_handler, 'load_config', return_value=_proxy_config()),
             mock.patch.object(
@@ -107,6 +118,9 @@ class DownloadLogRedactionTests(unittest.TestCase):
             ),
             mock.patch.object(youtube_handler, 'get_ffmpeg_path', return_value=None),
             mock.patch.object(youtube_handler, 'is_docker_env', return_value=False),
+            mock.patch.object(
+                youtube_handler, 'get_download_rate_controller', return_value=no_limit_controller
+            ),
         ]
 
     def test_progress_path_does_not_log_proxy_credentials(self):
@@ -129,7 +143,7 @@ class DownloadLogRedactionTests(unittest.TestCase):
 
         logs = self.assert_no_credentials_in_logs()
         self.assertIn("执行 yt-dlp 下载命令", logs)
-        self.assertIn("下载命令已就绪", logs)
+        self.assertIn("拉起 yt-dlp（动态限速）", logs)
 
         # 脱敏只作用于日志：真实命令仍必须把代理凭据交给 yt-dlp，否则代理会失效
         self.assertTrue(popen_mock.called)
@@ -145,8 +159,10 @@ class DownloadLogRedactionTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for patch in self._base_patches():
                 stack.enter_context(patch)
+            # 动态限速重构后，视频下载统一走 Popen（subprocess.run 只用于 --skip-download
+            # 的元数据采集分支），因此失败路径也通过 Popen 桩触发
             stack.enter_context(
-                mock.patch.object(youtube_handler.subprocess, 'run', side_effect=_fail)
+                mock.patch.object(youtube_handler.subprocess, 'Popen', side_effect=_fail)
             )
 
             success, error = youtube_handler.download_video_data(

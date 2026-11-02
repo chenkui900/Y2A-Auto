@@ -626,12 +626,8 @@
                                                                 <div class="form-group">
                                                                     <label for="download-rate-value" class="form-label">下载限速（总速率）</label>
                                                                     <div class="input-group">
-                                                                        <input type="text" id="download-rate-value" name="DOWNLOAD_RATE_LIMIT_VALUE" value="{{ download_rate_value }}" class="form-control" placeholder="留空不限速" inputmode="decimal" autocomplete="off">
-                                                                        <select id="download-rate-unit" name="DOWNLOAD_RATE_LIMIT_UNIT" class="form-select" aria-label="下载限速单位" style="max-width: 6.5rem;">
-                                                                            {% for unit in rate_limit_units %}
-                                                                            <option value="{{ unit }}" {% if download_rate_unit == unit %}selected{% endif %}>{{ unit }}/s</option>
-                                                                            {% endfor %}
-                                                                        </select>
+                                                                        <input type="text" id="download-rate-value" name="DOWNLOAD_RATE_LIMIT_VALUE" value="{{ download_rate_value }}" class="form-control" placeholder="如 500 或 2M，留空不限速" inputmode="decimal" autocomplete="off" maxlength="6" style="max-width: 7.5rem;">
+                                                                        <span class="input-group-text" id="download-rate-unit" data-rate-unit-label title="单位根据输入值自动切换（KB/s / MB/s），也可直接输入 2M 这类带单位的写法" style="min-width: 6.5rem; justify-content: center;">自动单位</span>
                                                                     </div>
                                                                     <input type="hidden" id="download-rate-limit" name="DOWNLOAD_RATE_LIMIT" value="{{ config.get('DOWNLOAD_RATE_LIMIT', '') or config.get('YOUTUBE_THROTTLED_RATE', '') }}">
                                                                     <div class="form-text" id="download-rate-split-hint"
@@ -642,12 +638,8 @@
                                                                 <div class="form-group">
                                                                     <label for="upload-rate-value" class="form-label">上传限速（总速率）</label>
                                                                     <div class="input-group">
-                                                                        <input type="text" id="upload-rate-value" name="UPLOAD_RATE_LIMIT_VALUE" value="{{ upload_rate_value }}" class="form-control" placeholder="留空不限速" inputmode="decimal" autocomplete="off">
-                                                                        <select id="upload-rate-unit" name="UPLOAD_RATE_LIMIT_UNIT" class="form-select" aria-label="上传限速单位" style="max-width: 6.5rem;">
-                                                                            {% for unit in rate_limit_units %}
-                                                                            <option value="{{ unit }}" {% if upload_rate_unit == unit %}selected{% endif %}>{{ unit }}/s</option>
-                                                                            {% endfor %}
-                                                                        </select>
+                                                                        <input type="text" id="upload-rate-value" name="UPLOAD_RATE_LIMIT_VALUE" value="{{ upload_rate_value }}" class="form-control" placeholder="如 500 或 2M，留空不限速" inputmode="decimal" autocomplete="off" maxlength="6" style="max-width: 7.5rem;">
+                                                                        <span class="input-group-text" id="upload-rate-unit" data-rate-unit-label title="单位根据输入值自动切换（KB/s / MB/s），也可直接输入 2M 这类带单位的写法" style="min-width: 6.5rem; justify-content: center;">自动单位</span>
                                                                     </div>
                                                                     <input type="hidden" id="upload-rate-limit" name="UPLOAD_RATE_LIMIT" value="{{ config.get('UPLOAD_RATE_LIMIT', '') }}">
                                                                     <div class="form-text" id="upload-rate-split-hint"
@@ -699,7 +691,7 @@
                                                              data-active="{{ '1' if rate_limit_state.active else '0' }}"
                                                              data-window="{{ rate_limit_state.window }}">{% if rate_enabled and not (config.get('DOWNLOAD_RATE_LIMIT') or config.get('UPLOAD_RATE_LIMIT') or config.get('YOUTUBE_THROTTLED_RATE')) %}已启用限速，但下载和上传速率都没填，实际仍是满速。填写速率后保存即可生效。{% else %}{{ rate_limit_state.text }}{% endif %}</div>
 
-                                                        <p class="help-text mb-0 mt-2">单位可选 K 或 M（1K = 1024 字节，1M = 1024K）；填 0 或留空表示不限制。限速填的是「总速率」，会按「当前实际在下载的任务数」动态分配（并发数量只决定最多同时下载几个）：只有 1 个任务在下载时就吃满全部带宽，多个同时下载时自动均分，总速度也不会超过设定值。修改限速或并发数量后无需重启服务，正在下载的任务会自动以新速率断点续传；想让单个下载吃满限速，把「下载并发数量」调成 1 即可。上传的分块节流为全局记账，实时生效。</p>
+                                                        <p class="help-text mb-0 mt-2">单位根据输入值自动切换并显示（KB/s / MB/s / GB/s），直接填数字默认按 KB/s，也可以直接输入 2M、1.5M 这类带单位的写法；填 0 或留空表示不限制。限速填的是「总速率」，会按「当前实际在下载的任务数」动态分配（并发数量只决定最多同时下载几个）：只有 1 个任务在下载时就吃满全部带宽，多个同时下载时自动均分，总速度也不会超过设定值。修改限速或并发数量后无需重启服务，正在下载的任务会自动以新速率断点续传；想让单个下载吃满限速，把「下载并发数量」调成 1 即可。上传的分块节流为全局记账，实时生效。</p>
                                                     </div>
                                                 </div>
 

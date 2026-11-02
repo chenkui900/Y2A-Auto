@@ -94,6 +94,18 @@ class RateLimitUnitSaveTests(_SaveBase):
         self._save({'UPLOAD_RATE_LIMIT_VALUE': '250'})
         self.assertEqual(self._config()['UPLOAD_RATE_LIMIT'], '250K')
 
+    def test_value_with_inline_unit_is_accepted(self):
+        # 新版自动单位控件：输入框可直接填 2M 这类带单位的写法
+        self._save({'DOWNLOAD_RATE_LIMIT_VALUE': '2M', 'UPLOAD_RATE_LIMIT_VALUE': '1.5M'})
+        config = self._config()
+        self.assertEqual(config['DOWNLOAD_RATE_LIMIT'], '2M')
+        self.assertEqual(config['UPLOAD_RATE_LIMIT'], '1.5M')
+
+    def test_bare_number_is_auto_normalized_to_best_unit(self):
+        # 裸数字默认按 KB/s，保存时自动换成合适单位：2048（KB/s）-> 2M
+        self._save({'DOWNLOAD_RATE_LIMIT_VALUE': '2048'})
+        self.assertEqual(self._config()['DOWNLOAD_RATE_LIMIT'], '2M')
+
     def test_hidden_only_submission_keeps_value(self):
         # 老页面 / 关掉 JS 时只有隐藏域，不能把已有速率清成「不限速」
         self._save({'DOWNLOAD_RATE_LIMIT': '2M'})
